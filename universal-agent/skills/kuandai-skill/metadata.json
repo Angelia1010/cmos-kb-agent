@@ -1,0 +1,7 @@
+{
+  "name": "kuandai-skill",
+  "description": "宽带类知识的字段归一与坐席处理规范",
+  "triggers": [{"type": "keyword", "value": "宽带"},{"type": "keyword", "value": "光纤"}],
+  "references": [],
+  "tags": ["business", "宽带"]
+}

@@ -1,0 +1,38 @@
+## KB 知识库智能体 — 配置模板(基于裁剪版 uniagent)
+## 复制为 config.yaml 使用。生产时把 models[0].use 换成内部网关/ChatOpenAI。
+
+log_level: info
+
+models:
+  - name: default
+    use: "kbagent.scripted_model:ScriptedChatModel"   # 生产: "langchain_openai:ChatOpenAI"
+    model: scripted-mock
+    temperature: 0.0
+    kwargs: {}
+
+tools: []          # KB 工具由 kbagent.pipeline 以代码方式绑定(RETRIEVAL_TOOLS / PROCESSING_TOOLS)
+
+loop:
+  max_iterations: 2        # 检索循环硬上限(V2 方案 3.1)
+  max_tokens: 0
+  max_time_seconds: 2      # 检索阶段延迟预算
+  verify_every: 1          # 每轮强制充分性验证
+  checkpoint_every: 1
+
+state:
+  backend: local
+  state_dir: ".uniagent/state"
+
+verification:
+  strategy: none           # SufficiencyVerifier 由 kbagent 代码传入
+  confidence_threshold: 0.7
+  evaluator_model: ""
+
+skills:
+  enabled: true
+  directories:
+    - skills               # 业务技能包: taocan/kuandai/zhangdan/tousu
+  max_active: 1            # 单查询命中一个业务类目即可
+  auto_match: true
+
+extra_middleware: []

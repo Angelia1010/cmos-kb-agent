@@ -1,0 +1,11 @@
+{
+  "name": "taocan-skill",
+  "description": "套餐类知识的字段归一与坐席话术规范",
+  "triggers": [
+    {"type": "keyword", "value": "套餐"},
+    {"type": "keyword", "value": "流量"},
+    {"type": "keyword", "value": "资费"}
+  ],
+  "references": [],
+  "tags": ["business", "套餐"]
+}
