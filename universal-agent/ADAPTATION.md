@@ -4,9 +4,9 @@
 
 **主智能体是编排好的,子智能体是自主规划的。** 这决定了取舍标准:
 
-- 主智能体(kbagent/main_agent.py):阶段顺序、缓存快速通道、降级兜底、trace
-  全部固定,不含任何 LLM 决策 —— 生产链路的骨架必须可预测;
-- 三个子智能体(kbagent/subagents.py):每个阶段内部,LLM 面对自己的工具集
+- 主智能体(kbagent/main_agent.py):阶段顺序固定、降级兜底、trace 全部固定,
+  不含任何 LLM 决策 —— 生产链路的骨架必须可预测;
+- 三个子智能体(各自独立目录):每个阶段内部,LLM 面对自己的工具集
   自主决定调用顺序与参数(uniagent create_agent → ReAct);
 - 自主性有边界:轮次/时间上限(Budget)、充分性判定(Verifier)、DSL 白名单、
   锚定校验、保底流水线都是确定性护栏,刻意不交给 LLM。
@@ -50,6 +50,16 @@
 | skills/script_loader.py | 扫描技能包 scripts/ 目录，动态加载 @tool 函数；factory.py 在 feat.skill=True 时自动预加载 |
 | skills/tools.py | load_skill_reference 工具：LLM 按需加载技能 references/ 文档 |
 | test_uniagent_e2e.py | 7个场景端到端演示：裸Agent / TurnLoop / GoalLoop / 中间件顺序 / 完整管线 / Skill全链路 |
+
+## kbagent 重构(最新,在 uniagent 保留范围内)
+
+| 重构内容 | 说明 |
+|---|---|
+| 目录结构重组 | 每个子智能体独立目录(retrieval/ / processing/ / answer/)；共享模块归入 shared/ |
+| 删除缓存层 | 移除 cache.py / AnswerCache；链路无请求间状态干扰，trace 更真实 |
+| 删除多模型协同 | 移除 llm_bridge.py / judge/small_json/large_json；答案生成改用标准 model.invoke |
+| SufficiencyVerifier 简化 | 移除 LLM intent coverage 判断；纯规则层(top3得分+数量下限)，更确定性 |
+| 测试体系建立 | tests/test_retrieval.py(34项) / test_processing.py(33项) / test_answer.py(41项) / test_kbagent_e2e.py(108项) |
 
 ## 与方案 V2 的映射、生产接入清单
 

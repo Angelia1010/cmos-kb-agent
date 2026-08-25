@@ -15,9 +15,17 @@ pip install langgraph langchain-core pydantic pyyaml
 # 运行演示（kbagent 业务层，离线 ScriptedChatModel + MockES）
 PYTHONPATH=src python main.py
 
-# 运行 uniagent 框架端到端演示/测试（7个场景，不依赖 kbagent）
-PYTHONPATH=src python test_uniagent_e2e.py
+# uniagent 框架端到端演示/测试（7个场景，不依赖 kbagent）
 PYTHONPATH=src python -m unittest test_uniagent_e2e -v
+
+# kbagent 整体集成测试（7个测试类，含正常/重试/降级/透传/隔离）
+PYTHONPATH=src python -m unittest test_kbagent_e2e -v
+
+# kbagent 子智能体单元测试（检索/处理/答案）
+PYTHONPATH=src python -m unittest discover tests -v
+
+# 一次运行所有 kbagent 测试
+PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
 ```
 
 无lint/格式化工具配置。测试使用标准库unittest，无pytest。
@@ -45,20 +53,34 @@ PYTHONPATH=src python -m unittest test_uniagent_e2e -v
   - `verification/` — Verifier 协议 + LLMVerifier / AlwaysPassVerifier
   - `state/` — ThreadState / reducers / backend
   - `config/` — AppConfig YAML 热重载、ModelConfig、SkillConfig 等子配置
-- `src/kbagent/` — 业务层实现
-  - `main_agent.py` — 主智能体，三阶段固定编排入口
-  - `subagents.py` — 三个子智能体定义（检索/处理/答案）
-  - `tools.py` — 11个工具（4检索 + 7处理）
-  - `answer.py` — 答案生成 + 逐句锚定校验（硬事实删句，软性表述标注）
-  - `sufficiency.py` — 充分性验证器（规则先行 + LLM补充）
-  - `search.py` — ES检索层抽象（BM25 + 向量 + RRF融合）
-  - `llm_bridge.py` — LLM接口适配（自动包装BaseChatModel为judge/small_json/large_json）
-  - `models.py` — 核心数据结构（Chunk、RetrievalParams、FinalAnswer）
-  - `scripted_model.py` — 离线Mock模型，用于测试和演示
-  - `cache.py` / `workspace.py` / `tracing.py` / `config.py`
+- `src/kbagent/` — 业务层实现（每个子智能体独立目录）
+  - `main_agent.py` — 主智能体，三阶段固定编排入口（无缓存，无多模型协同）
+  - `scripted_model.py` — 离线Mock模型，处理 ReAct / [TASK:answer] / [TASK:anchor_check]
+  - `shared/` — 跨子智能体共享模块
+    - `models.py` — 核心数据结构（Chunk、RetrievalParams、FinalAnswer）
+    - `search.py` — ES检索层抽象（build_dsl / rrf_fuse / MockESClient）
+    - `config.py` — 领域配置（阈值/预算/溯源天数）
+    - `workspace.py` — ContextVar 请求级工作区
+    - `tracing.py` — 全链路 trace（TraceEvent / Tracer）
+    - `lexicon.py` — 关键词提取 / 意图识别 / 同义扩展
+  - `retrieval/` — 检索子智能体
+    - `agent.py` — RetrievalSubAgent（GoalLoop 护栏）
+    - `sufficiency.py` — SufficiencyVerifier（纯规则：top3得分 + 数量下限）
+    - `tools.py` — 4个检索工具（query_understanding / question_rewrite / keyword_extraction / coarse_recall）
+  - `processing/` — 处理子智能体
+    - `agent.py` — ProcessingSubAgent（SkillMiddleware + 保底流水线）
+    - `tools.py` — 7个处理工具（analyze/clean/denoise/dedupe/structure/sort/apply_business_skill）
+  - `answer/` — 答案子智能体
+    - `agent.py` — AnswerSubAgent（select_fragments + generate）
+    - `generate.py` — 答案生成 + 逐句锚定校验（model.invoke 标准调用）
 - `skills/` — 业务技能包（当前：taocan-skill），零代码可扩展
-- `main.py` — kbagent 演示入口（4个场景）
+- `tests/` — kbagent 子智能体单元测试
+  - `test_retrieval.py` — 34项：DSL白名单 / 检索工具 / 充分性验证 / RetrievalSubAgent
+  - `test_processing.py` — 33项：7个处理工具 / 保底流水线 / ProcessingSubAgent
+  - `test_answer.py` — 41项：片段精选 / JSON解析 / 锚定校验 / AnswerSubAgent / 渲染
+- `test_kbagent_e2e.py` — kbagent 整体集成测试（7个测试类，108项）
 - `test_uniagent_e2e.py` — uniagent 框架端到端演示（7个场景，含 Skill 系统全链路）
+- `main.py` — kbagent 演示入口（4个场景）
 
 ### 关键设计约束
 
