@@ -1,13 +1,18 @@
 # 10086 坐席知识库智能体 —— 编排好的主智能体 + 三个自主规划的子智能体
 
-基于裁剪版 uniagent。核心定位:**主智能体编排固定,子智能体自主规划,护栏确定性兜底。**
+基于裁剪版 uniagent v2.0.2。核心定位:**主智能体编排固定,子智能体自主规划,护栏确定性兜底。**
 
 ## 快速开始
 
 ```bash
 pip install langgraph langchain-core pydantic pyyaml
-PYTHONPATH=src python main.py          # 4 个演示场景(ScriptedChatModel + MockES,离线)
-python tests.py && python tests_subagents.py   # 8 + 4 项测试
+
+# kbagent 业务层演示（4个场景，ScriptedChatModel + MockES，完全离线）
+PYTHONPATH=src python main.py
+
+# uniagent 框架端到端演示（7个场景，不依赖 kbagent，可单独 debug）
+PYTHONPATH=src python test_uniagent_e2e.py
+PYTHONPATH=src python -m unittest test_uniagent_e2e -v
 ```
 
 ## 架构
@@ -31,7 +36,7 @@ MainAgent 主智能体(编排好的,零 LLM 决策)          kbagent/main_agent.
    ├─ ② ProcessingSubAgent 数据处理子智能体(自主规划)
    │     ReAct: 自主决定清洗工具取舍与顺序
    │       analyze/clean/denoise/dedupe/structure/sort/apply_business_skill
-   │     业务个性化: skills/ 技能包(套餐/宽带/账单/投诉)关键词触发,
+   │     业务个性化: skills/ 技能包关键词触发,
    │       SkillMiddleware 把归一规则注入提示 → 子智能体套用对应 skill
    │     护栏: 无产出时确定性保底流水线;"不裁剪片段"写入工具约束
    │
@@ -53,16 +58,28 @@ LLM 决定"怎么做"(工具顺序、参数、素材取舍);代码决定"何时�
 
 ## uniagent 保留/删除
 
-保留:agents(ReAct 工厂)、**skills 技能子系统**、middleware(技能注入/工具异常/
-死循环检测/孤立调用修补/用量统计)、runtime(GoalLoop/Budget)、verification、
-tools/registry、state、config —— 自主规划子智能体的完整底座。
+保留:agents(ReAct 工厂)、**models(ModelFactory + 增强 ModelConfig)**、
+**skills 技能子系统**、middleware(技能注入/工具异常/死循环检测/孤立调用修补/用量统计)、
+runtime(GoalLoop/Budget)、verification、tools/registry、state、config ——
+自主规划子智能体的完整底座。
+
 删除:sandbox、MCP 延迟工具发现、澄清工具、WIP/FeatureList/日志状态机、
-命令验证器、摘要中间件。详细理由与三处框架兼容性修复见 ADAPTATION.md。
+命令验证器、摘要中间件。详细理由与框架兼容性修复见 ADAPTATION.md。
 
 ## 代码地图
 
 ```
 src/uniagent/            裁剪版通用框架(无业务概念)
+├── agents/              ReAct Agent 工厂(create_agent / create_agent_from_config)
+├── models/              模型工厂子包
+│   └── factory.py       ModelFactory(build/get/invalidate) + build_model/get_model 便捷函数
+├── middleware/          洋葱模型中间件系统
+├── runtime/             GoalLoop / TurnLoop / Budget / LoopHook
+├── skills/              技能子系统(SkillRegistry/Manifest/Loader/ScriptLoader/Tools)
+├── verification/        Verifier 协议 + LLMVerifier / AlwaysPassVerifier
+├── state/               ThreadState / reducers / backend
+└── config/              AppConfig YAML 热重载；ModelConfig(含 api_key/base_url/timeout/…)
+
 src/kbagent/
 ├── main_agent.py        主智能体(编排好的): 三阶段固定编排 + 缓存/降级/trace
 ├── subagents.py         三个自主规划的子智能体 + 自主性/护栏边界说明
@@ -71,10 +88,16 @@ src/kbagent/
 ├── answer.py            答案组织 / 逐句锚定校验 / 来源渲染
 ├── workspace.py         ContextVar 请求级工作区(Chunk 实体不走 prompt)
 ├── scripted_model.py    离线 BaseChatModel(生产换 ChatOpenAI/内部网关)
-├── models/search/lexicon/cache/tracing/config    领域层
-skills/                  业务技能包: taocan / kuandai / zhangdan / tousu
+└── models/search/lexicon/cache/tracing/config    领域层
+
+skills/                  业务技能包(当前: taocan-skill)
                          新增业务类目 = 加一个目录(metadata.json 触发词 + SKILL.md 归一规则)
-main.py / tests.py / tests_subagents.py / tests_bugfix.py
+                         技能包结构: metadata.json / SKILL.md / references/ / scripts/
+
+main.py                  kbagent 演示入口(4个场景)
+test_uniagent_e2e.py     uniagent 框架端到端演示(7个场景,含 Skill 系统全链路)
+config.example.yaml      配置模板(含新增 api_key/base_url/timeout/max_retries 等字段示例)
+```
 
 ## 代码审查记录(v2.0.2 全局终审)
 
@@ -85,29 +108,33 @@ elapsed_ms 误报为原次运行耗时;召回 trace 丢失轮次号;**普通 Bas
 
 全局终审补充修复(pyflakes 全量静态扫描 + 边界用例):
 - **loop.py 缺失 logger 定义**(裁剪时误删):GoalLoop 的验证器异常、agent 异常、
-  回退、钩子信号四条错误处理路径全部 NameError 逃逸,循环自身的
-  RETRY/BREAK/ROLLBACK 语义实际失效 —— 已补回并加回归测试;
-- **连锁发现**:"LLM 故障→降级"此前竟依赖上述 NameError 逃逸才成立;logger 修复后
-  改为显式语义 —— 检索子智能体错误失败且零召回时主动抛出触发降级,
-  与"知识库确实无此知识"的正常零召回(输出空答案)明确区分;
-- features.py / config_factory.py 引用未导入符号的注解(静态隐患)清理;
-  全树死导入清零(pyflakes 0 告警);测试文件中 unittest.main 位于文件中部导致
-  其后测试类未被收集(修复后 8+4+8=20 项全量执行)。
+  回退、钩子信号四条错误处理路径全部 NameError 逃逸 —— 已补回并加回归测试;
+- **连锁发现**:"LLM 故障→降级"此前依赖上述 NameError 逃逸才成立;logger 修复后
+  改为显式语义;
+- features.py / config_factory.py 引用未导入符号的注解清理;全树死导入清零。
+
+v2.0.2 新增:
+- **models/ 子包**:ModelFactory(带缓存, 线程安全) + build_model/get_model 便捷函数;
+  从 `uniagent` 顶层直接导出;
+- **ModelConfig 增强**:新增 api_key / base_url / timeout / max_retries / extra_headers
+  五个字段，向后兼容，参数注入优先级低于 kwargs;
+- **Skill 脚本工具**:skills/scripts/ 目录下 @tool 函数自动发现并注入 Agent 工具集;
+- **test_uniagent_e2e.py**:7个场景覆盖框架全部核心层(裸Agent/TurnLoop/GoalLoop/
+  中间件/完整管线/Skill全链路)。
 
 已知限制(设计取舍,文档化而非修复):
 - 同一 MainAgent 实例不支持并发 run(tracer/工作区按请求隔离依赖"每请求一实例"或外层锁);
 - 已在事件循环中时用 arun(),run() 的 asyncio.run 会与现有循环冲突;
 - 处理子智能体的中间件只在外层调用时执行一次,ReAct 内部步骤依赖 langgraph
-  自身的 recursion_limit 防死循环(检索子智能体则每轮迭代都过中间件链)。
-```
+  自身的 recursion_limit 防死循环。
 
 ## 生产接入
 
-1. LLM:`MainAgent(model=...)` 传入任意 `BaseChatModel`;判据小模型可另配
-   (模型对象实现 `judge()`,或拆两个模型实例);
-2. ES:实现 `kbagent.search.ESClient`(keyword_search 执行白名单 DSL,
+1. **LLM**:在 `config.yaml` 的 `models` 段填写 `api_key` / `base_url` / `timeout`
+   等字段，或传入 `ModelFactory.build(config)` 手动实例化；
+2. **ES**:实现 `kbagent.search.ESClient`(keyword_search 执行白名单 DSL,
    vector_search 走 ES 8.x kNN);
-3. 技能包:向 `skills/` 加目录即接入新业务类目,零代码;
-4. 缓存换 Redis + embedding 相似度;`Tracer.export()` 落日志管道;
-5. 上线前用评测集(300~500 条真实坐席 query)校准 `config.py` 判据阈值,
+3. **技能包**:向 `skills/` 加目录即接入新业务类目,零代码;
+4. **缓存**:换 Redis + embedding 相似度;`Tracer.export()` 落日志管道;
+5. **上线前**:用评测集(300~500 条真实坐席 query)校准 `config.py` 判据阈值,
    并实测子智能体自主规划带来的额外 LLM 调用对延迟预算的占用。

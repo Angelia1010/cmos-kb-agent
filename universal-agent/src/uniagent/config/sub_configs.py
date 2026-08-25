@@ -14,7 +14,13 @@ class ModelConfig(BaseModel):
     )
     model: str = Field(description="模型标识符，例如 'gpt-4o'。")
     temperature: float = 0.0
-    kwargs: dict[str, object] = Field(default_factory=dict)
+    # ── API 接入配置 ──
+    api_key: str = Field(default="", description="API 密钥，支持 ${ENV_VAR} 环境变量替换。")
+    base_url: str = Field(default="", description="自定义端点（代理 / 私有化部署）。")
+    timeout: float = Field(default=60.0, ge=0.0, description="请求超时（秒），0 表示不限制。")
+    max_retries: int = Field(default=2, ge=0, description="SDK 层自动重试次数。")
+    extra_headers: dict[str, str] = Field(default_factory=dict, description="额外 HTTP 请求头。")
+    kwargs: dict[str, object] = Field(default_factory=dict, description="兜底：任意 provider 专属参数，可覆盖上述字段。")
 
 
 

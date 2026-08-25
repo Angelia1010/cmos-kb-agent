@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kb-agent"
-version = "2.0.0"
+version = "2.0.2"
 description = "10086 坐席知识库智能体 — 编排好的主智能体 + 三个自主规划的子智能体(裁剪版 uniagent)"
 readme = "README.md"
 requires-python = ">=3.12"

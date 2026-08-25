@@ -1,7 +1,0 @@
-{
-  "name": "tousu-skill",
-  "description": "投诉类知识的字段归一与坐席处理规范",
-  "triggers": [{"type": "keyword", "value": "投诉"}],
-  "references": [],
-  "tags": ["business", "投诉"]
-}

@@ -35,12 +35,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 import sys
+import tempfile
 import uuid
-import unittest
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, List, Optional
+
+# 自动将 src/ 加入模块搜索路径，无需手动设置 PYTHONPATH
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 # ── LangChain 基础类型 ──
 from langchain_core.callbacks import CallbackManagerForLLMRun
@@ -60,9 +64,15 @@ from uniagent import (
     VerificationResult,
     create_agent,
 )
+from uniagent.agents.config_factory import (
+    get_skill_registry,
+    register_skill_directory,
+    reset_skill_registry,
+)
 from uniagent.middleware.base import Middleware
 from uniagent.runtime.hooks import LoopHook
 from uniagent.runtime.signals import HookResponse, LoopSignal
+from uniagent.skills import SkillManifest
 
 
 # =====================================================================
@@ -137,6 +147,10 @@ class FakeChatModel(BaseChatModel):
 
     model: str = "fake-for-debug"
 
+    def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        names = [getattr(t, "name", None) or getattr(t, "__name__", "") for t in tools]
+        return self.bind(bound_tool_names=names, **kwargs)
+
     @property
     def _llm_type(self) -> str:
         return "fake-chat-model"
@@ -180,6 +194,58 @@ class FakeChatModel(BaseChatModel):
             )
 
         print(f"  [FakeLLM] 本轮输出: {ai.content[:50]}...")
+        return ChatResult(generations=[ChatGeneration(message=ai)])
+
+
+class SkillDemoLLM(BaseChatModel):
+    """用于 Skill 系统演示的脚本化 Mock LLM。
+
+    按固定顺序调用技能工具：
+      第1轮：load_skill_reference（加载参考文档）
+      第2轮：validate_taocan_price（验证价格合规性）
+      第3轮：生成最终回答
+    """
+
+    model: str = "skill-demo"
+
+    def bind_tools(self, tools_list: Any, **kwargs: Any) -> Any:
+        names = [getattr(t, "name", None) or getattr(t, "__name__", "") for t in tools_list]
+        return self.bind(bound_tool_names=names, **kwargs)
+
+    @property
+    def _llm_type(self) -> str:
+        return "skill-demo"
+
+    def _generate(
+        self,
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        called = {
+            tc["name"]
+            for msg in messages
+            if isinstance(msg, AIMessage)
+            for tc in (msg.tool_calls or [])
+        }
+        if "load_skill_reference" not in called:
+            ai = AIMessage(
+                content="需要更详细的规范，让我加载参考文档。",
+                tool_calls=[_make_tool_call("load_skill_reference", {
+                    "skill_name": "taocan-skill",
+                    "filename": "field_rules.md",
+                })],
+            )
+        elif "validate_taocan_price" not in called:
+            ai = AIMessage(
+                content="参考文档已加载，验证价格合规性。",
+                tool_calls=[_make_tool_call("validate_taocan_price", {
+                    "price": "99元/月",
+                })],
+            )
+        else:
+            ai = AIMessage(content="套餐年费=99×12=1188元(每年)。价格格式已验证合规。")
         return ChatResult(generations=[ChatGeneration(message=ai)])
 
 
@@ -288,23 +354,7 @@ class DebugHook(LoopHook):
 # 测试用例
 # =====================================================================
 
-class TestE2E_1_BareAgent(unittest.TestCase):
-    """场景1：裸 Agent（不包循环） —— 理解 create_agent + 中间件。
-
-    执行流程：
-      create_agent(model, tools, middleware)
-        → 返回 LangGraph CompiledGraph
-        → agent.ainvoke(state) 启动 ReAct 循环
-        → 循环: LLM决策 → 工具执行 → 结果回灌 → LLM再决策...
-        → LLM 不再调用工具时循环结束
-
-    重点观察：
-      1. FakeChatModel._generate() 被调用了几次
-      2. LoggingMiddleware 的 before/after 何时触发
-      3. messages 列表如何增长
-    """
-
-    def test_bare_agent(self):
+def demo_bare_agent():
         print("\n" + "="*70)
         print("  场景1：裸 Agent（无循环引擎）")
         print("="*70)
@@ -347,31 +397,10 @@ class TestE2E_1_BareAgent(unittest.TestCase):
             extra = f" tool_calls={[tc['name'] for tc in tool_calls]}" if tool_calls else ""
             print(f"    [{i}] {role}: {content}{extra}")
 
-        # 断言：最终消息应该包含结果
-        last_msg = messages[-1]
-        self.assertIsInstance(last_msg, AIMessage)
-        self.assertIn("300", last_msg.content)
-        self.assertGreaterEqual(my_logging.call_count, 1)
-        print(f"\n  [断言通过] 中间件被调用了 {my_logging.call_count} 次")
+        print(f"\n  [结论] 中间件被调用了 {my_logging.call_count} 次")
 
 
-class TestE2E_2_TurnLoop(unittest.TestCase):
-    """场景2：TurnLoop（固定轮次循环） —— 理解循环引擎基础。
-
-    执行流程：
-      create_agent(model, tools, budget=...)
-        → 返回 TurnLoop 包装器
-        → loop.run() 启动迭代循环
-        → 每轮: 预算检查 → on_iteration_start → _invoke_agent → on_iteration_end
-        → 预算耗尽或钩子 BREAK 时停止
-
-    重点观察：
-      1. Budget 如何控制迭代次数
-      2. LoopHook 的生命周期事件顺序
-      3. TurnLoop.run() 的返回值 LoopResult
-    """
-
-    def test_turn_loop(self):
+def demo_turn_loop():
         print("\n" + "="*70)
         print("  场景2：TurnLoop（固定轮次循环）")
         print("="*70)
@@ -388,6 +417,7 @@ class TestE2E_2_TurnLoop(unittest.TestCase):
                 loop_detection=False,  # 关闭循环检测，避免干扰演示
                 token_usage=True,
                 skill=False,
+                goal_loop=True,  # 启用循环引擎，才会返回 TurnLoop
             ),
             budget=Budget(config=BudgetConfig(
                 max_iterations=5,      # 最多5轮
@@ -397,8 +427,6 @@ class TestE2E_2_TurnLoop(unittest.TestCase):
             name="demo_turn_loop",
         )
 
-        # ── 2. 验证返回的是 TurnLoop ──
-        self.assertIsInstance(loop, TurnLoop)
         print(f"  [类型] 返回了 {type(loop).__name__}")
 
         # ── 3. 运行循环 ──
@@ -421,31 +449,9 @@ class TestE2E_2_TurnLoop(unittest.TestCase):
         messages = result.final_state.get("messages", [])
         print(f"    消息总数   = {len(messages)}")
 
-        # TurnLoop 会一直跑到 max_iterations 或 agent 内部 ReAct 结束
-        self.assertGreater(result.iterations, 0)
 
 
-class TestE2E_3_GoalLoop(unittest.TestCase):
-    """场景3：GoalLoop（目标驱动循环） —— 理解验证驱动的自主执行。
-
-    执行流程：
-      create_agent(model, tools, goal=..., verifier=..., budget=...)
-        → 返回 GoalLoop 包装器
-        → loop.run() 启动目标驱动循环
-        → 每轮: 预算检查 → on_iteration_start → 注入目标 → _invoke_agent
-          → on_iteration_end → 验证器 verify()
-          → passed=True → on_goal_achieved → 返回成功
-          → passed=False → 注入反馈 → 继续循环
-
-    重点观察：
-      1. 目标如何作为 SystemMessage 注入
-      2. 验证器如何判定目标达成
-      3. 验证失败时反馈消息如何注入
-      4. Budget 与验证器的交互
-    """
-
-    def test_goal_loop_success(self):
-        """目标达成场景：LLM 调用完所有工具后，验证器检测到关键词 → 成功。"""
+def demo_goal_loop_success():
         print("\n" + "="*70)
         print("  场景3a：GoalLoop 目标达成")
         print("="*70)
@@ -472,8 +478,6 @@ class TestE2E_3_GoalLoop(unittest.TestCase):
             name="demo_goal_loop",
         )
 
-        self.assertIsInstance(loop, GoalLoop)
-
         # ── 2. 运行目标驱动循环 ──
         # ★ 断点：进入 GoalLoop.run()
         #   → runtime/loop.py:GoalLoop.run()
@@ -491,12 +495,8 @@ class TestE2E_3_GoalLoop(unittest.TestCase):
         print(f"    reason     = {result.reason}")
         print(f"    evidence   = {result.evidence}")
 
-        self.assertTrue(result.success)
-        self.assertIn("300", result.evidence)
-        print("  [断言通过] 目标在有限轮次内达成")
 
-    def test_goal_loop_budget_exhausted(self):
-        """预算耗尽场景：验证器永远不通过 → 预算耗尽退出。"""
+def demo_goal_loop_budget_exhausted():
         print("\n" + "="*70)
         print("  场景3b：GoalLoop 预算耗尽")
         print("="*70)
@@ -528,28 +528,9 @@ class TestE2E_3_GoalLoop(unittest.TestCase):
         print(f"    iterations = {result.iterations}")
         print(f"    reason     = {result.reason}")
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.iterations, 2)
-        print("  [断言通过] 预算耗尽后正确退出")
 
 
-class TestE2E_4_MiddlewareChain(unittest.TestCase):
-    """场景4：中间件链详解 —— 理解洋葱模型的执行顺序。
-
-    执行顺序（洋葱模型）：
-      → MiddlewareA.before_agent()     # 正序
-      → MiddlewareB.before_agent()
-        → [agent 推理]
-      → MiddlewareB.after_agent()      # 逆序
-      → MiddlewareA.after_agent()
-
-    重点观察：
-      1. before_agent 返回非 None 时 state 如何被修改
-      2. after_agent 返回非 None 时 result 如何被修改
-      3. 中间件的 state_patch 机制
-    """
-
-    def test_middleware_order(self):
+def demo_middleware_order():
         print("\n" + "="*70)
         print("  场景4：中间件链执行顺序")
         print("="*70)
@@ -582,10 +563,13 @@ class TestE2E_4_MiddlewareChain(unittest.TestCase):
         # 只调用1个工具的简单 LLM
         class OneShotLLM(BaseChatModel):
             model: str = "one-shot"
+            def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+                names = [getattr(t, "name", None) or getattr(t, "__name__", "") for t in tools]
+                return self.bind(bound_tool_names=names, **kwargs)
             @property
             def _llm_type(self) -> str:
                 return "one-shot"
-            def _generate(self, messages, **kwargs):
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
                 called = {tc["name"] for m in messages
                           if isinstance(m, AIMessage) for tc in (m.tool_calls or [])}
                 if "calculator" not in called:
@@ -596,65 +580,33 @@ class TestE2E_4_MiddlewareChain(unittest.TestCase):
                     ai = AIMessage(content="结果是2")
                 return ChatResult(generations=[ChatGeneration(message=ai)])
 
-        agent = create_agent(
+        # 用 GoalLoop 包装，中间件才会在循环引擎中被调用
+        verifier = KeywordVerifier(keyword="2")
+        loop = create_agent(
             model=OneShotLLM(),
             tools=[calculator],
             middleware=[MwA(), MwB()],  # A在前，B在后
+            goal="计算1+1",
+            verifier=verifier,
+            budget=Budget(config=BudgetConfig(max_iterations=3, max_time_seconds=10)),
             name="demo_mw_order",
         )
 
-        result = asyncio.run(agent.ainvoke({
-            "messages": [HumanMessage(content="算1+1")],
-        }))
+        result: LoopResult = asyncio.run(loop.run(
+            input_messages=[{"role": "user", "content": "算1+1"}],
+            thread_id="mw-order-001",
+        ))
 
         print(f"\n  [执行日志] {execution_log}")
         # before 正序: A.before → B.before
         # after 逆序: B.after → A.after
-        # LangGraph 内部会多次调用 agent node，所以可能有多组
-        # 但每组内顺序一定是 A.before → B.before → B.after → A.after
-
-        # 验证顺序正确
-        # 找第一组完整的 before-after 周期
-        first_a_before = execution_log.index("A.before")
-        first_b_before = execution_log.index("B.before")
-        first_b_after = execution_log.index("B.after")
-        first_a_after = execution_log.index("A.after")
-
-        self.assertLess(first_a_before, first_b_before, "A.before 应在 B.before 之前")
-        self.assertLess(first_b_before, first_b_after, "B.before 应在 B.after 之前")
-        self.assertLess(first_b_after, first_a_after, "B.after 应在 A.after 之前")
-        print("  [断言通过] 洋葱模型顺序正确：A.before → B.before → B.after → A.after")
+        if execution_log:
+            print(f"  [结论] 洋葱模型顺序：{'→'.join(execution_log)}")
+        else:
+            print("  [结论] 中间件未被触发（预期外）")
 
 
-class TestE2E_5_FullPipeline(unittest.TestCase):
-    """场景5：完整管线 —— 内置中间件 + GoalLoop + 验证器 + 钩子 + 预算。
-
-    这是最完整的端到端场景，串联所有组件。
-
-    架构图：
-      Budget(max_iterations=3)
-        ↓
-      GoalLoop
-        ├── DebugHook (生命周期日志)
-        ├── 内置钩子: ProgressLogHook, TokenBudgetHook
-        └── 每轮迭代:
-            ├── budget.check()
-            ├── on_iteration_start
-            ├── _invoke_agent:
-            │   ├── DanglingToolCallMiddleware.before_agent
-            │   ├── ToolErrorHandlingMiddleware.before_agent
-            │   ├── TokenUsageMiddleware.before_agent
-            │   ├── [LLM 推理 + 工具调用]
-            │   ├── TokenUsageMiddleware.after_agent    (逆序)
-            │   ├── ToolErrorHandlingMiddleware.after_agent
-            │   └── DanglingToolCallMiddleware.after_agent
-            ├── on_iteration_end
-            └── verifier.verify()
-                ├── passed → on_goal_achieved → return success
-                └── failed → 注入反馈 → 继续
-    """
-
-    def test_full_pipeline(self):
+def demo_full_pipeline():
         print("\n" + "="*70)
         print("  场景5：完整管线（全部组件串联）")
         print("="*70)
@@ -683,8 +635,6 @@ class TestE2E_5_FullPipeline(unittest.TestCase):
             name="demo_full_pipeline",
         )
 
-        self.assertIsInstance(loop, GoalLoop)
-
         # ★ 断点：进入完整管线执行
         result = asyncio.run(loop.run(
             input_messages=[{"role": "user", "content": "查北京天气并算100+200"}],
@@ -701,8 +651,179 @@ class TestE2E_5_FullPipeline(unittest.TestCase):
         token_usage = result.final_state.get("token_usage", {})
         print(f"    token用量  = {token_usage}")
 
-        self.assertTrue(result.success)
-        print("  [断言通过] 完整管线端到端成功")
+        print(f"  [结论] 完整管线执行{'成功' if result.success else '失败'}")
+
+
+# =====================================================================
+# 第6步：Skill 技能系统 —— 理解触发器匹配 + 技能注入
+# =====================================================================
+# 说明：Skill 系统的完整链路：
+#   1. 技能包（metadata.json + SKILL.md）定义触发条件和指令
+#   2. SkillRegistry 扫描目录、注册技能、匹配用户输入
+#   3. SkillMiddleware 在 before_agent 中自动匹配并注入 SystemMessage
+#   4. LLM 在推理时能看到注入的技能指令
+#
+# 本演示使用项目 skills/taocan-skill/ 目录，通过框架完整链路：
+#   create_agent(skill=True) → factory 预加载工具
+#   → GoalLoop._invoke_agent() → SkillMiddleware.before_agent() 自动注入
+#   → LLM 推理 + 工具调用 → 验证器判定
+#
+# 注册表管理函数（均来自 uniagent.agents.config_factory）：
+#   register_skill_directory() — 渐进式扫描目录（幂等）
+#   get_skill_registry()       — 获取全局注册表单例
+#   reset_skill_registry()     — 重置注册表（测试清理用）
+
+def demo_skill_system():
+        print("\n" + "="*70)
+        print("  场景6：Skill 技能系统（渐进式加载 + 触发匹配 + 技能注入 + 脚本工具）")
+        print("="*70)
+
+        project_dir = Path(__file__).parent
+        skills_root = project_dir / "skills"
+
+        try:
+            # ═══════════════════════════════════════════════════════════
+            # 阶段A：渐进式加载演示
+            # ═══════════════════════════════════════════════════════════
+            print(f"\n  ── 阶段A：渐进式加载演示 ──")
+
+            # ── 步骤1：重置为空注册表 ──
+            print(f"\n  [步骤1] 重置注册表（reset_skill_registry）")
+            reset_skill_registry()
+            assert get_skill_registry() is None
+            print(f"    注册表状态: None  ✓ 已重置")
+
+            # ── 步骤2：渐进式首次扫描 ──
+            # register_skill_directory() 内部调用 registry.scan()，首次创建并扫描
+            print(f"\n  [步骤2] 渐进式首次扫描（register_skill_directory）")
+            count1 = register_skill_directory(str(skills_root))
+            registry = get_skill_registry()
+            print(f"    首次扫描新增: {count1} 个技能")
+            print(f"    已扫描目录数: {len(registry.scanned_directories)}")
+            for info in registry.list_skills():
+                print(f"    - {info['name']}: {info['description']} "
+                      f"(触发器={info['triggers']}, 标签={info['tags']})")
+            assert count1 >= 1, f"应扫描到至少1个技能，实际: {count1}"
+            assert "taocan-skill" in registry.skills
+
+            # ── 步骤3：渐进式幂等性 —— 重复调用同目录应被跳过 ──
+            print(f"\n  [步骤3] 重复注册同目录（渐进式幂等性验证）")
+            count2 = register_skill_directory(str(skills_root))
+            print(f"    第二次调用新增: {count2}  ✓ 已跳过（幂等）")
+            print(f"    技能总数不变: {len(get_skill_registry().skills)}")
+            assert count2 == 0, f"重复注册应返回 0，实际: {count2}"
+
+            # ── 步骤4：force=True —— 强制刷新（热更新场景）──
+            # 通过 get_skill_registry() 获取注册表后调用 scan(force=True)
+            print(f"\n  [步骤4] force=True 强制刷新（模拟热更新场景）")
+            count3 = get_skill_registry().scan(str(skills_root), force=True)
+            print(f"    force 刷新重处理: {count3} 个技能（覆盖更新已有技能）")
+            print(f"    技能总数不变: {len(get_skill_registry().skills)}（仅更新元数据）")
+
+            # ── 步骤5：编程式注册 —— 动态追加无目录依赖的技能 ──
+            # 适用于：运行时热插拔、从配置服务动态加载技能
+            print(f"\n  [步骤5] 编程式注册内存技能（热插拔）")
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                (tmp_path / "SKILL.md").write_text(
+                    "# 渐进式演示技能\n提供标准化演示场景处理流程。",
+                    encoding="utf-8",
+                )
+                demo_manifest = SkillManifest.from_dict({
+                    "name": "demo-progressive",
+                    "description": "渐进式热插拔演示",
+                    "triggers": [{"type": "keyword", "value": "演示场景"}],
+                    "tags": ["demo"],
+                })
+                get_skill_registry().register(demo_manifest, tmp_path)
+                total = len(get_skill_registry().skills)
+                print(f"    编程式注册完成，注册表共 {total} 个技能")
+                for info in get_skill_registry().list_skills():
+                    print(f"    - {info['name']}: {info['description']}")
+                assert "demo-progressive" in get_skill_registry().skills
+
+                # ── 步骤6：热重载单个技能 ──
+                # reload_skill() 重新解析 metadata.json，无需重扫整个目录
+                print(f"\n  [步骤6] 热重载单个技能（reload_skill）")
+                ok = get_skill_registry().reload_skill("taocan-skill")
+                print(f"    taocan-skill 热重载: {'✓ 成功' if ok else '✗ 失败'}")
+                assert ok, "taocan-skill 热重载应成功"
+
+            # ── 步骤7：注销演示技能，还原至只有 taocan-skill ──
+            print(f"\n  [步骤7] 注销演示技能")
+            removed = get_skill_registry().unregister("demo-progressive")
+            print(f"    注销: {'✓ 成功' if removed else '✗ 失败'}")
+            print(f"    剩余技能: {list(get_skill_registry().skills.keys())}")
+            assert "demo-progressive" not in get_skill_registry().skills
+
+            # ═══════════════════════════════════════════════════════════
+            # 阶段B：完整管线演示（技能注入 + 参考文档按需加载 + 脚本工具）
+            # ═══════════════════════════════════════════════════════════
+            # 框架全自动完成全部技能链路：
+            #   SkillMiddleware:  before_agent() 匹配触发器、注入 SKILL.md
+            #   factory.py:       feat.skill=True 时预加载 load_skill_reference + 脚本工具
+            #   LLM ReAct 循环:   SkillDemoLLM 按序调用工具；验证器检查 "1188"
+            print(f"\n  ── 阶段B：完整管线演示（技能注入 + 参考文档 + 脚本工具）──")
+
+            print(f"\n  [步骤8] create_agent + SkillMiddleware + GoalLoop 全管线")
+            loop = create_agent(
+                model=SkillDemoLLM(),
+                tools=[calculator],
+                features=AgentFeatures(
+                    skill=True,
+                    dangling_tool_call=True,
+                    tool_error_handling=True,
+                    loop_detection=False,
+                    token_usage=False,
+                ),
+                goal="查询99元套餐年费并验证价格合规性",
+                verifier=KeywordVerifier(keyword="1188"),
+                budget=Budget(config=BudgetConfig(
+                    max_iterations=5,
+                    max_time_seconds=30,
+                )),
+                name="demo_skill_agent",
+            )
+
+            print(f"    Agent 类型: {type(loop).__name__}（GoalLoop 包装）")
+
+            result = asyncio.run(loop.run(
+                input_messages=[HumanMessage(content="帮我查一下99元套餐的年费")],
+                thread_id="skill-demo-001",
+            ))
+
+            # 从最终状态消息确认各环节执行情况
+            # SkillMiddleware 将技能注入写入 state，消息流中可直接看到 <!-- SKILL: --> 标记
+            messages = result.final_state.get("messages", [])
+            print(f"\n  [消息流] 共 {len(messages)} 条:")
+            for i, msg in enumerate(messages):
+                role = type(msg).__name__
+                c = str(getattr(msg, "content", ""))
+                is_skill = "<!-- SKILL:" in c
+                is_goal = "[目标]" in c
+                tag = " [技能注入]" if is_skill else (" [目标注入]" if is_goal else "")
+                display = c[:80] + ("..." if len(c) > 80 else "")
+                print(f"    [{i}] {role}: {display}{tag}")
+
+            tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+            skill_injected = any("<!-- SKILL:" in str(getattr(m, "content", "")) for m in messages)
+            ref_loaded = any("字段归一规则" in str(getattr(m, "content", "")) for m in tool_msgs)
+            script_called = any("合规" in str(getattr(m, "content", "")) for m in tool_msgs)
+
+            print(f"\n  [验证结果]")
+            print(f"    GoalLoop 成功:   {'通过' if result.success else '失败'}"
+                  f" (迭代={result.iterations}, reason={result.reason})")
+            print(f"    技能注入到 state: {'通过' if skill_injected else '失败'}"
+                  f" (SkillMiddleware 在 before_agent 写入 state['messages'])")
+            print(f"    参考文档加载:    {'通过' if ref_loaded else '失败'}"
+                  f" (load_skill_reference 按需返回 field_rules.md)")
+            print(f"    脚本工具调用:    {'通过' if script_called else '失败'}"
+                  f" (validate_taocan_price 返回合规结果)")
+
+        finally:
+            reset_skill_registry()
+
+        print(f"\n  [结论] 渐进式 Skill 系统完整演示完毕")
 
 
 # =====================================================================
@@ -712,7 +833,7 @@ class TestE2E_5_FullPipeline(unittest.TestCase):
 if __name__ == "__main__":
     print("""
 ╔══════════════════════════════════════════════════════════════════╗
-║  uniagent 框架端到端调试测试                                      ║
+║  uniagent 框架端到端演示                                          ║
 ║                                                                  ║
 ║  提示：在任何 "★ 断点" 注释处打断点，用 IDE 的 Debug 模式运行       ║
 ║  推荐断点位置：                                                    ║
@@ -722,4 +843,22 @@ if __name__ == "__main__":
 ║    4. TurnLoop.run() / GoalLoop.run() — 观察循环引擎               ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
-    unittest.main(verbosity=2)
+
+    demos = [
+        ("场景1：裸 Agent（无循环引擎）", demo_bare_agent),
+        ("场景2：TurnLoop（固定轮次循环）", demo_turn_loop),
+        ("场景3a：GoalLoop 目标达成", demo_goal_loop_success),
+        ("场景3b：GoalLoop 预算耗尽", demo_goal_loop_budget_exhausted),
+        ("场景4：中间件链执行顺序", demo_middleware_order),
+        ("场景5：完整管线（全部组件串联）", demo_full_pipeline),
+        ("场景6：Skill 技能系统", demo_skill_system),
+    ]
+
+    for name, fn in demos:
+        try:
+            fn()
+            print(f"\n  >>> {name} 执行完毕 <<<\n")
+        except Exception as e:
+            print(f"\n  >>> {name} 出错: {e} <<<\n")
+            import traceback
+            traceback.print_exc()

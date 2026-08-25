@@ -82,7 +82,8 @@ Agent 看到后换策略 → search("Python 入门指南") ✅
 
 ```python
 from langchain_openai import ChatOpenAI
-from uniagent import create_agent, AgentFeatures
+from uniagent import create_agent, AgentFeatures, Budget, BudgetConfig
+from uniagent.verification.builtins import LLMVerifier
 
 # 你自己实例化所有东西
 model = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -92,14 +93,16 @@ tools = [my_search_tool, my_calculator_tool]
 agent = create_agent(model, tools)
 result = await agent.ainvoke({"messages": [{"role": "user", "content": "你好"}]})
 
-# 模式2：带自定义特性
+# 模式2：带自定义特性（当前可用特性见 AgentFeatures 定义）
 agent = create_agent(
     model,
     tools,
     features=AgentFeatures(
-        loop_detection=True,     # 开启循环检测
-        summarization=True,      # 开启对话摘要
-        sandbox=False,           # 不用沙箱
+        dangling_tool_call=True,   # 修补断裂的工具调用对话
+        tool_error_handling=True,  # 工具异常转为 ToolMessage，不崩溃
+        loop_detection=True,       # 检测重复调用同一工具
+        token_usage=True,          # 统计 token 用量
+        skill=False,               # 不启用技能自动匹配中间件
     ),
     system_prompt="你是一个Python专家。",
 )
@@ -108,11 +111,11 @@ agent = create_agent(
 agent = create_agent(
     model,
     tools,
-    goal="写一个贪吃蛇游戏",
-    verifier=CommandVerifier("python -m pytest tests/"),
-    budget=BudgetConfig(max_iterations=10),
+    goal="完成指定任务",
+    verifier=LLMVerifier(model=ChatOpenAI(model="gpt-4o-mini"), confidence_threshold=0.8),
+    budget=Budget(config=BudgetConfig(max_iterations=10)),
 )
-result = await agent.run()
+result = await agent.run(input_messages=[{"role": "user", "content": "开始"}])
 ```
 
 **特点：** 灵活、代码级控制，适合嵌入到其他 Python 项目中。
@@ -215,30 +218,23 @@ result = await agent.run(
 ### 模式3：GoalLoop（目标驱动 + 验证）
 
 ```python
-from uniagent.verification.builtins import CommandVerifier, LLMVerifier
+from uniagent import create_agent, Budget, BudgetConfig
+from uniagent.verification.builtins import LLMVerifier
 
-# 例子A：用命令验证（测试必须通过）
-agent = create_agent(
-    model, tools,
-    goal="用 Python 实现一个 TODO 应用，包含增删改查功能",
-    verifier=CommandVerifier("python -m pytest tests/ -v"),
-    budget=BudgetConfig(max_iterations=15, max_time_seconds=300),
-)
-result = await agent.run()
-# result.success  → True/False
-# result.evidence → 测试输出
-
-# 例子B：用 LLM 验证（独立评估器判断）
+# 用 LLM 验证（独立评估器判断目标是否完成）
 agent = create_agent(
     model, tools,
     goal="写一篇关于量子计算的科普文章，至少1000字",
     verifier=LLMVerifier(
-        model=ChatOpenAI(model="gpt-4o-mini"),  # 用不同的模型做评估
+        model=ChatOpenAI(model="gpt-4o-mini"),  # 用更小的模型做评估
         confidence_threshold=0.8,
     ),
-    budget=BudgetConfig(max_iterations=10),
+    budget=Budget(config=BudgetConfig(max_iterations=10, max_time_seconds=120)),
 )
-result = await agent.run()
+result = await agent.run(input_messages=[{"role": "user", "content": "请开始"}])
+# result.success   → True/False
+# result.evidence  → 验证器返回的证据字符串
+# result.iterations → 实际执行了几轮
 ```
 
 GoalLoop 执行流程：
@@ -423,3 +419,71 @@ class LoopDetectionMiddleware(Middleware):
 | 强制执行 WIP=1 约束 | ❌ | ✅ |
 | 记录迭代日志 | ❌ | ✅ |
 | 需要同时做两件事 | ✅ 通过 `loop_hooks()` 桥接两层 | — |
+
+---
+
+## 五、ModelFactory — 模型工厂
+
+### 为什么需要 ModelFactory？
+
+`config.example.yaml` 里的 `models` 配置段可以指定 `api_key`、`base_url`、
+`timeout` 等字段。`ModelFactory` 负责把这些配置字段正确映射到 LangChain SDK 的
+构造参数，实例化 `BaseChatModel` 并支持缓存与热重载。
+
+### ModelConfig 完整字段（v2.0.2）
+
+```yaml
+models:
+  - name: default               # 标识符，按名字查找；找不到时回退到第一个
+    use: "langchain_openai:ChatOpenAI"  # 点分导入路径
+    model: gpt-4o-mini          # 传给 SDK 的 model 参数
+    temperature: 0.0
+    # ── 新增 API 接入字段（均有合理默认值，不填则使用默认）──
+    api_key: "${OPENAI_API_KEY}"        # 支持 ${ENV_VAR} 替换
+    base_url: "https://proxy.example.com/v1"  # 代理 / 私有化部署
+    timeout: 30.0               # 请求超时（秒），0 = 不限制
+    max_retries: 3              # SDK 层自动重试次数
+    extra_headers:              # 额外 HTTP 请求头
+      X-Custom-Token: "abc"
+    kwargs: {}                  # 兜底：优先级最高，可覆盖上述所有字段
+```
+
+**字段注入优先级（低 → 高）：**
+`api_key / base_url / timeout / max_retries / extra_headers` → `kwargs` 覆盖
+
+### 代码用法
+
+```python
+from uniagent import build_model, get_model, ModelFactory
+from uniagent.config.sub_configs import ModelConfig
+
+# 方式1：直接从 ModelConfig 构建（不使用缓存）
+mc = ModelConfig(
+    use="langchain_openai:ChatOpenAI",
+    model="gpt-4o-mini",
+    api_key="sk-...",
+    base_url="https://my-proxy.example.com/v1",
+    timeout=30.0,
+)
+model = build_model(mc)
+
+# 方式2：从全局 config.yaml 按名称获取（带缓存）
+model = get_model("default")   # 读取 config.yaml 中 name="default" 的配置
+judge = get_model("judge")     # 读取 name="judge" 的配置（适合判据小模型）
+
+# 方式3：手动管理工厂实例（适合需要缓存隔离的场景）
+factory = ModelFactory()
+model = factory.build(mc)               # 不缓存
+model = factory.get("default", mc)     # 带缓存
+factory.invalidate("default")          # 清除指定缓存（热重载）
+factory.invalidate()                   # 清除所有缓存
+```
+
+### 配置驱动 vs 代码驱动
+
+| 场景 | 推荐方式 |
+|------|---------|
+| 生产部署，模型参数由运维配置 | `config.yaml` + `get_model("default")` |
+| 嵌入其他项目，代码直接传模型 | `build_model(mc)` 或直接 `ChatOpenAI(...)` |
+| 多租户/请求级不同模型 | `ModelFactory` 独立实例，手动 `build()` |
+| 热重载（更新了 config.yaml） | `factory.invalidate()` 后下次 `get()` 自动重建 |

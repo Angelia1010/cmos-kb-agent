@@ -4,6 +4,7 @@ from uniagent.agents.factory import create_agent
 from uniagent.agents.config_factory import create_agent_from_config
 from uniagent.agents.features import AgentFeatures
 from uniagent.config.app_config import AppConfig, get_app_config
+from uniagent.models.factory import ModelFactory, build_model, get_model
 from uniagent.runtime.loop import GoalLoop, TurnLoop
 from uniagent.runtime.budget import Budget, BudgetConfig
 from uniagent.runtime.signals import LoopResult
@@ -15,6 +16,9 @@ __all__ = [
     "AgentFeatures",
     "AppConfig",
     "get_app_config",
+    "ModelFactory",
+    "build_model",
+    "get_model",
     "Budget",
     "BudgetConfig",
     "GoalLoop",

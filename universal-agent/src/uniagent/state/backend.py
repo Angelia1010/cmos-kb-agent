@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -88,7 +89,6 @@ class LocalFileBackend(StateBackend):
             dir=str(path.parent), suffix=".tmp", prefix=".state_"
         )
         try:
-            import os
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
             # Windows 上需要先删除目标文件才能重命名

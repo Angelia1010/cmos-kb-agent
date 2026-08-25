@@ -4,8 +4,14 @@
   "triggers": [
     {"type": "keyword", "value": "套餐"},
     {"type": "keyword", "value": "流量"},
-    {"type": "keyword", "value": "资费"}
+    {"type": "keyword", "value": "资费"},
+    {"type": "regex", "value": "\\d+元.*套餐|月租\\d+"}
   ],
-  "references": [],
+  "references": [
+    {"filename": "field_rules.md", "description": "字段归一详细规则表", "when": "on_demand"},
+    {"filename": "examples.md", "description": "坐席话术示例与标准应答", "when": "on_demand"}
+  ],
+  "scripts": ["validate_taocan.py"],
+  "promoted_tools": ["calculator"],
   "tags": ["business", "套餐"]
 }

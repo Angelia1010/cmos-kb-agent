@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""演示入口:PYTHONPATH=src python main.py
+"""kbagent 演示入口 —— PYTHONPATH=src python main.py
 
-1. 正常链路(套餐推荐,GoalLoop 1轮验证通过 + 业务技能包触发)
-2. 循环重试(冷门问题,验证失败→框架注入反馈→第2轮改写重召→轮次耗尽携最优退出)
-3. 缓存命中快速通道
-4. LLM 故障 → 降级兜底
+4 个场景（完全离线：ScriptedChatModel + MockES）：
+  1. 正常链路（套餐推荐，GoalLoop 1轮验证通过 + taocan-skill 技能包触发）
+  2. 循环重试（冷门问题，验证失败→框架注入反馈→第2轮改写重召→轮次耗尽携最优退出）
+  3. 缓存命中快速通道
+  4. LLM 故障 → 降级兜底
+
+uniagent 框架演示见 test_uniagent_e2e.py（7个场景，不依赖 kbagent）。
 """
 import sys
 sys.path.insert(0, "src")

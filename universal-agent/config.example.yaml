@@ -1,21 +1,47 @@
 ## KB 知识库智能体 — 配置模板(基于裁剪版 uniagent)
-## 复制为 config.yaml 使用。生产时把 models[0].use 换成内部网关/ChatOpenAI。
+## 复制为 config.yaml 使用。
 
 log_level: info
 
+# ── 模型配置（可配置多个，按 name 字段区分）──
+# ModelFactory 按 name 查找，找不到时回退到第一个。
+# api_key/base_url 支持 ${ENV_VAR} 或 ${ENV_VAR:default} 环境变量替换。
 models:
   - name: default
     use: "kbagent.scripted_model:ScriptedChatModel"   # 生产: "langchain_openai:ChatOpenAI"
     model: scripted-mock
     temperature: 0.0
-    kwargs: {}
+    # ── API 接入配置（新增字段，均有合理默认值）──
+    api_key: ""                  # 留空则使用环境变量 OPENAI_API_KEY；生产填 "${OPENAI_API_KEY}"
+    base_url: ""                 # 代理或私有化部署端点，如 "https://my-proxy.example.com/v1"
+    timeout: 60.0                # 请求超时秒数，0 = 不限制
+    max_retries: 2               # SDK 层自动重试次数
+    extra_headers: {}            # 额外 HTTP 请求头，如 {"X-Custom-Header": "value"}
+    kwargs: {}                   # 兜底：任意 provider 专属参数，可覆盖上述所有字段
+
+  ## 示例：生产环境 OpenAI 接入（取消注释即用）
+  # - name: default
+  #   use: "langchain_openai:ChatOpenAI"
+  #   model: gpt-4o-mini
+  #   temperature: 0.0
+  #   api_key: "${OPENAI_API_KEY}"
+  #   base_url: "https://my-proxy.example.com/v1"   # 如有代理填此处
+  #   timeout: 30.0
+  #   max_retries: 3
+
+  ## 示例：独立判据小模型（供 SufficiencyVerifier / LLMVerifier 使用）
+  # - name: judge
+  #   use: "langchain_openai:ChatOpenAI"
+  #   model: gpt-4o
+  #   api_key: "${OPENAI_API_KEY}"
+  #   temperature: 0.0
 
 tools: []          # KB 工具由 kbagent.pipeline 以代码方式绑定(RETRIEVAL_TOOLS / PROCESSING_TOOLS)
 
 loop:
-  max_iterations: 2        # 检索循环硬上限(V2 方案 3.1)
+  max_iterations: 2        # 检索循环硬上限
   max_tokens: 0
-  max_time_seconds: 2      # 检索阶段延迟预算
+  max_time_seconds: 2      # 检索阶段延迟预算（秒）
   verify_every: 1          # 每轮强制充分性验证
   checkpoint_every: 1
 
@@ -31,7 +57,7 @@ verification:
 skills:
   enabled: true
   directories:
-    - skills               # 业务技能包: taocan/kuandai/zhangdan/tousu
+    - skills               # 业务技能包目录，当前只含 taocan-skill
   max_active: 1            # 单查询命中一个业务类目即可
   auto_match: true
 

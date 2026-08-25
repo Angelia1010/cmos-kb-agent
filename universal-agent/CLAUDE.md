@@ -12,13 +12,12 @@ KB-Agent v2.0.2 — 10086坐席知识库智能体。基于裁剪版uniagent框�
 # 安装依赖
 pip install langgraph langchain-core pydantic pyyaml
 
-# 运行演示（离线，ScriptedChatModel + MockES）
+# 运行演示（kbagent 业务层，离线 ScriptedChatModel + MockES）
 PYTHONPATH=src python main.py
 
-# 测试
-python tests.py              # 8项关键约束测试
-python tests_subagents.py    # 4项子智能体测试
-python tests_bugfix.py       # 8项修复回归测试
+# 运行 uniagent 框架端到端演示/测试（7个场景，不依赖 kbagent）
+PYTHONPATH=src python test_uniagent_e2e.py
+PYTHONPATH=src python -m unittest test_uniagent_e2e -v
 ```
 
 无lint/格式化工具配置。测试使用标准库unittest，无pytest。
@@ -37,7 +36,15 @@ python tests_bugfix.py       # 8项修复回归测试
 
 ### 代码布局
 
-- `src/uniagent/` — 裁剪版通用框架（agents工厂、GoalLoop/TurnLoop循环引擎、中间件系统、技能子系统、工具注册表、充分性验证协议、ThreadState、配置热重载）
+- `src/uniagent/` — 裁剪版通用框架
+  - `agents/` — ReAct Agent 工厂（create_agent / create_agent_from_config）
+  - `models/` — 模型工厂子包（ModelFactory / build_model / get_model）；ModelConfig 支持 api_key / base_url / timeout / max_retries / extra_headers
+  - `middleware/` — 洋葱模型中间件（SkillMiddleware / ToolErrorHandling / LoopDetection / DanglingToolCall / TokenUsage）
+  - `runtime/` — GoalLoop / TurnLoop 循环引擎、Budget、LoopHook
+  - `skills/` — 技能子系统（SkillRegistry / SkillManifest / load_skill_scripts / load_skill_reference）
+  - `verification/` — Verifier 协议 + LLMVerifier / AlwaysPassVerifier
+  - `state/` — ThreadState / reducers / backend
+  - `config/` — AppConfig YAML 热重载、ModelConfig、SkillConfig 等子配置
 - `src/kbagent/` — 业务层实现
   - `main_agent.py` — 主智能体，三阶段固定编排入口
   - `subagents.py` — 三个子智能体定义（检索/处理/答案）
@@ -49,8 +56,9 @@ python tests_bugfix.py       # 8项修复回归测试
   - `models.py` — 核心数据结构（Chunk、RetrievalParams、FinalAnswer）
   - `scripted_model.py` — 离线Mock模型，用于测试和演示
   - `cache.py` / `workspace.py` / `tracing.py` / `config.py`
-- `skills/` — 业务技能包（taocan/kuandai/zhangdan/tousu），零代码可扩展
-- `main.py` — 演示入口（4个场景）
+- `skills/` — 业务技能包（当前：taocan-skill），零代码可扩展
+- `main.py` — kbagent 演示入口（4个场景）
+- `test_uniagent_e2e.py` — uniagent 框架端到端演示（7个场景，含 Skill 系统全链路）
 
 ### 关键设计约束
 
@@ -62,7 +70,7 @@ python tests_bugfix.py       # 8项修复回归测试
 
 ### 中间件（洋葱模型）
 
-DanglingToolCallMiddleware → ToolErrorHandlingMiddleware → LoopDetectionMiddleware → SkillMiddleware → TokenUsageMiddleware
+SkillMiddleware → DanglingToolCallMiddleware → ToolErrorHandlingMiddleware → LoopDetectionMiddleware → TokenUsageMiddleware
 
 ### 并发注意
 

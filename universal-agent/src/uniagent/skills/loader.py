@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from uniagent.skills.manifest import SkillManifest
 
@@ -27,6 +28,8 @@ class SkillContent:
     eager_references: dict[str, str] = field(default_factory=dict)
     loaded_references: dict[str, str] = field(default_factory=dict)
     _templates_cache: dict[str, str] = field(default_factory=dict)
+    script_tools: list[Any] = field(default_factory=list)
+    """从技能 scripts/ 目录加载的 LangChain 工具列表。"""
 
     @property
     def all_references(self) -> dict[str, str]:

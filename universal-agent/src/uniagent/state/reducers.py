@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, TypeVar
 
 T = TypeVar("T")
@@ -49,7 +50,6 @@ def _hashable(item: Any) -> Any:
         hash(item)
         return item
     except TypeError:
-        import json
         try:
             return json.dumps(item, sort_keys=True, default=str)
         except (TypeError, ValueError):

@@ -1,7 +1,0 @@
-{
-  "name": "zhangdan-skill",
-  "description": "账单类知识的字段归一与坐席处理规范",
-  "triggers": [{"type": "keyword", "value": "账单"},{"type": "keyword", "value": "话费"},{"type": "keyword", "value": "扣费"}],
-  "references": [],
-  "tags": ["business", "账单"]
-}

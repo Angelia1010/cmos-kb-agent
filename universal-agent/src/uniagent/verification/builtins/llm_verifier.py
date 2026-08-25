@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -49,8 +51,7 @@ class LLMVerifier:
         self._threshold = confidence_threshold
 
     async def verify(self, goal: str, state: dict[str, Any]) -> VerificationResult:
-        import json
-
+        """调用评估器 LLM 判断目标是否达成，返回结构化验证结果。"""
         messages_summary = _summarize_messages(state.get("messages", []))
 
         eval_messages = [
@@ -69,11 +70,14 @@ class LLMVerifier:
             response = await self._model.ainvoke(eval_messages)
             content = str(response.content).strip()
 
-            # M10: 更健壮的 JSON 代码块提取，支持大写标记、多代码块等
+            # M10: 健壮的 JSON 代码块提取，支持大写标记、多代码块等
             if "```" in content:
-                import re as _re
                 # 匹配所有代码块，提取第一个包含 JSON 的
-                blocks = _re.findall(r"```(?:[jJ][sS][oO][nN])?\s*\n?(.*?)```", content, _re.DOTALL)
+                blocks = re.findall(
+                    r"```(?:[jJ][sS][oO][nN])?\s*\n?(.*?)```",
+                    content,
+                    re.DOTALL,
+                )
                 for block in blocks:
                     stripped = block.strip()
                     if stripped.startswith("{"):
@@ -89,6 +93,7 @@ class LLMVerifier:
             confidence = float(result.get("confidence", 0.0))
             evidence = str(result.get("evidence", ""))
 
+            # 置信度低于阈值时强制降级为不通过
             if passed and confidence < self._threshold:
                 passed = False
                 evidence = (
@@ -114,7 +119,7 @@ class LLMVerifier:
 
 
 def _summarize_messages(messages: list[Any], max_chars: int = 3000) -> str:
-    """为评估器构建对话消息的精简摘要。"""
+    """为评估器构建对话消息的精简摘要（从最新消息开始，不超过 max_chars）。"""
     parts: list[str] = []
     total = 0
     for msg in reversed(messages):

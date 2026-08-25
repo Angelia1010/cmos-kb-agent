@@ -4,6 +4,8 @@ from uniagent.skills.manifest import SkillManifest, TriggerRule, ReferenceEntry
 from uniagent.skills.loader import SkillLoader, SkillContent
 from uniagent.skills.registry import SkillRegistry, MatchResult
 from uniagent.skills.injector import SkillInjector
+from uniagent.skills.script_loader import load_skill_scripts
+from uniagent.skills.tools import load_skill_reference
 
 __all__ = [
     "SkillManifest",
@@ -14,4 +16,6 @@ __all__ = [
     "SkillRegistry",
     "MatchResult",
     "SkillInjector",
+    "load_skill_scripts",
+    "load_skill_reference",
 ]

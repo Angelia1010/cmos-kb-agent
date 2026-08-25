@@ -1,8 +1,8 @@
 """检测重复的工具调用模式并中断无限循环。
 
 在两个层级上运行：
-- Agent 节点层：注入警告 HumanMessage（软控制）
-- 循环层：通过 LoopHook 发出 LoopSignal.BREAK（硬控制）
+- Agent 节点层：注入警告 HumanMessage（软控制，依赖 LLM 响应）
+- 循环层：通过 LoopHook 发出 LoopSignal.BREAK（硬控制，无条件终止）
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 
 from uniagent.middleware.base import Middleware
+from uniagent.runtime.hooks import LoopHook
+from uniagent.runtime.signals import HookResponse, LoopSignal
 from uniagent.state.thread_state import ThreadState
 
 logger = logging.getLogger(__name__)
@@ -42,10 +44,15 @@ class LoopDetectionMiddleware(Middleware):
         self._hard_limit = hard_limit
         self._repeat_count: int = 0
         self._last_sig: str = ""
-        # C5: 标志位替代在 before_agent 中重置计数器
+        # C5: 标志位替代在 before_agent 中重置计数器，确保 on_iteration_end 可检测到
         self._hard_stop_triggered: bool = False
 
     async def before_agent(self, state: ThreadState) -> ThreadState | None:
+        """检查最新 AIMessage 的 tool_calls 是否与上一次相同。
+
+        - 重复次数 >= 2：记录 INFO 警告日志
+        - 重复次数 >= hard_limit：注入 HumanMessage 警告并设置硬停止标志
+        """
         messages = state.get("messages", [])
         if not messages:
             return None
@@ -69,7 +76,7 @@ class LoopDetectionMiddleware(Middleware):
                 sig,
                 self._repeat_count,
             )
-            # C5: 设置标志位而非重置计数器，让 on_iteration_end 能检测到
+            # C5: 设置标志位而非直接重置，让 loop_hooks 的 on_iteration_end 能检测到
             self._hard_stop_triggered = True
             warning = HumanMessage(
                 content=(
@@ -85,14 +92,11 @@ class LoopDetectionMiddleware(Middleware):
         return None
 
     def loop_hooks(self) -> list[Any]:
-        """暴露用于循环层硬停止的钩子。
+        """返回循环层硬停止钩子。
 
-        钩子从 runtime 延迟导入，以避免在导入时产生
-        middleware → runtime 的硬依赖。
+        钩子在 on_iteration_end 检测 _hard_stop_triggered 标志，
+        若已设置则发出 LoopSignal.BREAK 强制终止 GoalLoop/TurnLoop。
         """
-        from uniagent.runtime.hooks import LoopHook
-        from uniagent.runtime.signals import HookResponse, LoopSignal
-
         mw = self
 
         class _LoopDetectionHook(LoopHook):
@@ -104,7 +108,7 @@ class LoopDetectionMiddleware(Middleware):
                 state: dict[str, Any],
                 agent_output: dict[str, Any] | None,
             ) -> HookResponse:
-                # C5: 使用标志位检查，然后重置
+                # C5: 使用标志位检查，检测后立即重置防止重复触发
                 if mw._hard_stop_triggered:
                     mw._hard_stop_triggered = False
                     mw._repeat_count = 0
@@ -129,7 +133,7 @@ def _signature(tool_calls: list[dict[str, Any]]) -> str:
     for tc in tool_calls:
         name = tc.get("name", "?")
         args = tc.get("args", {})
-        # H6: 用 json.dumps 处理所有类型参数，而非仅基本类型
+        # H6: json.dumps 确保所有类型参数都参与哈希，而非仅基本类型
         arg_str = json.dumps(args, sort_keys=True, default=str)
         parts.append(f"{name}({arg_str})")
     return "|".join(sorted(parts))
