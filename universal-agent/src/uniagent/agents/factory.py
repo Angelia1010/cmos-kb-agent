@@ -133,7 +133,16 @@ def create_agent(
         resolved_budget = Budget()
 
     # ── 解析循环钩子 ──
-    all_hooks = list(loop_hooks) if loop_hooks else feat.default_loop_hooks()
+    # 基础钩子：用户显式传入 > AgentFeatures 默认钩子
+    all_hooks: list = list(loop_hooks) if loop_hooks else feat.default_loop_hooks()
+
+    # 从中间件链收集各中间件声明的循环层钩子
+    # （如 LoopDetectionMiddleware 的硬停止钩子、LLMLoggingMiddleware 的迭代日志钩子）
+    # 注意：此处必须在 chain 确定后执行，且无论用户是否传入 loop_hooks 都需要追加
+    for mw in chain:
+        mw_hooks = mw.loop_hooks()
+        if mw_hooks:
+            all_hooks.extend(mw_hooks)
 
     # ── 按需包装为循环（三种模式）──
 

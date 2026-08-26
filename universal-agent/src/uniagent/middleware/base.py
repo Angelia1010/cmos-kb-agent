@@ -61,3 +61,22 @@ class Middleware:
         默认返回空列表（不参与循环层）。
         """
         return []
+
+    def get_invoke_config(self) -> dict[str, Any]:
+        """返回要合并到 ``agent.ainvoke(config=...)`` 的额外配置项。
+
+        覆盖此方法可让中间件向每次 LLM 调用注入额外配置，
+        最典型的用途是注入 LangChain callbacks：
+
+        .. code-block:: python
+
+            def get_invoke_config(self) -> dict:
+                return {"callbacks": [self._my_callback]}
+
+        ``_invoke_agent`` 会遍历整条中间件链，将所有 callbacks 合并后
+        一并传入 ``ainvoke``，从而让 TurnLoop / GoalLoop 模式下的中间件
+        也能捕获完整的 LLM prompt / response / 工具调用信息。
+
+        默认返回空字典（不注入额外配置）。
+        """
+        return {}

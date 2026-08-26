@@ -40,6 +40,13 @@ class AgentFeatures:
     token_usage: bool | Middleware = True
     skill: bool | Middleware = False
     """启用技能自动匹配中间件（SkillMiddleware）。"""
+    logging: bool | Middleware = False
+    """启用 LLM 调用日志中间件（LLMLoggingMiddleware）。
+
+    True  → 使用默认实例（verbose=False，log_level=DEBUG）。
+    False → 禁用（默认）。
+    Middleware 实例 → 使用自定义实例，如 LLMLoggingMiddleware(verbose=True)。
+    """
 
     # ── 循环层级 ──
     goal_loop: bool = False
@@ -62,6 +69,7 @@ class AgentFeatures:
         # 延迟导入：打破循环依赖的唯一断点（见上方注释）
         from uniagent.middleware.builtins import (
             DanglingToolCallMiddleware,
+            LLMLoggingMiddleware,
             LoopDetectionMiddleware,
             SkillMiddleware,
             TokenUsageMiddleware,
@@ -69,7 +77,9 @@ class AgentFeatures:
         )
 
         # 按照中间件洋葱模型的执行顺序排列
+        # LLMLoggingMiddleware 置于链首，在其他中间件修改 state 之前捕获原始快照
         _defaults: list[tuple[str, type[Middleware]]] = [
+            ("logging",             LLMLoggingMiddleware),
             ("skill",               SkillMiddleware),
             ("dangling_tool_call",  DanglingToolCallMiddleware),
             ("tool_error_handling", ToolErrorHandlingMiddleware),

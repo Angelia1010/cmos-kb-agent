@@ -1,0 +1,18 @@
+# ── 大模型接入配置 ──────────────────────────────────────────────────────────
+# 填写 api_key 后即可运行 test_uniagent_e2e.py（使用真实大模型）。
+# ─────────────────────────────────────────────────────────────────────────────
+
+use: "langchain_anthropic:ChatAnthropic"   # Anthropic 兼容接口
+model: "deepseek-v4-flash"                 # DeepSeek 模型名
+
+api_key: "sk-1f9e66cf5dd744a3b4c25335799bb263"                          # 填写你的 DeepSeek API Key
+                                           # （映射到 anthropic_api_key）
+
+base_url: "https://api.deepseek.com/anthropic"   # DeepSeek Anthropic 兼容端点
+                                                  # （映射到 anthropic_api_url）
+
+temperature: 0.0
+timeout: 60.0
+max_retries: 2
+extra_headers: {}
+kwargs: {}

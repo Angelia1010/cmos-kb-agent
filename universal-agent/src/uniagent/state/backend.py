@@ -128,3 +128,42 @@ class LocalFileBackend(StateBackend):
             if not prefix or key.startswith(prefix):
                 keys.append(key)
         return keys
+
+
+# ── 工厂函数 ─────────────────────────────────────────────────────────────── #
+
+def get_backend(config: Any) -> StateBackend:
+    """根据 StateConfig 创建对应的状态后端实例。
+
+    内置别名：
+
+    - ``"local"``  → :class:`LocalFileBackend`（本地 JSON 文件）
+    - ``"redis"``  → :class:`~uniagent.state.redis_backend.RedisBackend`
+      （需 ``pip install redis``）
+
+    自定义后端：将 ``backend`` 设为点分导入路径，
+    构造函数接收 ``config`` 实例作为唯一参数。
+
+    参数
+    ------
+    config:
+        ``uniagent.config.sub_configs.StateConfig`` 实例。
+    """
+    backend_name: str = getattr(config, "backend", "local")
+
+    if backend_name == "local":
+        return LocalFileBackend(getattr(config, "state_dir", ".uniagent/state"))
+
+    if backend_name == "redis":
+        # 延迟导入：redis 是可选依赖，不在模块加载时引入
+        from uniagent.state.redis_backend import RedisBackend  # noqa: PLC0415
+        return RedisBackend(
+            url=getattr(config, "redis_url", "redis://localhost:6379/0"),
+            key_prefix=getattr(config, "key_prefix", "uniagent:state"),
+            ttl=getattr(config, "ttl", 0),
+        )
+
+    # 点分路径 → 自定义后端（接收整个 config 对象）
+    from uniagent.imports.resolvers import resolve_class  # noqa: PLC0415
+    cls = resolve_class(backend_name)
+    return cls(config)

@@ -46,8 +46,16 @@ loop:
   checkpoint_every: 1
 
 state:
+  # ── 本地文件后端（开发/单机，默认）──
   backend: local
   state_dir: ".uniagent/state"
+
+  ## 示例：Redis 后端（多进程/分布式部署，取消注释即用）
+  ## 前置：pip install redis
+  # backend: redis
+  # redis_url: "${REDIS_URL:redis://localhost:6379/0}"   # 支持环境变量替换
+  # key_prefix: "uniagent:state"   # 键命名空间，隔离不同应用/环境
+  # ttl: 0                         # 键 TTL（秒），0 = 永不过期；3600 = 1小时自动淘汰
 
 verification:
   strategy: none           # SufficiencyVerifier 由 kbagent 代码传入

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Sequence
 
@@ -74,14 +75,41 @@ class BaseLoop(ABC):
 
         修复 H1: before_agent 前浅拷贝 state，全部成功后才应用。
         修复 C3: 支持中间件的 handle_invoke_error 方法处理智能体调用异常。
+
+        追踪集成：若 ContextVar 中存在 AgentTrace，则在每个中间件的
+        before_agent / after_agent 前后记录 MiddlewareEvent（名称、动作、耗时）。
+        追踪失败不影响主流程（异常静默忽略）。
         """
         chain = getattr(self._agent, "_uniagent_middleware", None) or []
+
+        # ── 读取当前追踪上下文（无则静默跳过）──
+        try:
+            from uniagent.logging.trace import MiddlewareEvent, get_current_trace
+            _trace = get_current_trace()
+            _cur_iter = _trace.current_iteration() if _trace else None
+        except Exception:
+            _trace = None
+            _cur_iter = None
 
         # H1: 浅拷贝 state，确保中间件链部分失败时不污染原 state
         state_snapshot = {**state}
         try:
             for mw in chain:
+                _t0 = time.monotonic()
                 patch = await mw.before_agent(state)
+                _dur = (time.monotonic() - _t0) * 1000
+                # 写入 MiddlewareEvent（追踪集成）
+                if _cur_iter is not None:
+                    try:
+                        _cur_iter.middleware_events.append(MiddlewareEvent(
+                            phase="before",
+                            middleware=mw.name or type(mw).__name__,
+                            action="patched" if patch else "noop",
+                            patch_keys=list(patch.keys()) if patch else [],
+                            duration_ms=_dur,
+                        ))
+                    except Exception:
+                        pass
                 if patch:
                     state.update(patch)
         except Exception:
@@ -89,7 +117,15 @@ class BaseLoop(ABC):
             state.update(state_snapshot)
             raise
 
-        invoke_config = {"configurable": {"thread_id": thread_id}}
+        # 从中间件链收集 callbacks（如 LLMLoggingMiddleware 注入的 VerboseCallback）
+        extra_callbacks: list = []
+        for mw in chain:
+            extra_cfg = mw.get_invoke_config()
+            extra_callbacks.extend(extra_cfg.get("callbacks", []))
+
+        invoke_config: dict = {"configurable": {"thread_id": thread_id}}
+        if extra_callbacks:
+            invoke_config["callbacks"] = extra_callbacks
 
         # C3: 智能体调用异常时，让具备 handle_invoke_error 的中间件处理
         try:
@@ -104,7 +140,21 @@ class BaseLoop(ABC):
                 raise
 
         for mw in reversed(chain):
+            _t0 = time.monotonic()
             patch = await mw.after_agent(result)
+            _dur = (time.monotonic() - _t0) * 1000
+            # 写入 MiddlewareEvent（追踪集成）
+            if _cur_iter is not None:
+                try:
+                    _cur_iter.middleware_events.append(MiddlewareEvent(
+                        phase="after",
+                        middleware=mw.name or type(mw).__name__,
+                        action="patched" if patch else "noop",
+                        patch_keys=list(patch.keys()) if patch else [],
+                        duration_ms=_dur,
+                    ))
+                except Exception:
+                    pass
             if patch:
                 result.update(patch)
         return result
@@ -378,6 +428,18 @@ class GoalLoop(BaseLoop):
                 except Exception as exc:
                     logger.warning("验证器出错：%s", exc)
                     continue
+
+                # 将验证结果写入当前迭代的追踪记录（若追踪上下文存在）
+                try:
+                    from uniagent.logging.trace import get_current_trace
+                    _tr = get_current_trace()
+                    if _tr and _tr.iterations:
+                        _tr.iterations[-1].verification = {
+                            "passed": vr.passed,
+                            "evidence": vr.evidence or "",
+                        }
+                except Exception:
+                    pass
 
                 if vr.passed:
                     await self._notify_hooks(

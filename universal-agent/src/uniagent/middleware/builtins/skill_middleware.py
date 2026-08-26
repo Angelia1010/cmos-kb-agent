@@ -115,21 +115,53 @@ class SkillMiddleware(Middleware):
         #  langgraph 当前版本不存在；直接写入 state 可审计、可追溯）
         body = getattr(skill_content, "instruction", "") or str(skill_content)
 
+        # 已激活的脚本工具：告知 LLM 本技能提供了哪些可直接调用的工具
+        # （脚本工具已在 create_agent 时通过 factory.py 静态绑定到模型，
+        #  此处仅在 SystemMessage 中显式列出，帮助 LLM 知道它们的存在和用途）
+        script_tools = getattr(skill_content, "script_tools", [])
+        if script_tools:
+            body += "\n\n## 本技能已激活的业务工具（可直接调用）\n"
+            for t in script_tools:
+                tool_desc = getattr(t, "description", "") or ""
+                # description 可能多行，取第一行作摘要
+                tool_desc_summary = tool_desc.splitlines()[0] if tool_desc else ""
+                body += f"- `{t.name}`: {tool_desc_summary}\n"
+
+        # 推荐优先使用的通用工具（来自 metadata.promoted_tools）
+        if match.manifest.promoted_tools:
+            body += "\n## 推荐优先使用的工具\n"
+            for tool_name in match.manifest.promoted_tools:
+                body += f"- `{tool_name}`\n"
+
         # 列出可按需加载的参考文档，提示 LLM 可调用 load_skill_reference
         on_demand_refs = [
             ref for ref in match.manifest.references if ref.when == "on_demand"
         ]
         if on_demand_refs:
-            body += "\n\n可按需加载的参考文档（调用 load_skill_reference 获取）：\n"
+            body += "\n## 可按需加载的参考文档（调用 load_skill_reference 获取）\n"
             for ref in on_demand_refs:
                 desc = f": {ref.description}" if ref.description else ""
-                body += f"- {ref.filename}{desc}\n"
+                body += f"- `{ref.filename}`{desc}\n"
 
         skill_msg = SystemMessage(
             content=f"<!-- SKILL: {match.manifest.name} -->\n{body}"
         )
 
-        patch: dict[str, Any] = {"messages": messages + [skill_msg]}
+        # ── 7. 将 skill_msg 插入到第一条非 SystemMessage 之前 ──
+        # Anthropic 等 API 要求 SystemMessage 必须连续出现在消息流开头，
+        # 不能在 HumanMessage / AIMessage 之后再出现 SystemMessage。
+        # GoalLoop 已在 [0] 插入了 SystemMessage([目标])，SkillMiddleware
+        # 若直接 append 到末尾，就会触发 "multiple non-consecutive system messages"。
+        # 正确做法：找到最后一条连续 SystemMessage 的位置，将 skill_msg 紧随其后插入。
+        insert_idx = 0
+        for idx, m in enumerate(messages):
+            if isinstance(m, SystemMessage):
+                insert_idx = idx + 1  # 跟在最后一条 SystemMessage 后面
+            else:
+                break  # 第一条非 SystemMessage，插入点固定
+
+        patched_messages = messages[:insert_idx] + [skill_msg] + messages[insert_idx:]
+        patch: dict[str, Any] = {"messages": patched_messages}
 
         # 将 promoted_tools 写入 state，供下游中间件或工具路由使用
         promoted = self._injector.get_promoted_tools()

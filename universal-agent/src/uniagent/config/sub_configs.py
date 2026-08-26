@@ -48,10 +48,51 @@ class LoopConfig(BaseModel):
 
 
 class StateConfig(BaseModel):
-    """外部状态持久化的配置。"""
+    """外部状态持久化的配置。
 
-    backend: str = Field(default="local", description="状态后端：'local' 或点分导入路径。")
-    state_dir: str = Field(default=".uniagent/state", description="本地文件后端的存储目录。")
+    支持两种内置后端（通过 ``backend`` 字段选择）：
+
+    - ``"local"``：本地 JSON 文件（开发/单机部署，默认）；
+    - ``"redis"``：Redis 字符串（多进程/分布式部署）。
+
+    也可填写点分导入路径（如 ``"myapp.state:CustomBackend"``）接入自定义后端，
+    构造函数将接收当前 ``StateConfig`` 实例作为唯一参数。
+    """
+
+    backend: str = Field(
+        default="local",
+        description="状态后端：'local' / 'redis' 或自定义后端的点分导入路径。",
+    )
+    # ── 本地文件后端 ──
+    state_dir: str = Field(
+        default=".uniagent/state",
+        description="本地文件后端的存储目录（backend='local' 时有效）。",
+    )
+    # ── Redis 后端 ──
+    redis_url: str = Field(
+        default="redis://localhost:6379/0",
+        description=(
+            "Redis 连接 URL（backend='redis' 时有效）。"
+            "明文：redis://[:pass@]host[:port][/db]；"
+            "TLS：rediss://...；"
+            "支持 ${ENV_VAR} 环境变量替换。"
+        ),
+    )
+    key_prefix: str = Field(
+        default="uniagent:state",
+        description=(
+            "Redis 键命名空间前缀（backend='redis' 时有效）。"
+            "实际键格式：{key_prefix}:{logical_key}。"
+        ),
+    )
+    ttl: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Redis 键生存时间（秒，backend='redis' 时有效）。"
+            "0 = 永不过期；>0 = 自动淘汰（适合会话级状态）。"
+        ),
+    )
 
 
 class VerificationConfig(BaseModel):
