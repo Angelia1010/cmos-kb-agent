@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
-"""ProcessingSubAgent 测试
+"""旧 Processing Chunk 工具测试
 
 覆盖范围:
   T1  processing/tools — 7 个工具逐一单元测试
   T2  run_fallback_pipeline — 确定性保底流水线
-  T3  ProcessingSubAgent — 完整子智能体运行
 
 运行方式:
   PYTHONPATH=src python -m unittest tests.test_processing -v
 """
-import asyncio
 import json
 import sys
 import unittest
@@ -325,91 +323,6 @@ class TestFallbackPipeline(unittest.TestCase):
         # 内容被 clean_data 压缩空白，但不应截断
         cleaned = ws.data["chunks"][0].content
         self.assertGreater(len(cleaned), 10)
-
-
-# ══════════════════════════════════════════════════════════════════════════ #
-#  T3  ProcessingSubAgent 完整运行                                           #
-# ══════════════════════════════════════════════════════════════════════════ #
-
-class TestProcessingSubAgent(unittest.TestCase):
-
-    def _make_agent(self, enable_skills: bool = False):
-        from kbagent.processing.agent import ProcessingSubAgent
-        from kbagent.scripted_model import ScriptedChatModel
-        return ProcessingSubAgent(ScriptedChatModel(), Tracer(),
-                                  enable_skills=enable_skills)
-
-    def _setup_ws(self) -> RunWorkspace:
-        ws = RunWorkspace(
-            query="套餐推荐", cfg=DEFAULT_CONFIG,
-            es=MockESClient(), tracer=Tracer()
-        )
-        ws.stage = "processing"
-        set_workspace(ws)
-        return ws
-
-    def _sample_chunks(self) -> list:
-        return [
-            _chunk("k1", score=0.9, content="5G畅享套餐月费59元,含30GB流量。"),
-            _chunk("k2", score=0.7, content="加油包10元5GB,立即生效。"),
-            _chunk("k3", score=0.4, content="旧套餐已停售。", status="下架"),
-        ]
-
-    def test_returns_list_of_chunks(self):
-        self._setup_ws()
-        agent = self._make_agent()
-        chunks = asyncio.run(agent.run("套餐推荐", self._sample_chunks()))
-        self.assertIsInstance(chunks, list)
-
-    def test_offshelf_chunks_removed_by_processing(self):
-        """处理后，下架片段应被去噪工具或保底流水线过滤。"""
-        self._setup_ws()
-        agent = self._make_agent()
-        chunks = asyncio.run(agent.run("套餐推荐", self._sample_chunks()))
-        statuses = {c.extra.get("status") for c in chunks}
-        self.assertNotIn("下架", statuses,
-                         "处理子智能体应过滤下架片段")
-
-    def test_result_chunks_have_required_attrs(self):
-        self._setup_ws()
-        agent = self._make_agent()
-        chunks = asyncio.run(agent.run("套餐推荐", self._sample_chunks()))
-        for c in chunks:
-            self.assertTrue(c.chunk_id, "chunk 必须有 chunk_id")
-            self.assertTrue(c.content, "chunk 必须有 content")
-
-    def test_tracer_logs_processing_snapshot(self):
-        ws = self._setup_ws()
-        agent = self._make_agent()
-        agent.tracer = ws.tracer
-        asyncio.run(agent.run("套餐推荐", self._sample_chunks()))
-        events = [e.event for e in ws.tracer.events]
-        self.assertIn("snapshot", events,
-                      "处理子智能体应在 tracer 中记录 snapshot 事件")
-
-    def test_empty_input_triggers_fallback(self):
-        """子智能体没有产出时，保底流水线应接管，不崩溃。"""
-        ws = self._setup_ws()
-        agent = self._make_agent()
-        try:
-            result = asyncio.run(agent.run("套餐推荐", []))
-            self.assertIsInstance(result, list)
-        except Exception as exc:
-            self.fail(f"空输入不应抛出异常: {exc}")
-
-    def test_chunks_sorted_by_score_after_processing(self):
-        """sort_data 工具运行后，处理结果应按 score 降序排列。"""
-        self._setup_ws()
-        agent = self._make_agent(enable_skills=False)
-        chunks = asyncio.run(agent.run(
-            "套餐推荐",
-            [_chunk("c1", score=0.3), _chunk("c2", score=0.9),
-             _chunk("c3", score=0.6)],
-        ))
-        if len(chunks) >= 2:
-            scores = [c.score for c in chunks]
-            self.assertEqual(scores, sorted(scores, reverse=True),
-                             "处理后的 chunks 应按 score 降序排列")
 
 
 if __name__ == "__main__":

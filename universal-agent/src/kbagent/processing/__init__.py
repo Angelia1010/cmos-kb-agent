@@ -1,4 +1,5 @@
-"""数据处理子智能体 — ReAct 自主规划 + SkillMiddleware 业务技能包注入。"""
-from .agent import ProcessingSubAgent
+"""知识级 Processing 固定流水线。"""
+from .agent import KnowledgeProcessingOrchestrator
+from .rerank import rerank_candidates
 
-__all__ = ["ProcessingSubAgent"]
+__all__ = ["KnowledgeProcessingOrchestrator", "rerank_candidates"]

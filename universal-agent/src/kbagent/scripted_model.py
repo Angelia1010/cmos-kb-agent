@@ -66,6 +66,11 @@ class ScriptedChatModel(BaseChatModel):
                   **kwargs: Any) -> ChatResult:
         all_text = "\n".join(str(getattr(m, "content", "")) for m in messages)
 
+        # ---- 知识候选两阶段重排直调 ----
+        if "[TASK:rerank_batch]" in all_text or "[TASK:rerank_global]" in all_text:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content=self._scripted_rerank(all_text)))])
+
         # ---- 答案生成直调 ----
         if "[TASK:answer]" in all_text:
             return ChatResult(generations=[ChatGeneration(
@@ -158,3 +163,40 @@ class ScriptedChatModel(BaseChatModel):
         overlap = sum(1 for ch in set(sent) if ch in chunk and not ch.isspace())
         consistent = overlap >= max(3, int(len(set(sent)) * 0.3))
         return json.dumps({"consistent": consistent}, ensure_ascii=False)
+
+    # ---- 知识候选重排脚本 ----
+    def _scripted_rerank(self, text: str) -> str:
+        matches = re.findall(r"RERANK_INPUT_BEGIN\s*(\{.*?\})\s*RERANK_INPUT_END", text, re.S)
+        if not matches:
+            return json.dumps({"ranked_ids": []}, ensure_ascii=False)
+        try:
+            payload = json.loads(matches[-1])
+        except json.JSONDecodeError:
+            return json.dumps({"ranked_ids": []}, ensure_ascii=False)
+        query = " ".join(filter(None, (
+            str(payload.get("query") or ""), str(payload.get("retrieval_query") or "")
+        )))
+
+        def terms(value: str) -> set[str]:
+            value = value.casefold()
+            found = set(re.findall(r"[a-z0-9]+", value))
+            chinese = "".join(re.findall(r"[\u4e00-\u9fff]", value))
+            found.update(chinese[i:i + 2] for i in range(max(0, len(chinese) - 1)))
+            found.update(ch for ch in chinese if ch.strip())
+            return found
+
+        query_terms = terms(query)
+        scored = []
+        for input_index, candidate in enumerate(payload.get("candidates") or []):
+            evidence_id = str(candidate.get("evidence_id") or "")
+            title = str(candidate.get("title") or "")
+            content = str(candidate.get("content_md") or "")
+            title_terms = terms(title)
+            content_terms = terms(content)
+            score = 4 * len(query_terms & title_terms) + len(query_terms & content_terms)
+            if query and query.casefold() in (title + "\n" + content).casefold():
+                score += 20
+            scored.append((-score, input_index, evidence_id))
+        scored.sort()
+        top_k = max(0, int(payload.get("top_k") or 0))
+        return json.dumps({"ranked_ids": [item[2] for item in scored[:top_k]]}, ensure_ascii=False)

@@ -1,0 +1,19 @@
+# KB-Agent 镜像依赖 — Python >= 3.12
+# 版本锁定为本地 .venv 中已验证通过的版本，保证镜像可复现构建。
+
+# ── 核心框架 ──────────────────────────────────────────────
+langgraph==1.2.11
+langchain-core==1.6.0
+pydantic==2.13.4
+PyYAML==6.0.3
+
+# ── 模型 Provider（model_config.yaml 中 use: "langchain_anthropic:ChatAnthropic"）──
+langchain-anthropic==1.6.1
+
+# ── OpenAI 兼容 Provider（生产 config: use "kbagent.lingxi_provider:LingxiSSLChatOpenAI",
+#    灵犀 SSL 策略类,vendor 自 deerflow,继承 ChatOpenAI）──
+langchain-openai==1.6.0
+
+# ── 服务层（灵犀契约 HTTP 封装 kbagent_service；需要高性能事件循环可改装 uvicorn[standard]）──
+fastapi==0.141.1
+uvicorn==0.52.4
