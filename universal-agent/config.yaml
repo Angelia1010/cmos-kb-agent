@@ -1,11 +1,11 @@
 ## KB 知识库智能体 — 配置模板(基于裁剪版 uniagent)
-## 复制为 config.yaml 使用。api_key 经 ${ENV_VAR} 注入,不要把真实密钥写进本文件。
+## 复制为 config.yaml 使用。生产时把 models[0].use 换成内部网关/ChatOpenAI。
 
 log_level: info
 
 models:
   - name: default
-    use: "kbagent.shared.lingxi_provider:LingxiSSLChatOpenAI"   # 灵犀 SSL 策略类(已 vendor)
+    use: "kbagent.lingxi_provider:LingxiSSLChatOpenAI"   # 灵犀 SSL 策略类(已 vendor)
     model: "Qwen3.5-397B-A17B-FP8"
     temperature: 0.44
     kwargs:
@@ -21,19 +21,12 @@ models:
         chat_template_kwargs:
           enable_thinking: false
 
-  ## 离线演示:无网关时取消注释并注释掉上面的真实模型
-  # - name: default
-  #   use: "kbagent.scripted_model:ScriptedChatModel"
-  #   model: scripted-mock
-  #   temperature: 0.0
-  #   kwargs: {}
-
-tools: []          # KB 工具由 kbagent 以代码方式绑定(RETRIEVAL_TOOLS / PROCESSING_TOOLS)
+tools: []          # KB 工具由 kbagent.pipeline 以代码方式绑定(RETRIEVAL_TOOLS / PROCESSING_TOOLS)
 
 loop:
   # 注意:本段对 kbagent 服务链路不生效。真实预算在
-  # src/kbagent/shared/config.py 的 budget(检索)与
-  # kbagent_service/app.py 的 DEFAULT_TIMEOUT_S(端到端),调超时请改那两处。
+  # src/kbagent/config.py 的 budget(检索)与 kbagent_service/app.py 的
+  # DEFAULT_TIMEOUT_S(端到端),调超时请改那两处。
   max_iterations: 2
   max_tokens: 0
   max_time_seconds: 2

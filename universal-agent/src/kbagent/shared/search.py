@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
 """检索层:结构化参数校验 → 模板拼装 ES DSL → 混合召回 → RRF 融合。
 
-LLM 永远不接触 DSL 字符串,只输出 RetrievalParams;
-字段白名单在 build_dsl 中强制执行。
+对应方案 3.2 / 3.3:
+- LLM 永远不接触 DSL 字符串,只输出 RetrievalParams;
+- 字段白名单 + 值域夹紧在 build_dsl 中强制执行,消除注入与语法错误;
+- BM25 与向量 kNN 双通道并行,RRF 融合。
+
+生产接入:实现 ESClient,内部用 elasticsearch-py 执行 build_dsl 产出的
+DSL(keyword 通道)与 knn 检索(vector 通道)。MockESClient 内置一份
+坐席知识库样例数据,用词面/字符重叠模拟两个通道的打分。
 """
 from __future__ import annotations
 
@@ -11,11 +17,13 @@ from typing import Any, Dict, List, Tuple
 
 from .models import Chunk, RetrievalParams
 
+# ---- 字段白名单(方案 3.2:代码侧校验) ----
 ALLOWED_FILTER_FIELDS = {"category", "status", "region"}
 ALLOWED_BOOST_FIELDS = {"title", "content", "keywords"}
 
 
 def build_dsl(params: RetrievalParams, size: int = 10) -> Dict[str, Any]:
+    """由结构化参数拼装 keyword 通道的 ES DSL。只认白名单字段。"""
     terms = [t for t in (params.keywords + params.expanded_terms) if t]
     boosts = {k: v for k, v in params.boost_fields.items() if k in ALLOWED_BOOST_FIELDS}
     if not boosts:
@@ -32,13 +40,14 @@ def build_dsl(params: RetrievalParams, size: int = 10) -> Dict[str, Any]:
     filt: List[Dict[str, Any]] = [
         {"term": {field: value}}
         for field, value in params.filters.items()
-        if field in ALLOWED_FILTER_FIELDS
+        if field in ALLOWED_FILTER_FIELDS          # 白名单外的过滤字段直接丢弃
     ]
     return {"size": size, "query": {"bool": {"must": must, "filter": filt}}}
 
 
 def rrf_fuse(keyword_hits: List[Chunk], vector_hits: List[Chunk],
              k: int = 60, top_n: int = 8) -> List[Chunk]:
+    """Reciprocal Rank Fusion:score = Σ 1/(k + rank)。"""
     scores: Dict[str, float] = {}
     pool: Dict[str, Chunk] = {}
     for hits in (keyword_hits, vector_hits):
@@ -49,7 +58,7 @@ def rrf_fuse(keyword_hits: List[Chunk], vector_hits: List[Chunk],
     out: List[Chunk] = []
     for cid, s in ranked:
         c = pool[cid]
-        c.score = round(s * 30, 4)
+        c.score = round(s * 30, 4)   # 归一到与阈值同量纲(Mock 用)
         out.append(c)
     return out
 
@@ -63,6 +72,9 @@ class ESClient(ABC):
                       size: int = 10) -> List[Chunk]: ...
 
 
+# ---------------------------------------------------------------------------
+# Mock ES:内置坐席知识库样例(套餐/宽带/账单/投诉)
+# ---------------------------------------------------------------------------
 _KB: List[Dict[str, Any]] = [
     dict(chunk_id="kb_0001#p1", doc_id="kb_0001", doc_title="5G畅享套餐资费说明",
          category="套餐", status="在售", updated_at="2026-06-10", version="v3.2",
@@ -109,7 +121,7 @@ class MockESClient(ESClient):
         for row in _KB:
             if any(row.get(k) != v for k, v in filters.items()):
                 continue
-            text = row["doc_title"] * 2 + row["content"]
+            text = row["doc_title"] * 2 + row["content"]   # 标题加权
             s = sum(text.count(t) for t in query_terms)
             if s > 0:
                 scored.append((float(s), row))
@@ -118,6 +130,7 @@ class MockESClient(ESClient):
 
     def vector_search(self, query_text: str, filters: Dict[str, str],
                       size: int = 10) -> List[Chunk]:
+        # 用字符集合重叠率模拟语义相似度,兜住口语化改写
         q = set(query_text) - set(" ,。?？!")
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for row in _KB:
