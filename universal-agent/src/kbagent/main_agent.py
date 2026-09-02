@@ -101,7 +101,7 @@ class MainAgent:
     def _degrade(self, query: str, reason: str) -> FinalAnswer:
         """降级:原始 query → 保守单轮关键词检索 → 返回 topN 原始片段。"""
         try:
-            from . import lexicon
+            from .shared import lexicon
             params = RetrievalParams(keywords=lexicon.extract_keywords(query),
                                      retrieval_mode="keyword")
             hits = self.es.keyword_search(build_dsl(params, size=5))

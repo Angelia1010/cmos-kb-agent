@@ -12,8 +12,12 @@ DSL(keyword 通道)与 knn 检索(vector 通道)。MockESClient 内置一份
 """
 from __future__ import annotations
 
+import ast
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple
+import json
+import requests
+from jinja2 import Template as JinjaTemplate
 
 from .models import Chunk, RetrievalParams
 
@@ -21,6 +25,40 @@ from .models import Chunk, RetrievalParams
 ALLOWED_FILTER_FIELDS = {"category", "status", "region"}
 ALLOWED_BOOST_FIELDS = {"title", "content", "keywords"}
 
+
+# ── ngkm 检索请求模板(string.Template 占位符 {{ var }}) ──────────────────
+_INFO_RECALL_TEMPLATE = """{
+  "beans": [],
+  "params": {
+    "indexType": "knowledges_info",
+    "indexName": "ngkm.knowledges_{{ region_code }}",
+    "page": "1",
+    "size": "100",
+    "keyWord": "{{ keyword }}",
+    "searchInfo": "knowledgeName=10,klgAliasName=5",
+    "analysisType": "smart",
+    "relCalculus": "OR",
+    "highlightField": "knowledgeName,klgAliasName"
+  }
+}"""
+
+_ATOM_RECALL_TEMPLATE = """{
+  "beans": [
+    {"column": "knowledgeId", "value": "{{ knowledgeId }}", "type": "any"}
+  ],
+  "params": {
+        "indexType": "_doc",
+        "mandatoryField": "knowledgeId,paramType,klgAttrAtomId,paramName,content,wkuntt,srcTemplateAttrAtomId,channelCode,groupId,except,annotation,isSendMessage,srcTmpltGrpngId",
+        "indexName": "ngkm.knowledge_atom_{{ region_code }}",
+        "ignoreField": "_id"
+    }
+}"""
+
+_PROVINCE_TO_REGION = {
+        "福建": "591", "甘肃": "931", "海南": "898", "河北": "311",
+        "黑龙江": "451", "河南": "371", "宁夏": "951", "四川": "280",
+        "云南": "871","全国": "000"
+    }
 
 def build_dsl(params: RetrievalParams, size: int = 10) -> Dict[str, Any]:
     """由结构化参数拼装 keyword 通道的 ES DSL。只认白名单字段。"""
@@ -111,7 +149,6 @@ def _to_chunk(row: Dict[str, Any], score: float) -> Chunk:
         extra={"status": row["status"]},
     )
 
-
 class MockESClient(ESClient):
     def keyword_search(self, dsl: Dict[str, Any]) -> List[Chunk]:
         query_terms = dsl["query"]["bool"]["must"][0]["multi_match"]["query"].split()
@@ -142,3 +179,167 @@ class MockESClient(ESClient):
                 scored.append((sim, row))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [_to_chunk(r, round(s, 4)) for s, r in scored[:size]]
+
+
+class ProduceESClient(ESClient):
+    def _get_region_code(self,province: str) -> str:
+        return _PROVINCE_TO_REGION.get(province, "200")
+
+    def _get_atom_recall_template(knowledgeId: str) -> str:
+        return _ATOM_RECALL_TEMPLATE.substitute(knowledgeId=knowledgeId)
+
+    def _get_info_recall_template(self,province: str) -> str:
+        return _INFO_RECALL_TEMPLATE.substitute(region_code=self._get_region_code(province))
+
+    def _get_keyword(self,query: str) -> str:
+        payload = {
+            "query": query,
+            "context": {
+                "app_id": "hint_server",
+                "province_id": "test_pro",
+                "channel_id": "web",
+            },
+            "confidence_threshold": 0.5,
+        }
+        resp = requests.post(
+            "http://restapi.ly4.tyyt.cmos:20070/slot_extract_unified",
+            headers={"Content-Type": "application/json"},
+            json=payload, timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_info(self,keyword: str, region_code: str = "200", timeout: int = 30) -> dict:
+        """知识主索引关键词检索(ngkm.knowledges_{region_code})。
+        参考 tools.py 的 info_recall:省份映射 → 渲染 _INFO_RECALL_TEMPLATE →
+        POST ngkm 检索接口 → 返回 json。
+        region_code 支持省份名(福建/甘肃/... 自动转区号,如 "福建" -> "591")。
+        """
+        region_code = _PROVINCE_TO_REGION.get(region_code, region_code)
+        rendered = JinjaTemplate(_INFO_RECALL_TEMPLATE).render(
+            keyword=keyword, region_code=region_code)
+        payload = json.loads(rendered)
+        resp = requests.post(
+            "http://restapi.ngkmsearch.cs.glb.cmos:20070"
+            "/ngkmSearch/ws/int/busiSearcher/busiSearcherInterService",
+            headers={"Content-Type": "application/json"},
+            json=payload, timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_atom(self,knowledgeId: str, region_code: str = "200", timeout: int = 30) -> dict:
+        """原子表按 knowledgeId 检索(ngkm.knowledge_atom_{region_code})。
+        参考 tools.py 的 atom_recall:省份映射 → 渲染 _ATOM_RECALL_TEMPLATE →
+        POST ngkm 检索接口 → 返回 json。
+        region_code 支持省份名(自动转区号)。
+        """
+        region_code = _PROVINCE_TO_REGION.get(region_code, region_code)
+        rendered = JinjaTemplate(_ATOM_RECALL_TEMPLATE).render(
+            knowledgeId=knowledgeId, region_code=region_code)
+        payload = json.loads(rendered)
+        resp = requests.post(
+            "http://restapi.ngkmsearch.cs.glb.cmos:20070"
+            "/ngkmSearch/ws/int/busiSearcher/busiSearcherInterService",
+            headers={"Content-Type": "application/json"},
+            json=payload, timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    def keyword_search(self, query: str = "", region_code: str = "200",
+                   timeout: int = 30) -> dict:
+        """一体化检索流水线: keyword → info → atom → 合并。
+        参考 tools.py 的 intergrate_all: 槽位提取关键词 → 知识主索引检索 →
+        原子表按 knowledgeId 检索 → 拼接返回。
+        """
+        # ── Step 1: 槽位提取关键词 ───────────────────────────────────
+        try:
+            kw_resp = self._get_keyword(query=query)
+        except Exception as e:
+            return {"error": f"keyword 调用失败: {e}", "merged": []}
+
+        slots = kw_resp.get("slots", []) if isinstance(kw_resp, dict) else []
+        keywords: List[str] = []
+        for slot in slots:
+            raw = slot.get("slot_value", "") if isinstance(slot, dict) else ""
+            if not raw:
+                continue
+            try:
+                parsed = ast.literal_eval(raw)
+                if isinstance(parsed, (list, tuple)):
+                    keywords.extend(str(v).strip() for v in parsed if v)
+                else:
+                    keywords.append(str(parsed).strip())
+            except (ValueError, SyntaxError):
+                keywords.append(raw.strip())
+
+        seen: set = set()
+        keywords = [k for k in keywords if k and not (k in seen or seen.add(k))]
+
+        if not keywords:
+            return {"keywords": [], "info": [], "atom": [], "merged": [],
+                    "message": "未提取到有效关键词"}
+
+        # ── Step 2: 收集所有 info 条目(跨所有 keyword) ─────────────────
+        all_infos: List[dict] = []
+        for kw in keywords:
+            try:
+                info_resp = self._get_info(keyword=kw, region_code=region_code,
+                                          timeout=timeout)
+            except Exception:
+                continue
+            raw_obj = info_resp.get("object", "") if isinstance(info_resp, dict) else ""
+            parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
+            infos = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+            for info in infos:
+                if not isinstance(info, dict):
+                    continue
+                info["_keyword"] = kw
+                all_infos.append(info)
+
+        # 收集所有 knowledgeId(去重)
+        seen_kids: set = set()
+        kid_order: List[str] = []
+        for info in all_infos:
+            kid = info.get("knowledgeId") or info.get("knowledge_id") or ""
+            if kid and kid not in seen_kids:
+                seen_kids.add(kid)
+                kid_order.append(kid)
+
+        # ── Step 3: 按 knowledgeId 检索 atom(去重复用) ─────────────────
+        atoms_cache: Dict[str, List[dict]] = {}
+        for kid in kid_order:
+            try:
+                atom_resp = self._get_atom(knowledgeId=kid, region_code=region_code,
+                                           timeout=timeout)
+                raw_obj = atom_resp.get("object", "") if isinstance(atom_resp, dict) else ""
+                parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
+                atoms = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+                for a in atoms:
+                    if isinstance(a, dict):
+                        a["knowledgeId"] = kid
+            except Exception as e:
+                atoms = [{"knowledgeId": kid, "error": f"atom 调用失败: {e}"}]
+            atoms_cache[kid] = atoms
+
+        # ── Step 4: 合并 info + atom ──────────────────────────────────
+        result: List[dict] = []
+        all_info_clean: List[dict] = []
+        for info in all_infos:
+            kid = info.get("knowledgeId") or info.get("knowledge_id") or ""
+            entry = dict(info)
+            entry["atoms"] = atoms_cache.get(kid, []) if kid else []
+            entry.pop("_keyword", None)
+            result.append(entry)
+            all_info_clean.append(entry)
+
+        all_atoms: List[dict] = [a for atoms in atoms_cache.values() for a in atoms]
+
+        return {
+            "keywords": keywords,
+            "knowledge_ids": kid_order,
+            "info": all_info_clean,
+            "atom": all_atoms,
+            "merged_count": len(result),
+            "merged": result,
+        }

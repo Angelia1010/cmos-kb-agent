@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""kbagent — 编排好的主智能体 + 三个自主规划的子智能体(基于裁剪版 uniagent)。"""
+"""kbagent — 编排好的主智能体 + 三个自主规划的子智能体(基于裁剪版 uniagent)。
+
+子智能体统一出口在 kbagent.shared.subagents;此处按需懒加载,
+避免导入独立子模块时初始化完整主链。
+"""
 from __future__ import annotations
 
 from importlib import import_module
@@ -10,15 +14,19 @@ from .shared.config import Config, DEFAULT_CONFIG
 from .shared.search import ESClient, MockESClient
 
 if TYPE_CHECKING:
-    from .answer.agent import AnswerSubAgent
     from .main_agent import MainAgent
-    from .retrieval.agent import RetrievalSubAgent
+    from .shared.subagents import (
+        AnswerSubAgent,
+        ProcessingSubAgent,
+        RetrievalSubAgent,
+    )
 
 
 _LAZY_EXPORTS = {
     "MainAgent": (".main_agent", "MainAgent"),
-    "RetrievalSubAgent": (".retrieval.agent", "RetrievalSubAgent"),
-    "AnswerSubAgent": (".answer.agent", "AnswerSubAgent"),
+    "RetrievalSubAgent": (".shared.subagents", "RetrievalSubAgent"),
+    "ProcessingSubAgent": (".shared.subagents", "ProcessingSubAgent"),
+    "AnswerSubAgent": (".shared.subagents", "AnswerSubAgent"),
 }
 
 
@@ -41,5 +49,5 @@ __all__ = [
     "MainAgent",
     "ScriptedChatModel",
     "ESClient", "MockESClient",
-    "RetrievalSubAgent", "AnswerSubAgent",
+    "RetrievalSubAgent", "ProcessingSubAgent", "AnswerSubAgent",
 ]
