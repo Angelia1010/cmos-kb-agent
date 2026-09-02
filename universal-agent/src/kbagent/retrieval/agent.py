@@ -20,8 +20,10 @@ from .tools import RETRIEVAL_TOOLS
 
 _RETRIEVAL_GOAL = (
     "为用户问题召回足量、高相关的候选知识片段。"
-    "可用工具:query_understanding / question_rewrite / keyword_extraction / coarse_recall,"
+    "可用工具:query_understanding / question_rewrite / keyword_extraction / coarse_recall / intergrate_all,"
     "由你自主决定调用顺序;若收到验证失败反馈,请换策略(改写问题/放宽过滤)重新召回。"
+    "提示:intergrate_all 是一体化流水线,自动完成槽位提取→知识检索→原子表拼接,"
+    "适合快速获取带详情的知识条目。"
 )
 
 
@@ -34,33 +36,38 @@ class RetrievalSubAgent:
         self.tracer = tracer
         self._verifier = SufficiencyVerifier()
 
+    # async def run(self, query: str) -> List[Chunk]:
+    #     ws = get_workspace()
+    #     ws.stage = "retrieval"
+    #     loop = create_agent(
+    #         model=self.model,
+    #         tools=RETRIEVAL_TOOLS,
+    #         features=AgentFeatures(skill=False),
+    #         system_prompt="你是候选知识检索子智能体,自主规划检索步骤。",
+    #         goal=_RETRIEVAL_GOAL,
+    #         verifier=self._verifier,
+    #         budget=Budget(config=BudgetConfig(
+    #             max_iterations=self.cfg.max_retrieval_rounds,
+    #             max_time_seconds=self.cfg.budget["retrieval_total"] / 1000.0,
+    #         )),
+    #         name="retrieval_subagent",
+    #     )
+    #     result = await loop.run(
+    #         input_messages=[{"role": "user", "content": f"用户问题:{query}"}],
+    #         thread_id=self.tracer.trace_id,
+    #     )
+    #     self.tracer.log("retrieval", "loop_result",
+    #                     success=result.success, iterations=result.iterations,
+    #                     reason=result.reason)
+    #     chunks: List[Chunk] = ws.data.get("chunks", [])
+    #     if not result.success:
+    #         if not chunks and str(result.reason).startswith("错误"):
+    #             raise RuntimeError(f"检索子智能体失败: {result.reason}")
+    #         self.tracer.log("retrieval", "exit_with_best",
+    #                         reason=result.reason, count=len(chunks))
+    #     return chunks
     async def run(self, query: str) -> List[Chunk]:
         ws = get_workspace()
         ws.stage = "retrieval"
-        loop = create_agent(
-            model=self.model,
-            tools=RETRIEVAL_TOOLS,
-            features=AgentFeatures(skill=False),
-            system_prompt="你是候选知识检索子智能体,自主规划检索步骤。",
-            goal=_RETRIEVAL_GOAL,
-            verifier=self._verifier,
-            budget=Budget(config=BudgetConfig(
-                max_iterations=self.cfg.max_retrieval_rounds,
-                max_time_seconds=self.cfg.budget["retrieval_total"] / 1000.0,
-            )),
-            name="retrieval_subagent",
-        )
-        result = await loop.run(
-            input_messages=[{"role": "user", "content": f"用户问题:{query}"}],
-            thread_id=self.tracer.trace_id,
-        )
-        self.tracer.log("retrieval", "loop_result",
-                        success=result.success, iterations=result.iterations,
-                        reason=result.reason)
-        chunks: List[Chunk] = ws.data.get("chunks", [])
-        if not result.success:
-            if not chunks and str(result.reason).startswith("错误"):
-                raise RuntimeError(f"检索子智能体失败: {result.reason}")
-            self.tracer.log("retrieval", "exit_with_best",
-                            reason=result.reason, count=len(chunks))
-        return chunks
+        result = ws.es.keyword_search(query)
+        return result

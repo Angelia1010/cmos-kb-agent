@@ -1,47 +1,35 @@
 ## KB 知识库智能体 — 配置模板(基于裁剪版 uniagent)
-## 复制为 config.yaml 使用。
+## 复制为 config.yaml 使用。生产时把 models[0].use 换成内部网关/ChatOpenAI。
 
 log_level: info
 
-# ── 模型配置（可配置多个，按 name 字段区分）──
-# ModelFactory 按 name 查找，找不到时回退到第一个。
-# api_key/base_url 支持 ${ENV_VAR} 或 ${ENV_VAR:default} 环境变量替换。
 models:
   - name: default
-    use: "kbagent.scripted_model:ScriptedChatModel"   # 生产: "langchain_openai:ChatOpenAI"
-    model: scripted-mock
-    temperature: 0.0
-    # ── API 接入配置（新增字段，均有合理默认值）──
-    api_key: ""                  # 留空则使用环境变量 OPENAI_API_KEY；生产填 "${OPENAI_API_KEY}"
-    base_url: ""                 # 代理或私有化部署端点，如 "https://my-proxy.example.com/v1"
-    timeout: 60.0                # 请求超时秒数，0 = 不限制
-    max_retries: 2               # SDK 层自动重试次数
-    extra_headers: {}            # 额外 HTTP 请求头，如 {"X-Custom-Header": "value"}
-    kwargs: {}                   # 兜底：任意 provider 专属参数，可覆盖上述所有字段
-
-  ## 示例：生产环境 OpenAI 接入（取消注释即用）
-  # - name: default
-  #   use: "langchain_openai:ChatOpenAI"
-  #   model: gpt-4o-mini
-  #   temperature: 0.0
-  #   api_key: "${OPENAI_API_KEY}"
-  #   base_url: "https://my-proxy.example.com/v1"   # 如有代理填此处
-  #   timeout: 30.0
-  #   max_retries: 3
-
-  ## 示例：独立判据小模型（供 SufficiencyVerifier / LLMVerifier 使用）
-  # - name: judge
-  #   use: "langchain_openai:ChatOpenAI"
-  #   model: gpt-4o
-  #   api_key: "${OPENAI_API_KEY}"
-  #   temperature: 0.0
+    use: "kbagent.lingxi_provider:LingxiSSLChatOpenAI"   # 灵犀 SSL 策略类(已 vendor)
+    model: "Qwen3.5-397B-A17B-FP8"
+    temperature: 0.44
+    kwargs:
+      api_key: "${QWEN_API_KEY}"          # 环境变量注入,注意是 ${VAR} 语法
+      base_url: "https://10.254.123.75:30006/v1"
+      max_tokens: 8000
+      timeout: 600.0
+      max_retries: 2
+      streaming: true
+      cs_verify_ssl: false                # 内网自签证书:跳过证书校验(仅批准端点可用)
+      cs_allow_legacy_dh: true            # 兼容旧版 DH 密码套件(OpenSSL SECLEVEL=1)
+      extra_body:                         # vLLM 透传:关闭 Qwen3 思考模式
+        chat_template_kwargs:
+          enable_thinking: false
 
 tools: []          # KB 工具由 kbagent.pipeline 以代码方式绑定(RETRIEVAL_TOOLS / PROCESSING_TOOLS)
 
 loop:
-  max_iterations: 2        # 检索循环硬上限
+  # 注意:本段对 kbagent 服务链路不生效。真实预算在
+  # src/kbagent/config.py 的 budget(检索)与 kbagent_service/app.py 的
+  # DEFAULT_TIMEOUT_S(端到端),调超时请改那两处。
+  max_iterations: 2
   max_tokens: 0
-  max_time_seconds: 2      # 检索阶段延迟预算（秒）
+  max_time_seconds: 2
   verify_every: 1          # 每轮强制充分性验证
   checkpoint_every: 1
 
@@ -57,7 +45,7 @@ verification:
 skills:
   enabled: true
   directories:
-    - skills               # 业务技能包目录，当前只含 taocan-skill
+    - skills               # 业务技能包: taocan/kuandai/zhangdan/tousu
   max_active: 1            # 单查询命中一个业务类目即可
   auto_match: true
 

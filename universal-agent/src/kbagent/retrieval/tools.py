@@ -6,9 +6,12 @@ RetrievalParams 清洗 + build_dsl 字段白名单,LLM 永远不接触 ES DSL。
 """
 from __future__ import annotations
 
+import ast
 import json
+from string import Template
 from typing import Dict, List
 
+import requests
 from langchain_core.tools import tool
 
 from ..shared import lexicon
@@ -96,6 +99,19 @@ def coarse_recall(relax_filters: bool = False, retrieval_mode: str = "hybrid") -
     return _obs(recalled=len(fused), titles=[c.doc_title for c in fused],
                 scores=[c.score for c in fused])
 
+#使用es完成
+@tool
+def intergrate_all(query: str = "", region_code: str = "000",
+                   timeout: int = 30) -> dict:
+    """使用es完成检索"""
+    ws = get_workspace()
+    query = query or ws.query
+    result = ws.es.keyword_search(query=query, region_code=region_code, timeout=timeout)
+    ws.data["original_query"] = query
+    ws.data["region_code"] = region_code
+    ws.data["merged_results"] = result.get("merged", [])
+
+
 
 RETRIEVAL_TOOLS = [query_understanding, question_rewrite,
-                   keyword_extraction, coarse_recall]
+                   keyword_extraction, coarse_recall, intergrate_all]
