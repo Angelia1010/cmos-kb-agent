@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """kbagent 服务层 — 灵犀契约的 FastAPI 封装。
 
-启动(在 universal-agent 目录下;PYTHONPATH 需同时含 src 与 services):
+启动(在 knowbase-agent 项目根目录下;PYTHONPATH 需同时含 src 与 services):
     Windows:  set PYTHONPATH=src;services && python -m uvicorn kbagent_service.app:app --host 0.0.0.0 --port 8000
     Linux:    PYTHONPATH=src:services python -m uvicorn kbagent_service.app:app --host 0.0.0.0 --port 8000
 
@@ -16,7 +16,7 @@
     不拼接历史,避免稀释检索关键词。
 
 生产依赖:
-    - model: config.yaml 配置了 models 时经 ModelFactory 构建;否则回退离线 ScriptedChatModel
+    - model: config.yaml 配置了 models 时经 models[].use 解析构建;否则回退离线 ScriptedChatModel
     - es:    默认 MockESClient(离线);生产请 create_app(es=...) 注入真实 ESClient 实现
 """
 from __future__ import annotations
@@ -51,8 +51,9 @@ from .models import (
 
 logger = logging.getLogger("kbagent_service")
 
-# 端到端超时(秒):略大于 Config.budget["end_to_end"]=4000ms
-DEFAULT_TIMEOUT_S = 5.0
+# 端到端超时(秒):略大于 Config.budget["end_to_end"]=120000ms;
+# 覆盖内网大模型多轮调用(检索循环 + 答案生成),超时返回 50002
+DEFAULT_TIMEOUT_S = 120.0
 # appId 白名单环境变量:逗号分隔;为空则全部放行
 ENV_APP_IDS = "KB_SERVICE_APP_IDS"
 # 技能包目录:按本文件位置定位到仓库根,不依赖启动时 CWD
@@ -78,14 +79,33 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
+def _mask_secret(value: Any) -> str:
+    """脱敏展示密钥:仅保留首尾 4 位;未展开的占位符原样标出。"""
+    s = str(value) if value is not None else ""
+    if not s:
+        return "<empty>"
+    if s.startswith("${"):
+        return s + "  ← 占位符未展开(环境变量未注入)!"
+    return (s[:4] + "****" + s[-4:]) if len(s) > 8 else "****"
+
+
 def _default_model() -> Any:
-    """优先经 uniagent ModelFactory 从 config.yaml 构建;失败回退离线模型。"""
+    """优先按 config.yaml 的 models[].use 构建;失败回退离线模型。
+
+    本仓库裁剪版 uniagent 未内置独立 ModelFactory,故直接经
+    ``resolve_class`` 解析 ``use`` 指向的类,并按 ModelConfig 的
+    model/temperature/kwargs 构建(与参考实现的工厂语义一致)。
+    """
     try:
         from uniagent.config.app_config import get_app_config
-        from uniagent.models.factory import get_model
+        from uniagent.imports.resolvers import resolve_class
         cfg = get_app_config()
         if cfg.models:
-            return get_model("default", cfg)
+            mc = next((m for m in cfg.models if m.name == "default"),
+                      cfg.models[0])
+            model_cls = resolve_class(mc.use)
+            return model_cls(model=mc.model, temperature=mc.temperature,
+                             **mc.kwargs)
         logger.warning("config.yaml 未配置 models,使用离线 ScriptedChatModel")
     except Exception as exc:  # noqa: BLE001
         logger.warning("加载模型配置失败(%r),使用离线 ScriptedChatModel", exc)
@@ -137,6 +157,60 @@ def _register_routes(app: FastAPI, base: str) -> None:
     @app.get("/health")
     async def health() -> dict:
         return {"status": "ok"}
+
+    # ── 排障端点:无 shell/容器权限时经 HTTP 自检 ──────────────────────────
+    # /diag         查看实际加载的模型类、密钥注入状态(脱敏)
+    # /diag/gateway 用当前配置里的 key 实测大模型网关,返回网关原始响应
+    # 注意:排障完成后建议移除或加鉴权
+    @app.get("/diag")
+    async def diag(request: Request) -> dict:
+        info: dict = {
+            "model_class": type(request.app.state.model).__name__,
+            "es_class": type(request.app.state.es).__name__,
+            "env_QWEN_API_KEY": "set" if os.environ.get("QWEN_API_KEY") else "MISSING",
+        }
+        try:
+            from uniagent.config.app_config import get_app_config
+            cfg = get_app_config()
+            if cfg.models:
+                mc = next((m for m in cfg.models if m.name == "default"),
+                          cfg.models[0])
+                key = mc.kwargs.get("api_key")
+                info["config"] = {
+                    "use": mc.use,
+                    "model": mc.model,
+                    "base_url": str(mc.kwargs.get("base_url") or ""),
+                    "api_key": _mask_secret(key),
+                    "api_key_expanded": not (isinstance(key, str)
+                                             and key.startswith("${")),
+                }
+            else:
+                info["config"] = {"models": "未配置"}
+        except Exception as exc:  # noqa: BLE001
+            info["config"] = {"error": repr(exc)}
+        return info
+
+    @app.get("/diag/gateway")
+    async def diag_gateway() -> dict:
+        try:
+            import httpx
+            from uniagent.config.app_config import get_app_config
+            cfg = get_app_config()
+            if not cfg.models:
+                return {"error": "未配置 models"}
+            mc = cfg.models[0]
+            base_url = str(mc.kwargs.get("base_url") or "").rstrip("/")
+            if not base_url:
+                return {"error": "base_url 未配置(可能是 ScriptedChatModel 离线模式)"}
+            key = str(mc.kwargs.get("api_key") or "")
+            async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {key}"})
+            return {"status_code": resp.status_code,
+                    "body": resp.text[:800]}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": repr(exc)}
 
     @app.post(f"{base}/retrieve", response_model=AskResponse)
     async def ask(req: AskRequest, request: Request):
