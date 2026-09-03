@@ -17,3 +17,7 @@ langchain-openai==1.6.0
 # ── 服务层（灵犀契约 HTTP 封装 kbagent_service；需要高性能事件循环可改装 uvicorn[standard]）──
 fastapi==0.141.1
 uvicorn==0.52.4
+
+# ── 生产检索（shared/search.py 的 ProduceESClient:ngkm HTTP 调用 + 请求模板渲染）──
+requests==2.34.2
+Jinja2==3.1.6

@@ -54,33 +54,43 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
   - `state/` — ThreadState / reducers / backend
   - `config/` — AppConfig YAML 热重载、ModelConfig、SkillConfig 等子配置
 - `src/kbagent/` — 业务层实现（每个子智能体独立目录）
-  - `main_agent.py` — 主智能体，三阶段固定编排入口（无缓存，无多模型协同）
-  - `scripted_model.py` — 离线Mock模型，处理 ReAct / [TASK:answer] / [TASK:anchor_check]
-  - `shared/` — 跨子智能体共享模块
+  - `main_agent.py` — 主智能体，三阶段固定编排入口（缓存快速通道 / 降级兜底 / 全链路trace / judge接口桥接）
+  - `scripted_model.py` — 离线Mock模型，处理 ReAct / [TASK:answer] / [TASK:anchor_check] / [TASK:rerank_*]
+  - `shared/` — 跨子智能体共享的基础设施（不放子智能体实现）
     - `models.py` — 核心数据结构（Chunk、RetrievalParams、FinalAnswer）
-    - `search.py` — ES检索层抽象（build_dsl / rrf_fuse / MockESClient）
-    - `config.py` — 领域配置（阈值/预算/溯源天数）
+    - `search.py` — ES检索层抽象（build_dsl / rrf_fuse / MockESClient / ProduceESClient / merged_to_chunks）
+    - `config.py` — 领域配置（阈值/预算/溯源天数/缓存阈值）
+    - `cache.py` — 高频问题缓存（快速通道）
     - `workspace.py` — ContextVar 请求级工作区
     - `tracing.py` — 全链路 trace（TraceEvent / Tracer）
     - `lexicon.py` — 关键词提取 / 意图识别 / 同义扩展
+    - `lingxi_provider.py` — 灵犀网关 SSL 策略模型类（生产大模型统一入口）
+    - `llm_bridge.py` — 把普通 BaseChatModel 适配出 judge 接口（检索充分性判据用）
+    - `tools.py` — 无 Workspace 依赖的共享知识工具（SHARED_KNOWLEDGE_TOOLS）
+    - `knowledge_processing/` — 知识级处理库（规范化/分析/适用性过滤/Markdown/重排支撑）
   - `retrieval/` — 检索子智能体
     - `agent.py` — RetrievalSubAgent（GoalLoop 护栏）
-    - `sufficiency.py` — SufficiencyVerifier（纯规则：top3得分 + 数量下限）
-    - `tools.py` — 4个检索工具（query_understanding / question_rewrite / keyword_extraction / coarse_recall）
+    - `sufficiency.py` — SufficiencyVerifier（规则先行 + LLM意图覆盖）
+    - `tools.py` — 5个检索工具（query_understanding / question_rewrite / keyword_extraction / coarse_recall / intergrate_all）
   - `processing/` — 处理子智能体
-    - `agent.py` — ProcessingSubAgent（SkillMiddleware + 保底流水线）
-    - `tools.py` — 7个处理工具（analyze/clean/denoise/dedupe/structure/sort/apply_business_skill）
+    - `agent.py` — ProcessingSubAgent（SkillMiddleware + 保底流水线）+ KnowledgeProcessingOrchestrator（知识级固定流水线，供 processing_service）
+    - `tools.py` — 7个Chunk处理工具（analyze/clean/denoise/dedupe/structure/sort/apply_business_skill）+ 知识级工具工厂
+    - `rerank.py` / `output.py` / `prompts.py` — 两阶段重排、Top3→Chunk适配、重排Prompt
   - `answer/` — 答案子智能体
     - `agent.py` — AnswerSubAgent（select_fragments + generate）
-    - `generate.py` — 答案生成 + 逐句锚定校验（model.invoke 标准调用）
+    - `generate.py` — 答案生成 + 逐句锚定校验（model.invoke 标准调用，任意BaseChatModel可直连）
 - `skills/` — 业务技能包（当前：taocan-skill），零代码可扩展
-- `tests/` — kbagent 子智能体单元测试
-  - `test_retrieval.py` — 34项：DSL白名单 / 检索工具 / 充分性验证 / RetrievalSubAgent
-  - `test_processing.py` — 33项：7个处理工具 / 保底流水线 / ProcessingSubAgent
-  - `test_answer.py` — 41项：片段精选 / JSON解析 / 锚定校验 / AnswerSubAgent / 渲染
-- `test_kbagent_e2e.py` — kbagent 整体集成测试（7个测试类，108项）
+- `tests/` — kbagent 子智能体/服务单元测试（共202项）
+  - `test_retrieval.py` — DSL白名单 / 检索工具 / 充分性验证 / RetrievalSubAgent
+  - `test_processing.py` — 7个处理工具 / 保底流水线 / ProcessingSubAgent
+  - `test_answer.py` — 片段精选 / JSON解析 / 锚定校验 / AnswerSubAgent / 渲染
+  - `test_knowledge_processing.py` / `test_processing_chunk_output.py` / `test_shared_knowledge_tools.py` — 知识级处理链路
+  - `test_processing_service.py` / `test_processing_demo.py` — processing 服务与演示
+  - `test_state_redis.py` — Redis 状态后端（需安装 redis 包）
+- `test_kbagent_e2e.py` — kbagent 整体集成测试（40项）
 - `test_uniagent_e2e.py` — uniagent 框架端到端演示（7个场景，含 Skill 系统全链路）
-- `main.py` — kbagent 演示入口（4个场景）
+- `main.py` — kbagent 离线演示入口（4个场景）
+- `scripts/run_e2e_real_model.py` — 真实大模型端到端验证（生产网络内执行）
 
 ### 关键设计约束
 

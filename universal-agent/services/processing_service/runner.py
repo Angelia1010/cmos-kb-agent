@@ -5,6 +5,7 @@ import copy
 from typing import Any
 
 from kbagent.processing.agent import KnowledgeProcessingOrchestrator
+from kbagent.scripted_model import ScriptedChatModel
 from kbagent.shared.knowledge_processing.models import (
     ProcessingMeta,
     ProcessingWarning,
@@ -47,6 +48,11 @@ def _stats(meta: Any) -> ProcessingStats:
     if not isinstance(meta, ProcessingMeta):
         return ProcessingStats()
     return ProcessingStats(**meta.to_dict())
+
+
+def _model_mode(model: Any) -> str:
+    """scripted=离线Mock模型;llm=真实大模型(生产灵犀网关)。"""
+    return "scripted" if isinstance(model, ScriptedChatModel) else "llm"
 
 
 async def run_processing_request(
@@ -116,6 +122,7 @@ async def run_processing_request(
     return ProcessingResponseObject(
         request_id=request_id,
         trace_id=ws.tracer.trace_id,
+        model_mode=_model_mode(model),
         outcome=outcome,
         degraded=meta.degraded,
         elapsed_ms=ws.tracer.elapsed_ms(),

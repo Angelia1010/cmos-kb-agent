@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""答案生成:识别目标片段 → 组织答案(内联引用) → 逐句锚定校验 → 渲染输出。
+"""答案生成(方案 五,答案子智能体内部实现)。
 
-使用标准 model.invoke([SystemMessage, HumanMessage]) 调用 LLM，无需特殊接口。
-锚定失败策略:硬事实直接删除;软性表述标注"建议核实"。
+四步:识别目标片段 → 组织答案(内联引用) → 逐句锚定校验 → 渲染输出。
+使用标准 model.invoke([SystemMessage, HumanMessage]) 调用 LLM,无需特殊接口,
+任意 BaseChatModel(如灵犀网关的 LingxiSSLChatOpenAI)可直接接入。
+锚定失败策略:硬事实(资费/办理条件/生效规则)直接删除;软性表述标注"建议核实"。
 """
 from __future__ import annotations
 
@@ -25,12 +27,13 @@ _ANSWER_SYSTEM = (
 )
 
 _ANCHOR_SYSTEM = (
-    "[TASK:anchor_check] 判断句子与知识片段是否语义一致,"
+    '[TASK:anchor_check] 判断句子与知识片段是否语义一致,'
     '输出 JSON: {"consistent": bool}。只输出 JSON。'
 )
 
 
 def _parse_json(raw: str) -> Dict[str, Any]:
+    """解析 LLM 输出的 JSON;剥离 markdown 代码围栏,失败返回空字典。"""
     raw = re.sub(r"^```(json)?|```$", "", str(raw).strip(), flags=re.M).strip()
     try:
         data = json.loads(raw)
@@ -47,11 +50,14 @@ def _invoke_json(model: Any, system: str, user: str) -> Dict[str, Any]:
 
 
 def select_fragments(query: str, chunks: List[Chunk], top_n: int = 4) -> List[Chunk]:
-    """识别目标片段:取 top_n,同文档最多 2 个片段。"""
+    """第一步:识别目标片段(该职责已从数据处理层收归到此)。
+    简化实现:处理层已按得分排序,取 top_n 并保证同文档不重复占满素材集。
+    """
     selected: List[Chunk] = []
     for c in chunks:
         if len(selected) >= top_n:
             break
+        # 同一文档最多 2 个片段,给其他文档留位
         if sum(1 for s in selected if s.doc_id == c.doc_id) >= 2:
             continue
         selected.append(c)
@@ -60,7 +66,7 @@ def select_fragments(query: str, chunks: List[Chunk], top_n: int = 4) -> List[Ch
 
 def generate(model: Any, query: str, materials: List[Chunk],
              cfg: Config, tracer: Tracer, trace_id: str) -> FinalAnswer:
-    """组织答案并执行逐句锚定校验。"""
+    """组织答案并执行逐句锚定校验;model 为任意标准 BaseChatModel。"""
     tracer.log("answer", "materials", chunk_ids=[c.chunk_id for c in materials])
     material_text = "\n".join(
         f'<chunk id="{c.chunk_id}">{c.content}</chunk>' for c in materials)
@@ -77,27 +83,31 @@ def generate(model: Any, query: str, materials: List[Chunk],
             hard_fact=bool(s.get("hard_fact", False)),
         ))
 
-    # ---- 逐句锚定校验 ----
+    # ---- 第三步:逐句锚定校验 ----
     for sent in sentences:
+        # 3a. 引用必须指向真实存在的片段
         real_cites = [c for c in sent.citations if c in valid_ids]
         if not real_cites:
             sent.anchored = False
         else:
             sent.citations = real_cites
+            # 3b. 语义一致性(小模型判句-片段一致性)
             chunk_text = " ".join(by_id[c].content for c in real_cites)
             check = _invoke_json(model, _ANCHOR_SYSTEM,
                                  f"句子:{sent.text}\n片段:{chunk_text}")
             sent.anchored = bool(check.get("consistent", False))
         if not sent.anchored:
             if sent.hard_fact:
-                sent.dropped = True
+                sent.dropped = True            # 硬事实零容忍:直接删除
             else:
-                sent.note = "建议核实"
+                sent.note = "建议核实"          # 软性表述降级标注
         tracer.log("answer", "anchor_check", text=sent.text[:40],
                    citations=sent.citations, hard_fact=sent.hard_fact,
                    anchored=sent.anchored, dropped=sent.dropped)
 
     kept = [s for s in sentences if not s.dropped]
+
+    # 重组两段式输出:删句后按剩余句子重建,保证与逐句结果一致
     expl = str(data.get("business_explanation", ""))
     sugg = str(data.get("handling_suggestion", ""))
     for s in sentences:
@@ -105,6 +115,7 @@ def generate(model: Any, query: str, materials: List[Chunk],
             expl = expl.replace(s.text, "").strip()
             sugg = sugg.replace(s.text, "").strip()
 
+    # ---- 第四步:来源列表 + 过旧提示 ----
     cited_ids: List[str] = []
     for s in kept:
         for c in s.citations:

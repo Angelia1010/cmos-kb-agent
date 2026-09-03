@@ -6,17 +6,14 @@ RetrievalParams 清洗 + build_dsl 字段白名单,LLM 永远不接触 ES DSL。
 """
 from __future__ import annotations
 
-import ast
 import json
-from string import Template
 from typing import Dict, List
 
-import requests
 from langchain_core.tools import tool
 
 from ..shared import lexicon
 from ..shared.models import Chunk, RetrievalParams
-from ..shared.search import build_dsl, rrf_fuse
+from ..shared.search import build_dsl, merged_to_chunks, rrf_fuse
 from ..shared.workspace import get_workspace
 
 
@@ -102,14 +99,30 @@ def coarse_recall(relax_filters: bool = False, retrieval_mode: str = "hybrid") -
 #使用es完成
 @tool
 def intergrate_all(query: str = "", region_code: str = "000",
-                   timeout: int = 30) -> dict:
-    """使用es完成检索"""
+                   timeout: int = 30) -> str:
+    """生产一体化检索流水线:槽位提取→知识主索引召回→原子表拼接,一次调用直接产出候选片段。仅在接入生产 ngkm 检索(ProduceESClient)时可用;离线环境请改用 coarse_recall。region_code 支持区号或省份名(如 000/福建)。"""
     ws = get_workspace()
+    full_recall = getattr(ws.es, "full_recall", None)
+    if full_recall is None:
+        return _obs(error="当前检索后端不支持一体化流水线,请改用 coarse_recall")
     query = query or ws.query
-    result = ws.es.keyword_search(query=query, region_code=region_code, timeout=timeout)
+    result = full_recall(query=query, region_code=region_code, timeout=timeout)
+    merged = result.get("merged", []) if isinstance(result, dict) else []
+    if not merged and isinstance(result, dict) and result.get("error"):
+        return _obs(error=result["error"])
+    chunks = merged_to_chunks(merged)
+    ws.data["chunks"] = chunks
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
-    ws.data["merged_results"] = result.get("merged", [])
+    ws.data["merged_results"] = merged
+    rnd = ws.data.get("recall_round", 0) + 1
+    ws.data["recall_round"] = rnd
+    ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
+                  channel="intergrate_all", region_code=region_code,
+                  titles=[c.doc_title for c in chunks],
+                  scores=[c.score for c in chunks])
+    return _obs(recalled=len(chunks), titles=[c.doc_title for c in chunks],
+                scores=[c.score for c in chunks])
 
 
 

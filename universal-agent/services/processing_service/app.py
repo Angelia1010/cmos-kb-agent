@@ -13,8 +13,6 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from kbagent.scripted_model import ScriptedChatModel
-
 from .models import (
     RTN_BAD_REQUEST,
     RTN_INTERNAL,
@@ -57,20 +55,43 @@ def _error(code: str, message: str, request_id: str, status_code: int) -> JSONRe
     return JSONResponse(status_code=status_code, content=payload.model_dump())
 
 
+def _default_model() -> Any:
+    """按 config.yaml 的 models[].use 构建 rerank 用模型(生产走灵犀网关)。
+
+    与 kbagent_service 的解析逻辑一致:经 ``resolve_class`` 解析 ``use``
+    指向的类,按 ModelConfig 的 model/temperature/kwargs 构建。解析失败
+    回退离线 ScriptedChatModel(仅离线演示,生产必须配置 models)。
+    """
+    try:
+        from uniagent.config.app_config import get_app_config
+        from uniagent.imports.resolvers import resolve_class
+        cfg = get_app_config()
+        if cfg.models:
+            mc = next((m for m in cfg.models if m.name == "default"), cfg.models[0])
+            model_cls = resolve_class(mc.use)
+            return model_cls(model=mc.model, temperature=mc.temperature, **mc.kwargs)
+        logger.warning("config.yaml 未配置 models,使用离线 ScriptedChatModel")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载模型配置失败(%r),使用离线 ScriptedChatModel", exc)
+    from kbagent.scripted_model import ScriptedChatModel
+    return ScriptedChatModel()
+
+
 def create_app(
     *,
     model: Any | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     base_path: str | None = None,
 ) -> FastAPI:
-    """创建首轮 Scripted Processing 服务；model 参数仅用于离线故障测试。"""
+    """创建 Processing 服务;model 缺省按 config.yaml 构建(灵犀网关真实模型)。"""
     base = _resolve_base_path(base_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.model = model if model is not None else ScriptedChatModel()
+        app.state.model = model if model is not None else _default_model()
         app.state.timeout_s = timeout_s
-        logger.info("Processing 服务就绪 base=%s model_mode=scripted", base)
+        logger.info("Processing 服务就绪 base=%s model=%s",
+                    base, type(app.state.model).__name__)
         yield
 
     app = FastAPI(title="processing-service", version="1.0.0", lifespan=lifespan)
@@ -84,8 +105,9 @@ def create_app(
         return _error(RTN_BAD_REQUEST, f"请求格式错误: {detail}", request_id, 422)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {"status": "ok", "model_mode": "scripted"}
+    async def health(request: Request) -> dict[str, str]:
+        return {"status": "ok",
+                "model_class": type(request.app.state.model).__name__}
 
     @app.post(f"{base}/process", response_model=ProcessingResponse)
     async def process(payload: ProcessingRequest, request: Request):

@@ -1,0 +1,21 @@
+# ── 敏感/本地配置(团队约定:不入库) ─────────────────────────────
+# config.yaml 含网关地址与 ${ENV} 密钥占位符,模板见 config.example.yaml
+universal-agent/config.yaml
+universal-agent/config.yaml.bak
+# model_config.yaml 曾含硬编码密钥,已移出版本库
+universal-agent/model_config.yaml
+
+# 部署环境变量(明文密钥,严禁入库)
+universal-agent/deploy/profile.env.sh
+universal-agent/deploy/profile_env.sh
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+
+# ── 虚拟环境 / 构建产物 / 本地目录 ──────────────────────────────
+.venv/
+universal-agent/.venv.zip
+dist/
+.claude/
+.uniagent/

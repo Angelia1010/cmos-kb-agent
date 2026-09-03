@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 from typing import Any, List, Optional
 
+from .answer.agent import AnswerSubAgent
+from .processing.agent import ProcessingSubAgent
+from .retrieval.agent import RetrievalSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.models import FinalAnswer, RetrievalParams, SourceRef
 from .shared.search import ESClient, build_dsl
-from .shared.subagents import AnswerSubAgent, ProcessingSubAgent, RetrievalSubAgent
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
 
@@ -87,7 +89,9 @@ class MainAgent:
             processed = await self._processing.run(query, chunks)
 
             # ---- ③ 答案生成子智能体(自主组织 + 确定性锚定) ----
-            ans = AnswerSubAgent(self.judge_model, self.cfg, self.tracer).run(
+            # generate 使用标准 model.invoke,直接传原始模型即可
+            # (judge_model 仅供检索充分性判据的 judge 接口使用)
+            ans = AnswerSubAgent(self.model, self.cfg, self.tracer).run(
                 query, processed, self.tracer.trace_id)
             ans.elapsed_ms = self.tracer.elapsed_ms()
             self.cache.put(nq, ans)

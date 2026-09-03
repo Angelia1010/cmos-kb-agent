@@ -1,12 +1,84 @@
-"""知识级 Processing 固定流水线入口。"""
+# -*- coding: utf-8 -*-
+"""数据处理子智能体(两个形态,共用本目录的工具集):
+
+- ``ProcessingSubAgent`` — 主链路使用的"自主规划"形态:
+  ReAct 子智能体自主决定清洗工具的取舍与顺序、业务 skill 的套用;
+  护栏:无产出时的确定性保底流水线、SkillMiddleware 业务技能包注入。
+- ``KnowledgeProcessingOrchestrator`` — processing_service 使用的
+  "固定流水线"形态:analyze → filter → build_markdown → rerank,
+  面向知识级候选(非 Chunk),零 LLM 编排。
+"""
 from __future__ import annotations
 
 from typing import Any, List
 
-from ..shared.knowledge_processing.models import KnowledgeProcessingOptions, ProcessedKnowledge
+from langchain_core.messages import HumanMessage
+from uniagent import AgentFeatures, create_agent
+
+from ..shared.knowledge_processing.models import (
+    KnowledgeProcessingOptions,
+    ProcessedKnowledge,
+)
+from ..shared.models import Chunk
+from ..shared.tracing import Tracer
 from ..shared.workspace import get_workspace
 from .output import top3_to_processed_chunks
-from .tools import build_knowledge_processing_tools
+from .tools import (
+    PROCESSING_TOOLS,
+    build_knowledge_processing_tools,
+    run_fallback_pipeline,
+)
+
+_PROCESSING_PROMPT = (
+    "你是数据处理子智能体,自主规划清洗流程,把候选知识处理为可用于答案生成的素材。"
+    "可用工具:analyze_data/clean_data/denoise_data/dedupe_data/structure_data/"
+    "sort_data/apply_business_skill,由你决定取舍与顺序。"
+    "若技能提示给出了业务类目的归一规则,套用 apply_business_skill。"
+    "不要裁剪片段内容 —— 片段取舍由答案生成子智能体负责。"
+)
+
+
+class ProcessingSubAgent:
+    """数据处理子智能体:ReAct 自主规划 + SkillMiddleware 业务技能包注入。"""
+
+    def __init__(self, model: Any, tracer: Tracer, enable_skills: bool = True):
+        self.tracer = tracer
+        self._agent = create_agent(
+            model=model, tools=PROCESSING_TOOLS,
+            features=AgentFeatures(skill=enable_skills, goal_loop=False),
+            system_prompt=_PROCESSING_PROMPT,
+            name="processing_subagent",
+        )
+
+    async def run(self, query: str, chunks: List[Chunk]) -> List[Chunk]:
+        ws = get_workspace()
+        ws.stage = "processing"
+        ws.data["chunks"] = list(chunks)
+        before = [c.chunk_id for c in chunks]
+        cats = sorted({c.category for c in chunks})
+        cat_hint = f"业务类目:{cats[0]}" if len(cats) == 1 else f"类目分布:{cats}"
+        try:
+            # SkillMiddleware 由循环引擎执行;裸 agent 场景手动跑一次 before_agent
+            state = {"messages": [HumanMessage(
+                content=f"清洗候选知识,共 {len(chunks)} 条。{cat_hint}。用户问题:{query}")]}
+            for mw in getattr(self._agent, "_uniagent_middleware", []):
+                patch = await mw.before_agent(state)
+                if patch:
+                    state.update(patch)
+            await self._agent.ainvoke(state)
+        except Exception as exc:                        # noqa: BLE001
+            self.tracer.log("processing", "agent_error", error=repr(exc))
+        # ---- 保底护栏:子智能体无有效产出 → 确定性流水线 ----
+        out = ws.data.get("chunks", [])
+        if not out:
+            self.tracer.log("processing", "fallback_pipeline",
+                            reason="子智能体产出为空")
+            ws.data["chunks"] = list(chunks)
+            run_fallback_pipeline()
+            out = ws.data["chunks"]
+        self.tracer.log("processing", "snapshot",
+                        before=before, after=[c.chunk_id for c in out])
+        return out
 
 
 class KnowledgeProcessingOrchestrator:
