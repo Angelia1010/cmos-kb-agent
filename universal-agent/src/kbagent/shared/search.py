@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Tuple
 
@@ -23,6 +24,8 @@ import requests
 from jinja2 import Template as JinjaTemplate
 
 from .models import Chunk, RetrievalParams, new_id
+
+logger = logging.getLogger("kbagent.search")
 
 # ---- 字段白名单(方案 3.2:代码侧校验) ----
 ALLOWED_FILTER_FIELDS = {"category", "status", "region"}
@@ -71,6 +74,35 @@ _NGKM_SEARCH_URL = ("http://restapi.ngkmsearch.cs.glb.cmos:20070"
 def _region_code(value: str) -> str:
     """省份名 → 区号;已是区号(或其他值)原样返回。"""
     return _PROVINCE_TO_REGION.get(value, value)
+
+
+def _preview(value: Any, limit: int = 800) -> str:
+    """日志安全预览:dict/list 转 JSON,控制台换行压成空格,超长截断。"""
+    try:
+        s = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:  # noqa: BLE001
+        s = str(value)
+    s = s.replace("\n", " ").replace("\r", " ")
+    return s if len(s) <= limit else s[:limit] + f"...(共{len(s)}字符)"
+
+
+def _extract_doc_list(parsed: Any) -> List[dict]:
+    """从 ngkm 检索响应的 object 解析结果中提取知识条目列表。
+
+    生产响应结构:object 是 JSON 对象,真正的条目列表在 ``docment`` 字段;
+    兼容解析结果本身就是 list 的旧结构;dict 且无 docment 字段时按单条处理。
+    """
+    if isinstance(parsed, list):
+        return [d for d in parsed if isinstance(d, dict)]
+    if isinstance(parsed, dict):
+        for key in ("docment", "document", "documents", "docs"):
+            docs = parsed.get(key)
+            if isinstance(docs, list):
+                logger.info("ngkm 响应从字段 %r 提取条目列表,共 %d 条",
+                            key, len(docs))
+                return [d for d in docs if isinstance(d, dict)]
+        return [parsed] if parsed else []
+    return []
 
 
 def build_dsl(params: RetrievalParams, size: int = 10) -> Dict[str, Any]:
@@ -157,6 +189,13 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
                    "source": "ngkm",
                    "atoms": atoms},
         ))
+    if len(chunks) < len(merged or []):
+        logger.info("merged_to_chunks: %d 条知识条目 → %d 条有效 Chunk"
+                    "(无内容/原子全失败的条目被丢弃)",
+                    len(merged or []), len(chunks))
+    for c in chunks[:5]:
+        logger.info("merged_to_chunks 产出: id=%s title=%r content_len=%d",
+                    c.chunk_id, c.doc_title, len(c.content))
     return chunks
 
 
@@ -281,13 +320,19 @@ class ProduceESClient(ESClient):
     def full_recall(self, query: str, region_code: str = "",
                     timeout: int = 0) -> dict:
         """完整流水线,返回 {keywords, knowledge_ids, info, atom, merged_count, merged}。"""
-        region_code = _region_code(region_code or self.region_code)
+        raw_region = region_code or self.region_code
+        region_code = _region_code(raw_region)
         timeout = timeout or self.timeout
+        logger.info("full_recall 开始 query=%r region=%r→%r "
+                    "索引=ngkm.knowledges_%s / ngkm.knowledge_atom_%s timeout=%ss",
+                    query, raw_region, region_code, region_code, region_code, timeout)
         try:
             keywords = self._extract_keywords(query)
         except Exception as exc:  # noqa: BLE001
+            logger.warning("full_recall 槽位提取异常,流水线终止: %r", exc)
             return {"error": f"keyword 调用失败: {exc}", "merged": []}
         if not keywords:
+            logger.warning("full_recall 未提取到有效关键词 → 零召回 query=%r", query)
             return {"keywords": [], "info": [], "atom": [], "merged": [],
                     "message": "未提取到有效关键词"}
         return self._info_atom_recall(keywords, region_code, timeout)
@@ -303,11 +348,20 @@ class ProduceESClient(ESClient):
             },
             "confidence_threshold": 0.5,
         }
-        resp = requests.post(_SLOT_EXTRACT_URL,
-                             headers={"Content-Type": "application/json"},
-                             json=payload, timeout=self.timeout)
+        try:
+            resp = requests.post(_SLOT_EXTRACT_URL,
+                                 headers={"Content-Type": "application/json"},
+                                 json=payload, timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("槽位提取请求失败(网络/超时/DNS) url=%s err=%r",
+                           _SLOT_EXTRACT_URL, exc)
+            raise
+        if resp.status_code != 200:
+            logger.warning("槽位提取返回非200 status=%s body=%s",
+                           resp.status_code, resp.text[:300])
         resp.raise_for_status()
         data = resp.json()
+        logger.info("槽位提取原始响应 query=%r: %s", query, _preview(data))
         slots = data.get("slots", []) if isinstance(data, dict) else []
         keywords: List[str] = []
         for slot in slots:
@@ -323,7 +377,12 @@ class ProduceESClient(ESClient):
             except (ValueError, SyntaxError):
                 keywords.append(raw.strip())
         seen: set = set()
-        return [k for k in keywords if k and not (k in seen or seen.add(k))]
+        deduped = [k for k in keywords if k and not (k in seen or seen.add(k))]
+        logger.info("槽位提取完成 query=%r slots=%d个 → keywords=%s",
+                    query, len(slots), deduped)
+        if not deduped:
+            logger.warning("槽位提取返回空关键词,响应体=%s", str(data)[:300])
+        return deduped
 
     def _info_atom_recall(self, keywords: List[str], region_code: str,
                           timeout: int) -> dict:
@@ -336,16 +395,32 @@ class ProduceESClient(ESClient):
             try:
                 info_resp = self._get_info(keyword=kw, region_code=region_code,
                                            timeout=timeout)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("info 召回失败,跳过该关键词 keyword=%r "
+                               "索引=ngkm.knowledges_%s err=%r",
+                               kw, region_code, exc)
                 continue
+            logger.info("info 原始响应 keyword=%r: %s", kw, _preview(info_resp))
             raw_obj = info_resp.get("object", "") if isinstance(info_resp, dict) else ""
-            parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
-            infos = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+            try:
+                parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
+            except json.JSONDecodeError as exc:
+                logger.warning("info 响应 object 非 JSON,跳过 keyword=%r err=%r raw=%s",
+                               kw, exc, str(raw_obj)[:200])
+                continue
+            infos = _extract_doc_list(parsed)
             for info in infos:
                 if not isinstance(info, dict):
                     continue
                 info["_keyword"] = kw
                 all_infos.append(info)
+            logger.info("info 召回 keyword=%r → %d 条", kw, len(infos))
+            for i, info in enumerate(infos[:5]):
+                if isinstance(info, dict):
+                    logger.info("  info[%d]: knowledgeId=%s name=%r keys=%s", i,
+                                info.get("knowledgeId") or info.get("knowledge_id"),
+                                info.get("knowledgeName") or info.get("knowledge_name"),
+                                sorted(info.keys())[:12])
 
         # 收集所有 knowledgeId(去重)
         seen_kids: set = set()
@@ -355,6 +430,12 @@ class ProduceESClient(ESClient):
             if kid and kid not in seen_kids:
                 seen_kids.add(kid)
                 kid_order.append(kid)
+        logger.info("info 召回汇总: keywords=%s 总条目=%d knowledgeIds=%s",
+                    keywords, len(all_infos), kid_order)
+        if not all_infos:
+            logger.warning("所有关键词均无 info 召回——请检查索引 "
+                           "ngkm.knowledges_%s 是否存在、其中有无匹配知识",
+                           region_code)
 
         # ---- Step 3: 按 knowledgeId 检索 atom(去重复用) ----
         atoms_cache: Dict[str, List[dict]] = {}
@@ -362,13 +443,18 @@ class ProduceESClient(ESClient):
             try:
                 atom_resp = self._get_atom(knowledgeId=kid, region_code=region_code,
                                            timeout=timeout)
+                logger.info("atom 原始响应 knowledgeId=%s: %s", kid, _preview(atom_resp))
                 raw_obj = atom_resp.get("object", "") if isinstance(atom_resp, dict) else ""
                 parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
-                atoms = parsed if isinstance(parsed, list) else [parsed] if isinstance(parsed, dict) else []
+                atoms = _extract_doc_list(parsed)
                 for a in atoms:
                     if isinstance(a, dict):
                         a["knowledgeId"] = kid
+                logger.info("atom 召回 knowledgeId=%s → %d 条", kid, len(atoms))
             except Exception as exc:  # noqa: BLE001
+                logger.warning("atom 召回失败 knowledgeId=%s "
+                               "索引=ngkm.knowledge_atom_%s err=%r",
+                               kid, region_code, exc)
                 atoms = [{"knowledgeId": kid, "error": f"atom 调用失败: {exc}"}]
             atoms_cache[kid] = atoms
 
@@ -384,6 +470,8 @@ class ProduceESClient(ESClient):
             all_info_clean.append(entry)
 
         all_atoms: List[dict] = [a for atoms in atoms_cache.values() for a in atoms]
+        logger.info("full_recall 完成: merged=%d 条 (info=%d, atom=%d) knowledgeIds=%s",
+                    len(merged), len(all_info_clean), len(all_atoms), kid_order)
         return {
             "keywords": keywords,
             "knowledge_ids": kid_order,
@@ -401,11 +489,24 @@ class ProduceESClient(ESClient):
         """知识主索引关键词检索(ngkm.knowledges_{region_code})。"""
         rendered = JinjaTemplate(_INFO_RECALL_TEMPLATE).render(
             keyword=keyword, region_code=_region_code(region_code))
-        resp = requests.post(
-            _NGKM_SEARCH_URL,
-            headers={"Content-Type": "application/json"},
-            json=json.loads(rendered), timeout=timeout,
-        )
+        logger.info("ngkm info 请求体 keyword=%r: %s", keyword,
+                    rendered.replace("\n", " "))
+        try:
+            resp = requests.post(
+                _NGKM_SEARCH_URL,
+                headers={"Content-Type": "application/json"},
+                json=json.loads(rendered), timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ngkm info 请求失败(网络/超时/DNS) url=%s keyword=%r err=%r",
+                           _NGKM_SEARCH_URL, keyword, exc)
+            raise
+        logger.info("ngkm info 响应 keyword=%r status=%s body=%s",
+                    keyword, resp.status_code, resp.text[:800])
+        if resp.status_code != 200:
+            logger.warning("ngkm info 检索非200 keyword=%r 索引=ngkm.knowledges_%s "
+                           "status=%s", keyword, _region_code(region_code),
+                           resp.status_code)
         resp.raise_for_status()
         return resp.json()
 
@@ -414,10 +515,24 @@ class ProduceESClient(ESClient):
         """原子表按 knowledgeId 检索(ngkm.knowledge_atom_{region_code})。"""
         rendered = JinjaTemplate(_ATOM_RECALL_TEMPLATE).render(
             knowledgeId=knowledgeId, region_code=_region_code(region_code))
-        resp = requests.post(
-            _NGKM_SEARCH_URL,
-            headers={"Content-Type": "application/json"},
-            json=json.loads(rendered), timeout=timeout,
-        )
+        logger.info("ngkm atom 请求体 knowledgeId=%s: %s", knowledgeId,
+                    rendered.replace("\n", " "))
+        try:
+            resp = requests.post(
+                _NGKM_SEARCH_URL,
+                headers={"Content-Type": "application/json"},
+                json=json.loads(rendered), timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ngkm atom 请求失败(网络/超时/DNS) url=%s knowledgeId=%s err=%r",
+                           _NGKM_SEARCH_URL, knowledgeId, exc)
+            raise
+        logger.info("ngkm atom 响应 knowledgeId=%s status=%s body=%s",
+                    knowledgeId, resp.status_code, resp.text[:800])
+        if resp.status_code != 200:
+            logger.warning("ngkm atom 检索非200 knowledgeId=%s "
+                           "索引=ngkm.knowledge_atom_%s status=%s",
+                           knowledgeId, _region_code(region_code),
+                           resp.status_code)
         resp.raise_for_status()
         return resp.json()

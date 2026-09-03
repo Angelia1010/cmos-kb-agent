@@ -7,6 +7,7 @@ RetrievalParams 清洗 + build_dsl 字段白名单,LLM 永远不接触 ES DSL。
 from __future__ import annotations
 
 import json
+import logging
 from typing import Dict, List
 
 from langchain_core.tools import tool
@@ -15,6 +16,8 @@ from ..shared import lexicon
 from ..shared.models import Chunk, RetrievalParams
 from ..shared.search import build_dsl, merged_to_chunks, rrf_fuse
 from ..shared.workspace import get_workspace
+
+logger = logging.getLogger("kbagent.retrieval")
 
 
 def _obs(**kw) -> str:
@@ -104,12 +107,18 @@ def intergrate_all(query: str = "", region_code: str = "000",
     ws = get_workspace()
     full_recall = getattr(ws.es, "full_recall", None)
     if full_recall is None:
+        logger.warning("intergrate_all: 当前检索后端 %s 无 full_recall,"
+                       "回退关键词召回", type(ws.es).__name__)
         return _obs(error="当前检索后端不支持一体化流水线,请改用 coarse_recall")
     query = query or ws.query
     result = full_recall(query=query, region_code=region_code, timeout=timeout)
     merged = result.get("merged", []) if isinstance(result, dict) else []
     if not merged and isinstance(result, dict) and result.get("error"):
+        logger.warning("intergrate_all 流水线报错: %s", result["error"])
         return _obs(error=result["error"])
+    if not merged and isinstance(result, dict) and result.get("message"):
+        logger.warning("intergrate_all 零召回: %s (keywords=%s)",
+                       result["message"], result.get("keywords"))
     chunks = merged_to_chunks(merged)
     ws.data["chunks"] = chunks
     ws.data["original_query"] = query
@@ -121,6 +130,8 @@ def intergrate_all(query: str = "", region_code: str = "000",
                   channel="intergrate_all", region_code=region_code,
                   titles=[c.doc_title for c in chunks],
                   scores=[c.score for c in chunks])
+    logger.info("intergrate_all 完成: query=%r region=%s merged=%d → chunks=%d",
+                query, region_code, len(merged), len(chunks))
     return _obs(recalled=len(chunks), titles=[c.doc_title for c in chunks],
                 scores=[c.score for c in chunks])
 

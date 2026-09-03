@@ -17,8 +17,9 @@
 
 生产依赖:
     - model: config.yaml 配置了 models 时经 models[].use 解析构建;否则回退离线 ScriptedChatModel
-    - es:    KB_SERVICE_ES=produce 时用 ProduceESClient(生产 ngkm 一体化流水线);
-             否则回退离线 MockESClient。也可 create_app(es=...) 显式注入覆盖。
+    - es:    缺省即 ProduceESClient(生产 ngkm 一体化流水线,intergrate_all 可用);
+             仅 KB_SERVICE_ES=mock 时回退离线 MockESClient。
+             也可 create_app(es=...) 显式注入覆盖。
 """
 from __future__ import annotations
 
@@ -78,8 +79,8 @@ _setup_logging()
 DEFAULT_TIMEOUT_S = 120.0
 # appId 白名单环境变量:逗号分隔;为空则全部放行
 ENV_APP_IDS = "KB_SERVICE_APP_IDS"
-# 检索后端选择:produce=生产 ngkm 一体化流水线(ProduceESClient);
-# 其他值/未设置=离线 MockESClient(内置 7 条样例,仅供演示)
+# 检索后端选择:默认 produce=生产 ngkm 一体化流水线(ProduceESClient);
+# 仅当显式设 KB_SERVICE_ES=mock 时才用离线 MockESClient(内置 7 条样例,本地演示)
 ENV_ES_BACKEND = "KB_SERVICE_ES"
 # ProduceESClient 缺省区域(请求未携带省份时使用);支持省份名或区号
 ENV_ES_REGION = "KB_SERVICE_ES_REGION"
@@ -147,20 +148,20 @@ def _default_model() -> Any:
 
 
 def _default_es() -> Any:
-    """按环境变量选择检索后端。
+    """按环境变量选择检索后端;**缺省即生产后端**。
 
-    KB_SERVICE_ES=produce → ProduceESClient(生产 ngkm 一体化流水线:
-    槽位提取 → 知识主索引召回 → 原子表拼接,intergrate_all 工具可用);
-    其他值/未设置 → 离线 MockESClient(内置样例,仅演示/测试)。
+    默认/KB_SERVICE_ES=produce → ProduceESClient(生产 ngkm 一体化流水线:
+    槽位提取 → 知识主索引召回 → 原子表拼接,intergrate_all 的
+    full_recall 必然可用,不会再落入"后端不支持"分支);
+    仅 KB_SERVICE_ES=mock → 离线 MockESClient(内置样例,本地演示)。
     """
     backend = os.environ.get(ENV_ES_BACKEND, "").strip().lower()
-    if backend == "produce":
-        region = os.environ.get(ENV_ES_REGION, "000").strip() or "000"
-        logger.info("检索后端: 生产 ngkm ProduceESClient region=%s", region)
-        return ProduceESClient(region_code=region)
-    logger.warning("未启用生产检索(设 KB_SERVICE_ES=produce),"
-                   "使用离线 MockESClient(仅 7 条内置样例)")
-    return MockESClient()
+    if backend == "mock":
+        logger.warning("KB_SERVICE_ES=mock: 使用离线 MockESClient(仅 7 条内置样例)")
+        return MockESClient()
+    region = os.environ.get(ENV_ES_REGION, "000").strip() or "000"
+    logger.info("检索后端: 生产 ngkm ProduceESClient region=%s", region)
+    return ProduceESClient(region_code=region)
 
 
 def create_app(model: Any = None, es: Any = None,
@@ -273,6 +274,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
         if query is None:
             return JSONResponse(error_body(
                 RTN_BAD_REQUEST, "conversations 中无有效用户消息(role=1)"))
+        logger.info("requestId=%s 收到请求 query=%r province=%r",
+                    p.requestId, query, p.userInfo.province)
 
         agent: Optional[MainAgent] = None
         try:
