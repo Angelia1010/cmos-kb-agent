@@ -17,7 +17,8 @@
 
 生产依赖:
     - model: config.yaml 配置了 models 时经 models[].use 解析构建;否则回退离线 ScriptedChatModel
-    - es:    默认 MockESClient(离线);生产请 create_app(es=...) 注入真实 ESClient 实现
+    - es:    KB_SERVICE_ES=produce 时用 ProduceESClient(生产 ngkm 一体化流水线);
+             否则回退离线 MockESClient。也可 create_app(es=...) 显式注入覆盖。
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from kbagent import MainAgent, MockESClient, ScriptedChatModel
+from kbagent import MainAgent, MockESClient, ProduceESClient, ScriptedChatModel
 from kbagent.shared.models import FinalAnswer
 
 from .models import (
@@ -51,11 +52,37 @@ from .models import (
 
 logger = logging.getLogger("kbagent_service")
 
+
+def _setup_logging() -> None:
+    """配置根日志器,保证每请求 INFO 行可见。
+
+    经 ``python -m uvicorn`` 启动时根日志器默认无 handler,INFO 会被丢弃、
+    只有 WARNING+ 经 lastResort 落到 stderr(这正是生产只看到两条启动
+    warning 的原因)。级别可用环境变量 KB_SERVICE_LOG_LEVEL 覆盖。
+    """
+    level = getattr(logging, os.environ.get("KB_SERVICE_LOG_LEVEL", "INFO").upper(),
+                    logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    else:
+        root.setLevel(level)
+
+
+_setup_logging()
+
 # 端到端超时(秒):略大于 Config.budget["end_to_end"]=120000ms;
 # 覆盖内网大模型多轮调用(检索循环 + 答案生成),超时返回 50002
 DEFAULT_TIMEOUT_S = 120.0
 # appId 白名单环境变量:逗号分隔;为空则全部放行
 ENV_APP_IDS = "KB_SERVICE_APP_IDS"
+# 检索后端选择:produce=生产 ngkm 一体化流水线(ProduceESClient);
+# 其他值/未设置=离线 MockESClient(内置 7 条样例,仅供演示)
+ENV_ES_BACKEND = "KB_SERVICE_ES"
+# ProduceESClient 缺省区域(请求未携带省份时使用);支持省份名或区号
+ENV_ES_REGION = "KB_SERVICE_ES_REGION"
 # 技能包目录:按本文件位置定位到仓库根,不依赖启动时 CWD
 _SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
 
@@ -89,6 +116,13 @@ def _mask_secret(value: Any) -> str:
     return (s[:4] + "****" + s[-4:]) if len(s) > 8 else "****"
 
 
+def _trace_dump(agent: Optional[MainAgent]) -> str:
+    """导出请求级全链路追踪 JSON;agent 未及创建时给出占位说明。"""
+    if agent is None:
+        return "<MainAgent 未初始化>"
+    return agent.tracer.export()
+
+
 def _default_model() -> Any:
     """优先按 config.yaml 的 models[].use 构建;失败回退离线模型。
 
@@ -113,7 +147,19 @@ def _default_model() -> Any:
 
 
 def _default_es() -> Any:
-    logger.warning("未注入 ES 客户端,使用离线 MockESClient(生产环境必须替换)")
+    """按环境变量选择检索后端。
+
+    KB_SERVICE_ES=produce → ProduceESClient(生产 ngkm 一体化流水线:
+    槽位提取 → 知识主索引召回 → 原子表拼接,intergrate_all 工具可用);
+    其他值/未设置 → 离线 MockESClient(内置样例,仅演示/测试)。
+    """
+    backend = os.environ.get(ENV_ES_BACKEND, "").strip().lower()
+    if backend == "produce":
+        region = os.environ.get(ENV_ES_REGION, "000").strip() or "000"
+        logger.info("检索后端: 生产 ngkm ProduceESClient region=%s", region)
+        return ProduceESClient(region_code=region)
+    logger.warning("未启用生产检索(设 KB_SERVICE_ES=produce),"
+                   "使用离线 MockESClient(仅 7 条内置样例)")
     return MockESClient()
 
 
@@ -228,6 +274,7 @@ def _register_routes(app: FastAPI, base: str) -> None:
             return JSONResponse(error_body(
                 RTN_BAD_REQUEST, "conversations 中无有效用户消息(role=1)"))
 
+        agent: Optional[MainAgent] = None
         try:
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
@@ -237,15 +284,20 @@ def _register_routes(app: FastAPI, base: str) -> None:
                 agent.arun(query, region_code=p.userInfo.province),
                 timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
-            logger.error("requestId=%s 端到端超时", p.requestId)
+            logger.error("requestId=%s 端到端超时,已执行链路:\n%s",
+                         p.requestId, _trace_dump(agent))
             return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))
         except Exception:  # noqa: BLE001
-            logger.exception("requestId=%s 未预期异常", p.requestId)
+            logger.exception("requestId=%s 未预期异常,已执行链路:\n%s",
+                             p.requestId, _trace_dump(agent))
             return JSONResponse(error_body(RTN_INTERNAL, "服务内部错误"))
 
         logger.info("requestId=%s traceId=%s degraded=%s elapsedMs=%s sources=%d",
                     p.requestId, ans.trace_id, ans.degraded,
                     ans.elapsed_ms, len(ans.sources))
+        # 全链路追踪落日志:缓存判定 / 每轮检索 DSL 与召回 / 降级原因 /
+        # 处理快照 / 答案素材与锚定校验,排查"无检索结果"看这一段即可
+        logger.info("requestId=%s 链路追踪:\n%s", p.requestId, _trace_dump(agent))
         return AskResponse(rtnCode=RTN_OK, rtnMsg="success",
                            object=_to_object(ans, p, arrived))
 

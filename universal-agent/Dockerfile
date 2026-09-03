@@ -31,7 +31,8 @@ COPY deploy/profile.env.sh /app/profile.env.sh
 RUN chmod 600 /app/profile.env.sh
 
 ENV PYTHONPATH=/app/src:/app/services \
-    UNIAGENT_CONFIG=/app/config.yaml
+    UNIAGENT_CONFIG=/app/config.yaml \
+    KB_SERVICE_ES=produce
 
 #USER appuser
 
