@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-"""数据处理子智能体(两个形态,共用本目录的工具集):
+"""数据处理子智能体 — 知识级固定流水线,零 LLM 编排。
 
-- ``ProcessingSubAgent`` — 主链路使用的"自主规划"形态:
-  ReAct 子智能体自主决定清洗工具的取舍与顺序、业务 skill 的套用;
-  护栏:无产出时的确定性保底流水线、SkillMiddleware 业务技能包注入。
-- ``KnowledgeProcessingOrchestrator`` — processing_service 使用的
-  "固定流水线"形态:analyze → filter → build_markdown → rerank,
-  面向知识级候选(非 Chunk),零 LLM 编排。
+``ProcessingSubAgent`` 固定执行 analyze → filter → build_markdown → rerank,
+面向知识级候选(工作区 ``knowledge_candidates``),主链路与
+processing_service 共用;``KnowledgeProcessingOrchestrator`` 为其向后兼容别名。
+早期"ReAct 自主规划 + SkillMiddleware"形态已注释归档于下方。
 """
 from __future__ import annotations
 
@@ -38,50 +36,50 @@ _PROCESSING_PROMPT = (
 )
 
 
+# class ProcessingSubAgent:
+#     """数据处理子智能体:ReAct 自主规划 + SkillMiddleware 业务技能包注入。"""
+
+#     def __init__(self, model: Any, tracer: Tracer, enable_skills: bool = True):
+#         self.tracer = tracer
+#         self._agent = create_agent(
+#             model=model, tools=PROCESSING_TOOLS,
+#             features=AgentFeatures(skill=enable_skills, goal_loop=False),
+#             system_prompt=_PROCESSING_PROMPT,
+#             name="processing_subagent",
+#         )
+
+#     async def run(self, query: str, chunks: List[Chunk]) -> List[Chunk]:
+#         ws = get_workspace()
+#         ws.stage = "processing"
+#         ws.data["chunks"] = list(chunks)
+#         before = [c.chunk_id for c in chunks]
+#         cats = sorted({c.category for c in chunks})
+#         cat_hint = f"业务类目:{cats[0]}" if len(cats) == 1 else f"类目分布:{cats}"
+#         try:
+#             # SkillMiddleware 由循环引擎执行;裸 agent 场景手动跑一次 before_agent
+#             state = {"messages": [HumanMessage(
+#                 content=f"清洗候选知识,共 {len(chunks)} 条。{cat_hint}。用户问题:{query}")]}
+#             for mw in getattr(self._agent, "_uniagent_middleware", []):
+#                 patch = await mw.before_agent(state)
+#                 if patch:
+#                     state.update(patch)
+#             await self._agent.ainvoke(state)
+#         except Exception as exc:                        # noqa: BLE001
+#             self.tracer.log("processing", "agent_error", error=repr(exc))
+#         # ---- 保底护栏:子智能体无有效产出 → 确定性流水线 ----
+#         out = ws.data.get("chunks", [])
+#         if not out:
+#             self.tracer.log("processing", "fallback_pipeline",
+#                             reason="子智能体产出为空")
+#             ws.data["chunks"] = list(chunks)
+#             run_fallback_pipeline()
+#             out = ws.data["chunks"]
+#         self.tracer.log("processing", "snapshot",
+#                         before=before, after=[c.chunk_id for c in out])
+#         return out
+
+
 class ProcessingSubAgent:
-    """数据处理子智能体:ReAct 自主规划 + SkillMiddleware 业务技能包注入。"""
-
-    def __init__(self, model: Any, tracer: Tracer, enable_skills: bool = True):
-        self.tracer = tracer
-        self._agent = create_agent(
-            model=model, tools=PROCESSING_TOOLS,
-            features=AgentFeatures(skill=enable_skills, goal_loop=False),
-            system_prompt=_PROCESSING_PROMPT,
-            name="processing_subagent",
-        )
-
-    async def run(self, query: str, chunks: List[Chunk]) -> List[Chunk]:
-        ws = get_workspace()
-        ws.stage = "processing"
-        ws.data["chunks"] = list(chunks)
-        before = [c.chunk_id for c in chunks]
-        cats = sorted({c.category for c in chunks})
-        cat_hint = f"业务类目:{cats[0]}" if len(cats) == 1 else f"类目分布:{cats}"
-        try:
-            # SkillMiddleware 由循环引擎执行;裸 agent 场景手动跑一次 before_agent
-            state = {"messages": [HumanMessage(
-                content=f"清洗候选知识,共 {len(chunks)} 条。{cat_hint}。用户问题:{query}")]}
-            for mw in getattr(self._agent, "_uniagent_middleware", []):
-                patch = await mw.before_agent(state)
-                if patch:
-                    state.update(patch)
-            await self._agent.ainvoke(state)
-        except Exception as exc:                        # noqa: BLE001
-            self.tracer.log("processing", "agent_error", error=repr(exc))
-        # ---- 保底护栏:子智能体无有效产出 → 确定性流水线 ----
-        out = ws.data.get("chunks", [])
-        if not out:
-            self.tracer.log("processing", "fallback_pipeline",
-                            reason="子智能体产出为空")
-            ws.data["chunks"] = list(chunks)
-            run_fallback_pipeline()
-            out = ws.data["chunks"]
-        self.tracer.log("processing", "snapshot",
-                        before=before, after=[c.chunk_id for c in out])
-        return out
-
-
-class KnowledgeProcessingOrchestrator:
     """固定执行 analyze → filter → build_markdown → rerank。"""
 
     _STEPS = (
@@ -127,3 +125,8 @@ class KnowledgeProcessingOrchestrator:
             count=len(ws.data["processed_chunks"]),
         )
         return list(top3)
+
+
+# 向后兼容别名:原 KnowledgeProcessingOrchestrator(固定流水线)已更名为主链路
+# 的 ProcessingSubAgent;processing_service / 演示脚本 / 测试仍按旧名引用。
+KnowledgeProcessingOrchestrator = ProcessingSubAgent

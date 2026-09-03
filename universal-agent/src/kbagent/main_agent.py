@@ -19,6 +19,7 @@ from .processing.agent import ProcessingSubAgent
 from .retrieval.agent import RetrievalSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
+from .shared.knowledge_processing.bridge import retrieval_to_candidates
 from .shared.models import FinalAnswer, RetrievalParams, SourceRef
 from .shared.search import ESClient, build_dsl
 from .shared.tracing import Tracer
@@ -40,9 +41,8 @@ class MainAgent:
         self._enable_skills = enable_skills
         if enable_skills:
             self._init_skills(skill_dirs or ["skills"])
-        # 处理/答案子智能体可复用;检索子智能体每次运行新建(GoalLoop 有状态)
-        self._processing = ProcessingSubAgent(model, self.tracer,
-                                              enable_skills=enable_skills)
+        # 处理子智能体可复用(固定流水线,无请求级状态)
+        self._processing = ProcessingSubAgent(model)
 
     @staticmethod
     def _init_skills(dirs: List[str]) -> None:
@@ -59,13 +59,13 @@ class MainAgent:
             config_factory._kb_scanned_dirs = scanned | set(new_dirs)
 
     # ------------------------------------------------------------------
-    def run(self, query: str) -> FinalAnswer:
-        return asyncio.run(self.arun(query))
+    def run(self, query: str, region_code: str = "000") -> FinalAnswer:
+        return asyncio.run(self.arun(query, region_code))
 
-    async def arun(self, query: str) -> FinalAnswer:
+    async def arun(self, query: str, region_code: str = "000") -> FinalAnswer:
+        """region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。"""
         self.tracer = Tracer()
-        self._processing.tracer = self.tracer
-        self.tracer.log("run", "start", query=query)
+        self.tracer.log("run", "start", query=query, region_code=region_code)
         ws = RunWorkspace(query=query, cfg=self.cfg, es=self.es,
                           tracer=self.tracer)
         set_workspace(ws)
@@ -80,17 +80,21 @@ class MainAgent:
                 hit.elapsed_ms = self.tracer.elapsed_ms()   # 命中耗时,而非原次耗时
                 return hit
 
-            # ---- ① 检索子智能体(自主规划,GoalLoop 护栏) ----
+            # ---- ① 检索子智能体(直调一体化流水线,传省份信息) ----
             chunks = await RetrievalSubAgent(
                 self.model, self.cfg, self.tracer,
-                judge_model=self.judge_model).run(query)
+                judge_model=self.judge_model).run(query, region_code)
 
-            # ---- ② 数据处理子智能体(自主规划,技能包注入) ----
-            processed = await self._processing.run(query, chunks)
+            # ---- 阶段衔接:检索产物 → 处理阶段标准候选 ----
+            ws.data["knowledge_candidates"] = retrieval_to_candidates(
+                merged=ws.data.get("merged_results"), chunks=chunks)
+
+            # ---- ② 数据处理子智能体(知识级固定流水线) ----
+            await self._processing.run()
+            processed = ws.data.get("processed_chunks") or []
 
             # ---- ③ 答案生成子智能体(自主组织 + 确定性锚定) ----
             # generate 使用标准 model.invoke,直接传原始模型即可
-            # (judge_model 仅供检索充分性判据的 judge 接口使用)
             ans = AnswerSubAgent(self.model, self.cfg, self.tracer).run(
                 query, processed, self.tracer.trace_id)
             ans.elapsed_ms = self.tracer.elapsed_ms()

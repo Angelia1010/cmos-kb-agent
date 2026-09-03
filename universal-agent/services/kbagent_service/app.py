@@ -232,8 +232,10 @@ def _register_routes(app: FastAPI, base: str) -> None:
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
                               skill_dirs=[_SKILLS_DIR])
-            ans = await asyncio.wait_for(agent.arun(query),
-                                         timeout=request.app.state.timeout_s)
+            # 省份信息经 region_code 下传:检索一体化流水线据此选省级索引
+            ans = await asyncio.wait_for(
+                agent.arun(query, region_code=p.userInfo.province),
+                timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
             logger.error("requestId=%s 端到端超时", p.requestId)
             return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))

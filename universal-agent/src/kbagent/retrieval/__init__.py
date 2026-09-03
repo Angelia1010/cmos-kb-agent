@@ -1,5 +1,5 @@
-"""检索子智能体 — ReAct 自主规划 + GoalLoop 循环护栏。"""
-from .agent import RETRIEVAL_GOAL, RetrievalSubAgent
+"""检索子智能体 — 直调生产一体化检索的固定流水线。"""
+from .agent import RetrievalSubAgent
 from .sufficiency import SufficiencyVerifier
 
-__all__ = ["RetrievalSubAgent", "RETRIEVAL_GOAL", "SufficiencyVerifier"]
+__all__ = ["RetrievalSubAgent", "SufficiencyVerifier"]
