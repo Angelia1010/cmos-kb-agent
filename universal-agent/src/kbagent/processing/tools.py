@@ -260,6 +260,23 @@ async def _rerank_knowledge_candidates(
     model: Any,
     options: KnowledgeProcessingOptions,
 ) -> str:
+    """对 Markdown 候选做两阶段重排并写入 Top3。
+    processed_knowledge_candidates
+           ↓
+     rerank_candidates()
+           ↓
+       RerankResult
+       ├─ candidates     → 最终 Top3
+       ├─ evidence_map   → 重排证据
+       ├─ details        → 重排详细信息
+       ├─ warnings       → 警告
+       └─ degraded       → 是否发生降级
+           ↓
+       写回 Workspace
+           ↓
+   更新 processing_meta
+           ↓
+     返回精简 observation"""
     ws = get_workspace()
     processed = ws.data.get("processed_knowledge_candidates")
     if not isinstance(processed, list):

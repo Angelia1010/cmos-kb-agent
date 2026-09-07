@@ -1,4 +1,22 @@
-"""知识级 Processing 固定流水线入口。"""
+"""知识级 Processing 固定流水线入口。
+    上游召回的知识候选
+            ↓
+    ① analyze
+    分析/规范化
+            ↓
+    ② filter
+    过滤
+            ↓
+    ③ build_markdown
+    构建 Markdown
+            ↓
+    ④ rerank
+    重排序，取 Top3
+            ↓
+    转换成 processed_chunks
+            ↓
+    供下游答案生成使用
+"""
 from __future__ import annotations
 
 from typing import Any, List
@@ -11,7 +29,7 @@ from .tools import build_knowledge_processing_tools
 
 class KnowledgeProcessingOrchestrator:
     """固定执行 analyze → filter → build_markdown → rerank。"""
-
+    # 要调用哪个 Tool  → 这个 Tool 应该产生什么结果  (tool_name, artifact_key)
     _STEPS = (
         ("analyze_knowledge_candidates", "normalized_knowledge_candidates"),
         ("filter_knowledge_candidates", "filtered_knowledge_candidates"),

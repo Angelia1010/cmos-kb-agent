@@ -251,7 +251,47 @@ async def rerank_candidates(
     candidates: Sequence[ProcessedKnowledge],
     options: KnowledgeProcessingOptions,
 ) -> RerankResult:
-    """每批 Top5、全局最多 25 复排，最终返回 Top3。"""
+    """每批 Top5、全局最多 25 复排，最终返回 Top3。
+    逻辑：先筛出能参与重排的候选 → 分批让模型选 Top5 → 把各批 Top5 汇总成池 
+    → 再让模型全局选 Top3 → 任一阶段模型失败都能按原检索排名兜底
+    processed_knowledge_candidates
+          │
+          ↓
+   _stable_candidates()
+   先稳定排序
+          │
+          ↓
+检查是否有资格参与重排
+  ├─ 缺 knowledge_id → 排除
+  ├─ 没有有效正文 → 排除
+  └─ 合格 → eligible
+          │
+          ↓
+给每条知识分配临时 Evidence ID
+E001、E002、E003……
+          │
+          ↓
+eligible <= 3 ?
+   │            │
+  是            否
+   │            ↓
+直接返回      按 batch_size 分批
+              │
+              ↓
+         每批 LLM 选 Top5
+              │
+              ↓
+        各批 Top5 汇总
+              │
+              ↓
+       最多取前 25 条
+              │
+              ↓
+        LLM 全局选 Top3
+              │
+              ↓
+         最终 Top3
+    """
     ordered = _stable_candidates(candidates)
     warnings: List[ProcessingWarning] = []
     eligible: List[ProcessedKnowledge] = []

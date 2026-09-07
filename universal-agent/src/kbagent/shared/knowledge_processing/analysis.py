@@ -1,4 +1,18 @@
-"""标准候选集的只读质量分析。"""
+"""标准候选集的只读质量分析。
+    标准 KnowledgeCandidate 列表
+            ↓
+        analyze_candidates
+            ↓
+    ┌───────┼─────────┐
+    ↓       ↓         ↓
+    缺字段？  有HTML？   有表格？
+    ↓       ↓         ↓
+    内容长？  原子多少？ 有特殊规则？
+            ↓
+        汇总统计
+            ↓
+        analysis 字典
+"""
 from __future__ import annotations
 
 import json

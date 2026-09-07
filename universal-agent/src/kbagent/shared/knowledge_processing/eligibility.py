@@ -7,7 +7,7 @@ from typing import Optional
 from .models import KnowledgeCandidate, ProcessedKnowledge
 from .richtext import is_renderable_content, render_richtext
 
-
+# 去正文中的标题
 def _without_own_title(text: str, name: str) -> str:
     lines = text.splitlines()
     if lines and re.sub(r"^#+\s*", "", lines[0]).strip() == str(name or "").strip():
@@ -24,7 +24,17 @@ def _markdown_has_body(content_md: str, name: str) -> bool:
 
 
 def has_renderable_candidate_content(candidate: KnowledgeCandidate) -> bool:
-    """不把知识标题、分组名或字段名本身当作业务证据。"""
+    """不把知识标题、分组名或字段名本身当作业务证据。
+    先看 candidate.content
+            ↓ 没有有效正文
+    再看 candidate.atoms
+            ↓ 也没有
+    如果是 ProcessedKnowledge
+            ↓
+    再看生成后的 content_md 有没有正文
+            ↓
+    都没有 → False
+    """
     if is_renderable_content(candidate.content):
         main_text = _without_own_title(render_richtext(candidate.content), candidate.name)
         if main_text:

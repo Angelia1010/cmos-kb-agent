@@ -348,6 +348,28 @@ def normalize_knowledge_atom(raw: Any, source_index: int = 0) -> KnowledgeAtom:
     return _normalize_atom(raw, source_index, warnings)
 
 
+"""
+                   raw
+                    │
+          是不是 KnowledgeCandidate？
+              /              \
+            是                不是
+            ↓                  ↓
+       深拷贝一份           转成 mapping/dict
+            ↓                  ↓
+       修正 rank            一个个提取字段
+       标准化 atoms         修正异常字段
+            ↓              标准化 atoms
+       标准化适用性         标准化 applicability
+            │                  ↓
+            │          创建 KnowledgeCandidate
+            │                  │
+            └────────┬─────────┘
+                     ↓
+        normalize_candidate_applicability()
+                     ↓
+            KnowledgeCandidate
+"""
 def _normalize_candidate(
     raw: Any,
     source_index: int,
@@ -471,7 +493,26 @@ def _candidate_sequence(raw: Any) -> tuple[List[Any], Optional[str]]:
 
 
 def normalize_knowledge_candidates(raw: Any) -> NormalizationResult:
-    """批量规范化，任何单条失败都不会影响其他候选。"""
+    """批量规范化，任何单条失败都不会影响其他候选。
+        raw
+        ↓
+        _candidate_sequence()
+        ↓
+        判断整体输入是否合法
+        ↓
+        逐条遍历
+        ↓
+        _normalize_candidate()
+        ↓
+        ┌──────────────┬──────────────┐
+        │ 成功         │ 失败         │
+        ↓              ↓
+        加入 candidates 记录 warning
+        │              │
+        └───────┬──────┘
+                ↓
+        NormalizationResult(candidates, warnings)
+    """
     warnings: List[ProcessingWarning] = []
     items, wrapper = _candidate_sequence(raw)
     if wrapper == "invalid":
