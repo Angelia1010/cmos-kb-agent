@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Retrieval 服务边界:绑定 Workspace、调用固定检索流水线并构造安全响应。
 
 设计要点(对照 processing_service/runner.py):
