@@ -80,7 +80,7 @@ class ProcessingStats(BaseModel):
 class ProcessingResponseObject(BaseModel):
     request_id: str
     trace_id: str
-    model_mode: Literal["scripted"] = "scripted"
+    model_mode: Literal["scripted", "llm"] = "scripted"
     outcome: Literal["success", "no_valid_candidates", "degraded"]
     degraded: bool
     elapsed_ms: int

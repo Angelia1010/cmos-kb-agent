@@ -1,0 +1,20 @@
+# ── 版本控制与本地环境 ──
+.git
+.claude/
+.venv/
+.venv.zip
+.uniagent/
+**/__pycache__/
+*.pyc
+
+# ── 含密钥的配置，严禁进镜像层 ──
+model_config.yaml
+config.yaml
+
+# ── 测试与文档（运行镜像不需要）──
+# 注意：skills/ 下的 SKILL.md 与 references/*.md 是技能系统运行时数据，不能排除
+/*.md
+docs/
+uniagent-docs-and-tests/
+tests/
+test_*.py

@@ -281,7 +281,12 @@ class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(TestClient is not None, "缺少 fastapi/TestClient 服务依赖")
 class TestProcessingServiceHttp(unittest.TestCase):
     def test_health_and_standard_post(self):
-        with TestClient(create_app(base_path="/api/processing-service/test")) as client:
+        # 显式注入 ScriptedChatModel 保持离线确定性;缺省会按 config.yaml
+        # 解析真实大模型(model_class/model_mode 随配置变化)。
+        with TestClient(create_app(
+            model=ScriptedChatModel(),
+            base_path="/api/processing-service/test",
+        )) as client:
             health = client.get("/health")
             response = client.post(
                 "/api/processing-service/test/process",
@@ -290,7 +295,8 @@ class TestProcessingServiceHttp(unittest.TestCase):
             )
 
         self.assertEqual(200, health.status_code)
-        self.assertEqual({"status": "ok", "model_mode": "scripted"}, health.json())
+        self.assertEqual({"status": "ok", "model_class": "ScriptedChatModel"},
+                         health.json())
         self.assertEqual(200, response.status_code)
         body = response.json()
         self.assertEqual("0", body["rtnCode"])

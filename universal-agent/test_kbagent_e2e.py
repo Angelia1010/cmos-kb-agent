@@ -215,6 +215,9 @@ class TC04_ChunkIdTransparency(KbagentE2EBase):
 class TC05_TraceEvents(KbagentE2EBase):
 
     def setUp(self):
+        # 清空缓存,保证每次都走完整链路(缓存快速通道会跳过检索/答案阶段,
+        # 而本组用例断言的是完整流水线的 trace 事件)。
+        self.agent.cache.entries.clear()
         self._run("流量套餐推荐")
 
     def test_tracer_has_events(self):
