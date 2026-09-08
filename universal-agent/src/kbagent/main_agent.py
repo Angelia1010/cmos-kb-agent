@@ -16,7 +16,8 @@ from typing import Any, List, Optional
 
 from .answer.agent import AnswerSubAgent
 from .processing.agent import ProcessingSubAgent
-from .retrieval.agent import RetrievalSubAgent
+# from .retrieval.agent import RetrievalSubAgent
+from .retrieval.agent import RetrievalKeywordSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.knowledge_processing.bridge import retrieval_to_candidates
@@ -81,7 +82,8 @@ class MainAgent:
                 return hit
 
             # ---- ① 检索子智能体(直调一体化流水线,传省份信息) ----
-            chunks = await RetrievalSubAgent(
+            # chunks = await RetrievalSubAgent(
+            chunks = await RetrievalKeywordSubAgent(
                 self.model, self.cfg, self.tracer,
                 judge_model=self.judge_model).run(query, region_code)
 

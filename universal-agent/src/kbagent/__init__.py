@@ -13,16 +13,28 @@ from .scripted_model import ScriptedChatModel
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.search import ESClient, MockESClient, ProduceESClient
 
+# if TYPE_CHECKING:
+#     from .answer.agent import AnswerSubAgent
+#     from .main_agent import MainAgent
+#     from .processing.agent import ProcessingSubAgent
+#     from .retrieval.agent import RetrievalSubAgent
 if TYPE_CHECKING:
     from .answer.agent import AnswerSubAgent
     from .main_agent import MainAgent
     from .processing.agent import ProcessingSubAgent
-    from .retrieval.agent import RetrievalSubAgent
+    from .retrieval.agent import RetrievalKeywordSubAgent, RetrievalVectorSubAgent
 
 
+# _LAZY_EXPORTS = {
+#     "MainAgent": (".main_agent", "MainAgent"),
+#     "RetrievalSubAgent": (".retrieval.agent", "RetrievalSubAgent"),
+#     "ProcessingSubAgent": (".processing.agent", "ProcessingSubAgent"),
+#     "AnswerSubAgent": (".answer.agent", "AnswerSubAgent"),
+# }
 _LAZY_EXPORTS = {
     "MainAgent": (".main_agent", "MainAgent"),
-    "RetrievalSubAgent": (".retrieval.agent", "RetrievalSubAgent"),
+    "RetrievalKeywordSubAgent": (".retrieval.agent", "RetrievalKeywordSubAgent"),
+    "RetrievalVectorSubAgent": (".retrieval.agent", "RetrievalVectorSubAgent"),
     "ProcessingSubAgent": (".processing.agent", "ProcessingSubAgent"),
     "AnswerSubAgent": (".answer.agent", "AnswerSubAgent"),
 }
@@ -42,10 +54,18 @@ def __getattr__(name: str) -> Any:
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
+# __all__ = [
+#     "Config", "DEFAULT_CONFIG",
+#     "MainAgent",
+#     "ScriptedChatModel",
+#     "ESClient", "MockESClient", "ProduceESClient",
+#     "RetrievalSubAgent", "ProcessingSubAgent", "AnswerSubAgent",
+# ]
 __all__ = [
     "Config", "DEFAULT_CONFIG",
     "MainAgent",
     "ScriptedChatModel",
     "ESClient", "MockESClient", "ProduceESClient",
-    "RetrievalSubAgent", "ProcessingSubAgent", "AnswerSubAgent",
+    "RetrievalKeywordSubAgent", "RetrievalVectorSubAgent",
+    "ProcessingSubAgent", "AnswerSubAgent",
 ]

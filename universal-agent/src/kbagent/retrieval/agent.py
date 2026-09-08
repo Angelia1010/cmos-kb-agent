@@ -29,6 +29,7 @@ from .tools import (
     coarse_recall,
     intergrate_all,
     keyword_extraction,
+    vector_recall,
 )
 
 RETRIEVAL_GOAL = (
@@ -83,7 +84,7 @@ RETRIEVAL_GOAL = (
 #         return chunks
 
 
-class RetrievalSubAgent:
+class RetrievalKeywordSubAgent:
     """检索候选知识子智能体:直调 intergrate_all(传省份信息),不走 agent loop。"""
 
     def __init__(self, model: Any, cfg: Config, tracer: Tracer,
@@ -108,6 +109,37 @@ class RetrievalSubAgent:
             if "error" in fallback and not ws.data.get("chunks"):
                 raise RuntimeError(
                     f"检索子智能体失败: {fallback['error']}")
+        chunks: List[Chunk] = ws.data.get("chunks", [])
+        self.tracer.log("retrieval", "done", region_code=region_code,
+                        count=len(chunks))
+        return chunks
+
+
+class RetrievalVectorSubAgent:
+    """向量召回子智能体:直调 vector_recall(传省份信息),不走 agent loop。"""
+
+    def __init__(self, model: Any, cfg: Config, tracer: Tracer,
+                 judge_model: Any = None):
+        # judge_model 仅为调用方兼容保留:去除循环后不再有充分性判定
+        self.model, self.cfg, self.tracer = model, cfg, tracer
+
+    async def run(self, query: str, region_code: str = "000") -> List[Chunk]:
+        """固定流水线:vector_recall 一次产出候选片段。
+
+        region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。
+        """
+        ws = get_workspace()
+        ws.stage = "retrieval"
+        obs = json.loads(vector_recall.func(query=query,
+                                            region_code=region_code))
+        if "error" in obs:
+            self.tracer.log("retrieval", "vector_recall_fallback",
+                            reason=obs["error"])
+            keyword_extraction.func()
+            fallback = json.loads(coarse_recall.func())
+            if "error" in fallback and not ws.data.get("chunks"):
+                raise RuntimeError(
+                    f"向量召回子智能体失败: {fallback['error']}")
         chunks: List[Chunk] = ws.data.get("chunks", [])
         self.tracer.log("retrieval", "done", region_code=region_code,
                         count=len(chunks))

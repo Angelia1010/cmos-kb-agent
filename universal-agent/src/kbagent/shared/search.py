@@ -10,15 +10,19 @@
 - MockESClient    内置坐席知识库样例数据,离线演示/测试用;
 - ProduceESClient 生产 ngkm 检索(槽位提取 → 知识主索引召回 → 原子表拼接),
                   一体化流水线经 ``full_recall`` 暴露,并映射为标准
-                  ``ESClient`` 接口(keyword_search / vector_search)。
+                  ``ESClient`` 接口(keyword_search / vector_search);
+                  vector 通道走在线知识 embedding 向量检索服务,新旧两套
+                  请求模板经 ``vector_search`` 的 ``vector_mode`` 参数选路
+                  (new/old/both,both 时按 ``vector_weights`` 比例分配返回名额)。
 """
 from __future__ import annotations
 
 import ast
 import json
 import logging
+import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from jinja2 import Template as JinjaTemplate
@@ -69,6 +73,94 @@ _PROVINCE_TO_REGION = {
 _SLOT_EXTRACT_URL = "http://restapi.ly4.tyyt.cmos:20070/slot_extract_unified"
 _NGKM_SEARCH_URL = ("http://restapi.ngkmsearch.cs.glb.cmos:20070"
                     "/ngkmSearch/ws/int/busiSearcher/busiSearcherInterService")
+_VECTOR_SEARCH_URL = ("http://192.168.212.199:8902/group/online-knowledge-embedding"
+                      "/open/embedding/search/vector")
+
+
+# ── 在线知识 embedding 向量检索请求体(新旧两套模板) ──────────────────────
+# 公共字段;每次请求动态写入: content(用户问题) / reqId / xTransId(重新生成),
+# sessionId 暂时保持原请求中的固定值。
+_VECTOR_PAYLOAD_COMMON: Dict[str, Any] = {
+    "esTop": 0,
+    "isEnableGroupContent": True,
+    "faqThresholdScore": 0.75,
+    "rerankModelType": "ZY_QW",
+    "isEnableGroupName": False,
+    "faqContentThresholdScore": 0.7,
+    "knowledgeThresholdScore": 0.35,
+    "isOn": False,
+    "isEnableResetRerank": False,
+    "knowledgeNameSeparateThresholdScore": 0.9,
+    "isEnableTotalKnowledge": "1",
+    "isEnableFaq": True,
+    "recessivityFlag": "0",
+    "isEnableQa": True,
+    "intentNM": "",
+    "provinceId": "",
+    "isEnableKnowledgeName": True,
+    "reqId": "",                       # 每次请求重新生成
+    "groupBindQuestionThresholdScore": 0.8,
+    "sysChnlCode": "lingxi",
+    "isEnableAtomName": False,
+    "qaType": "out",
+    "groupQuestionThresholdScore": 0.8,
+    "knowledgeNameGroupThresholdScore": 0.3,
+    "knowledgePath": "",
+    "klgState": "2",
+    "isEnableGroupBindQuestion": True,
+    "isEnableFaqContent": True,
+    "qaThresholdScore": 0.6,
+    "enableKeywordReplace": "true",
+    "faqoutScore": 0.85,
+    "content": "",                     # 每次请求替换为用户问题
+    "isEnableReRank": False,
+    "isEnableQaContent": True,
+    "channelCode": "1,lingxi,zaixian",
+    "maxTop": 100,
+    "replyModelScore": 0.9,
+    "xTransId": "",                    # 每次请求重新生成
+    "thresholdScore": 0.3,
+    "newRouteExpThresholdScore": 0.3,
+    "knowledgeGroupThresholdScore": 0.72,
+    "sessionId": "53NaJ6mPpiiIxSMkb7k3t3eBgPMNRHd9",
+    "knowledgeNameCoefficient": 0.35,
+    "isEnableGroupQuestion": True,
+    "knowledgeTop": 10,
+}
+
+# 新模板:启用新路由实验(newRouteExp),top=1 精排,embeddingTop=10
+_VECTOR_PAYLOAD_NEW: Dict[str, Any] = {
+    **_VECTOR_PAYLOAD_COMMON,
+    "knowledgeNameGroupTop": 2,
+    "embeddingTop": 10,
+    "isEnableNewRouteExp": True,
+    "newRouteExpTop": 100,
+    "groupBindQuestionTop": 5,
+    "top": 1,
+}
+
+# 旧模板:关闭新路由实验,top=100 宽召回,embeddingTop=30,含 faq/qaContent 独立条数
+_VECTOR_PAYLOAD_OLD: Dict[str, Any] = {
+    **_VECTOR_PAYLOAD_COMMON,
+    "knowledgeNameGroupTop": 20,
+    "embeddingTop": 30,
+    "isEnableNewRouteExp": False,
+    "newRouteExpTop": 0,
+    "faqTop": 20,
+    "groupBindQuestionTop": 20,
+    "top": 100,
+    "qaContentTop": 20,
+}
+
+_VECTOR_PAYLOADS: Dict[str, Dict[str, Any]] = {
+    "new": _VECTOR_PAYLOAD_NEW,
+    "old": _VECTOR_PAYLOAD_OLD,
+}
+
+# 向量响应命中条目字段(在线知识 embedding 服务固定返回)
+_VECTOR_ID_FIELD = "knowledgeId"
+_VECTOR_TITLE_FIELD = "knowledgeName"
+_VECTOR_CONTENT_FIELD = "content"
 
 
 def _region_code(value: str) -> str:
@@ -199,13 +291,75 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# 向量检索:原始返回 → 标准 Chunk(在线知识 embedding 服务)
+# ---------------------------------------------------------------------------
+def _vector_raw_to_chunks(resp: Any, source: str) -> List[Chunk]:
+    """向量检索原始返回 → 标准 Chunk 列表(按响应顺序,即服务端相关性顺序)。
+
+    条目标定为含 knowledgeId/knowledgeName 之一且含 content 的 dict,命中即收、
+    不再下钻;兼容 ngkm 风格 ``object``(JSON 字符串)包裹;每个 Chunk 的
+    ``extra.raw`` 保留对应条目原文供溯源,``source`` 标记来源模板(new/old)。
+    """
+    chunks: List[Chunk] = []
+    seen: set = set()
+
+    def add_entry(entry: Dict[str, Any]) -> None:
+        kid = str(entry.get(_VECTOR_ID_FIELD) or "")
+        title = str(entry.get(_VECTOR_TITLE_FIELD) or "")
+        content = str(entry.get(_VECTOR_CONTENT_FIELD) or "") or title
+        # 有 knowledgeId 用它去重;无 id 的条目用随机 id,不互相合并
+        key = kid or new_id("vec")
+        if kid and key in seen:
+            return
+        seen.add(key)
+        chunks.append(Chunk(
+            chunk_id=f"vec_{kid}" if kid else key,
+            doc_id=kid or "unknown",
+            doc_title=title,
+            content=content,
+            category="",
+            position={"knowledge_id": kid, "rank": len(chunks)},
+            score=0.0,  # 最终位置分由 vector_search 按返回顺序统一编号
+            extra={"source": "vector",
+                   "vector_channel": source,
+                   "raw": entry},
+        ))
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            raw_obj = node.get("object")
+            if isinstance(raw_obj, str):
+                try:
+                    walk(json.loads(raw_obj))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            has_id = node.get(_VECTOR_ID_FIELD) not in (None, "")
+            has_title = node.get(_VECTOR_TITLE_FIELD) not in (None, "")
+            has_content = node.get(_VECTOR_CONTENT_FIELD) not in (None, "")
+            if (has_id or has_title) and has_content:
+                add_entry(node)
+                return
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(resp)
+    return chunks
+
+
 class ESClient(ABC):
     @abstractmethod
     def keyword_search(self, dsl: Dict[str, Any]) -> List[Chunk]: ...
 
     @abstractmethod
     def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]: ...
+                      size: int = 10, vector_mode: str = "new",
+                      vector_weights: Optional[Dict[str, float]] = None
+                      ) -> List[Chunk]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +419,10 @@ class MockESClient(ESClient):
         return [_to_chunk(r, s) for s, r in scored[: dsl.get("size", 10)]]
 
     def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]:
+                      size: int = 10, vector_mode: str = "new",
+                      vector_weights: Optional[Dict[str, float]] = None
+                      ) -> List[Chunk]:
+        # Mock 无新旧模板之分,vector_mode/vector_weights 仅为对齐 ESClient 接口
         # 用字符集合重叠率模拟语义相似度,兜住口语化改写
         q = set(query_text) - set(" ,。?？!")
         scored: List[Tuple[float, Dict[str, Any]]] = []
@@ -285,7 +442,14 @@ class ProduceESClient(ESClient):
 
     keyword 通道:一体化流水线(槽位提取 → 知识主索引召回 → 原子表拼接),
     经 ``full_recall`` 返回原始结构,``keyword_search`` 将其映射为标准 Chunk。
-    vector 通道:生产侧暂无向量检索,返回空列表,RRF 自动退化为纯关键词融合。
+    vector 通道:在线知识 embedding 向量检索服务(新旧两套请求模板),
+    选路参数由 ``vector_search`` 逐次传入、不做客户端级配置:
+    - ``vector_mode="new"``  仅新模板(新路由实验,top=1 精排,默认);
+    - ``vector_mode="old"``  仅旧模板(top=100 宽召回);
+    - ``vector_mode="both"`` 新旧两路均请求,日志给出两路总条数与新旧比例,
+      按 ``vector_weights`` 比例分配返回名额(默认 new:old=0.6:0.4),
+      跨路同一知识去重(新模板优先),某路不足由另一路补齐。
+    任一通道异常时该路降级为空,不影响另一路;两路全空时 RRF 退化为纯关键词。
     """
 
     def __init__(self, region_code: str = "000", timeout: int = 30):
@@ -310,9 +474,174 @@ class ProduceESClient(ESClient):
         return merged_to_chunks(result.get("merged", []))[: dsl.get("size", 10)]
 
     def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]:
-        """生产 ngkm 暂无向量通道,返回空列表(混合召回退化为纯关键词)。"""
-        return []
+                      size: int = 10, vector_mode: str = "new",
+                      vector_weights: Optional[Dict[str, float]] = None
+                      ) -> List[Chunk]:
+        """向量通道(ESClient 接口):按 ``vector_mode`` 调度召回,返回标准 Chunk。
+
+        vector_mode/vector_weights 逐次调用传入(默认 new 单模板;both 时按
+        vector_weights 分配新旧两路返回名额),召回/选路见 ``_vector_recall``;
+        过滤条件中 region 经请求体 provinceId 下推,向量响应仅含
+        knowledgeId/knowledgeName/content,不做 category/status 客户端过滤。
+        返回顺序即最终相关性顺序,位置分按 1/(rank+1) 统一编号。
+        """
+        if not query_text or not query_text.strip():
+            return []
+        mode = (vector_mode or "new").strip().lower()
+        weights = vector_weights or {"new": 0.6, "old": 0.4}
+        province = str(filters.get("region") or "")
+        chunks = self._vector_recall(query_text, province, self.timeout, size,
+                                     mode, weights)
+        for rank, chunk in enumerate(chunks):
+            chunk.position["rank"] = rank
+            chunk.score = round(1.0 / (rank + 1), 4)
+        return chunks
+
+    # ------------------------------------------------------------------
+    # 向量召回:新模板请求 / 旧模板请求 / 模式调度
+    # ------------------------------------------------------------------
+    def _vector_recall_new(self, query_text: str, province: str,
+                           timeout: int) -> Optional[dict]:
+        """按新模板请求(newRouteExp,top=1 精排),返回接口完整原始返回;失败降级为 None。"""
+        try:
+            resp = self._post_vector_search("new", query_text, timeout,
+                                            province=province)
+            logger.info("向量召回(新模板) query=%r 完成", query_text)
+            return resp
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("向量召回(新模板)失败,降级为空 query=%r err=%r",
+                           query_text, exc)
+            return None
+
+    def _vector_recall_old(self, query_text: str, province: str,
+                           timeout: int) -> Optional[dict]:
+        """按旧模板请求(top=100 宽召回),返回接口完整原始返回;失败降级为 None。"""
+        try:
+            resp = self._post_vector_search("old", query_text, timeout,
+                                            province=province)
+            logger.info("向量召回(旧模板) query=%r 完成", query_text)
+            return resp
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("向量召回(旧模板)失败,降级为空 query=%r err=%r",
+                           query_text, exc)
+            return None
+
+    def _vector_recall(self, query_text: str, province: str, timeout: int,
+                       size: int, vector_mode: str,
+                       vector_weights: Dict[str, float]) -> List[Chunk]:
+        """按 ``vector_mode``(vector_search 入参)调度召回并转 Chunk,返回去重/配额后的 Chunk 列表。
+
+        - new/old: 单模板请求,原始返回经 ``_vector_raw_to_chunks`` 转 Chunk;
+        - both: 新旧两路均请求,日志给出两路总条数与新旧比例,按
+          ``vector_weights`` 把 size 个返回名额分配给两路(默认新 6 旧 4);
+          跨路同一知识(chunk_id)去重,新模板优先保留;某路名额不足时
+          由另一路剩余 Chunk 补齐。权重为 0 的路不请求、不占名额。
+        """
+        if vector_mode == "new":
+            return _vector_raw_to_chunks(
+                self._vector_recall_new(query_text, province, timeout),
+                "new")[:size]
+        if vector_mode == "old":
+            return _vector_raw_to_chunks(
+                self._vector_recall_old(query_text, province, timeout),
+                "old")[:size]
+
+        # both: 新旧两路均请求;权重为 0 的路不请求、不占名额、不参与去重
+        w_new = vector_weights.get("new", 0.5)
+        w_old = vector_weights.get("old", 0.5)
+        new_chunks = (_vector_raw_to_chunks(
+            self._vector_recall_new(query_text, province, timeout), "new")
+            if w_new > 0 else [])
+        old_chunks = (_vector_raw_to_chunks(
+            self._vector_recall_old(query_text, province, timeout), "old")
+            if w_old > 0 else [])
+
+        # 跨路去重(新模板优先保留;无 knowledgeId 的 chunk_id 随机,不合并)
+        seen: set = set()
+        new_unique: List[Chunk] = []
+        old_unique: List[Chunk] = []
+        for c in new_chunks:
+            if c.chunk_id not in seen:
+                seen.add(c.chunk_id)
+                new_unique.append(c)
+        for c in old_chunks:
+            if c.chunk_id not in seen:
+                seen.add(c.chunk_id)
+                old_unique.append(c)
+
+        # 按新旧比例分配返回名额
+        n_new = round(size * w_new) if w_new > 0 else 0
+        n_old = size - n_new
+        picked = new_unique[:n_new] + old_unique[:n_old]
+        # 某路不足名额:用另一路剩余 Chunk 补齐到 size
+        if len(picked) < size:
+            rest = new_unique[n_new:] + old_unique[n_old:]
+            picked += rest[:size - len(picked)]
+
+        logger.info("向量混合召回: 新模板=%d条 旧模板=%d条 两路总条数=%d; "
+                    "新旧比例=%.2f:%.2f → 分配名额 新%d/旧%d(size=%d), 实际返回=%d条",
+                    len(new_chunks), len(old_chunks),
+                    len(new_chunks) + len(old_chunks),
+                    w_new, w_old, n_new, n_old, size, len(picked))
+        return picked[:size]
+
+    def raw_vector_search(self, query_text: str, mode: str = "new",
+                          province: str = "", timeout: int = 0
+                          ) -> Dict[str, Any]:
+        """向量检索原始调用(批量评测/排障用),固定返回三字段、绝不抛异常:
+
+        ``{"response": 接口完整原始返回(dict), "success": bool, "error": str}``
+
+        - mode: ``new`` / ``old`` 单模板请求(both 为两路融合,无单一原始返回,
+          请在批量脚本中按模式分文件保存);
+        - 网络/超时/HTTP 非 2xx/参数非法等全部落入 ``success=False`` +
+          ``error``(异常类型与信息),``response`` 为 None,批量任务不中断。
+        """
+        mode = (mode or "new").strip().lower()
+        if mode not in _VECTOR_PAYLOADS:
+            return {"response": None, "success": False,
+                    "error": f"mode 仅支持 new/old,收到: {mode!r}"}
+        if not query_text or not query_text.strip():
+            return {"response": None, "success": False, "error": "query 为空"}
+        try:
+            resp = self._post_vector_search(mode, query_text,
+                                            timeout or self.timeout,
+                                            province=province)
+            return {"response": resp, "success": True, "error": ""}
+        except Exception as exc:  # noqa: BLE001
+            return {"response": None, "success": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
+    def _post_vector_search(self, mode: str, query_text: str,
+                            timeout: int, province: str = "") -> dict:
+        """按模板(mode=new/old)发向量检索请求;reqId/xTransId 每次重新生成。
+
+        province 非空时写入请求体 ``provinceId``(测试集"省份"列透传)。
+        """
+        payload = dict(_VECTOR_PAYLOADS[mode])
+        payload["content"] = query_text
+        if province:
+            payload["provinceId"] = province
+        payload["reqId"] = uuid.uuid4().hex
+        payload["xTransId"] = uuid.uuid4().hex
+        logger.info("向量检索请求 mode=%s content=%r top=%s embeddingTop=%s "
+                    "isEnableNewRouteExp=%s",
+                    mode, query_text, payload.get("top"),
+                    payload.get("embeddingTop"), payload.get("isEnableNewRouteExp"))
+        try:
+            resp = requests.post(
+                _VECTOR_SEARCH_URL,
+                headers={"Content-Type": "application/json"},
+                json=payload, timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("向量检索请求失败(网络/超时/DNS) mode=%s url=%s err=%r",
+                           mode, _VECTOR_SEARCH_URL, exc)
+            raise
+        logger.info("向量检索响应 mode=%s status=%s body=%s",
+                    mode, resp.status_code, resp.text[:800])
+        resp.raise_for_status()
+        return resp.json()
 
     # ------------------------------------------------------------------
     # 一体化流水线:槽位提取 → info 召回 → atom 召回 → 合并

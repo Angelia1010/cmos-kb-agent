@@ -137,6 +137,41 @@ def intergrate_all(query: str = "", region_code: str = "000",
                 scores=[c.score for c in chunks])
 
 
+@tool
+def vector_recall(query: str = "", region_code: str = "000",
+                  timeout: int = 30) -> str:
+    """纯向量召回:直接走在线知识 embedding 向量检索服务,按语义相似度返回候选片段,
+    不经过关键词/槽位提取。region_code 支持区号或省份名(如 000/福建),经 provinceId
+    下推到向量服务。生产环境(ProduceESClient)vector_search 默认走新模板
+    (vector_mode=new,逐次调用可选 old/both + vector_weights);
+    离线环境(MockESClient)回退为字符相似度模拟。建议在需要纯语义匹配时调用。
+    """
+    ws = get_workspace()
+    vector_search = getattr(ws.es, "vector_search", None)
+    if vector_search is None:
+        logger.warning("vector_recall: 当前检索后端 %s 无 vector_search,"
+                       "回退关键词召回", type(ws.es).__name__)
+        return _obs(error="当前检索后端不支持向量召回,请改用 coarse_recall")
+    query = query or ws.query
+    filters: Dict[str, str] = {"region": region_code} if region_code else {}
+    size = ws.cfg.recall_size
+    chunks: List[Chunk] = vector_search(query, filters, size)
+    ws.data["chunks"] = chunks
+    ws.data["original_query"] = query
+    ws.data["region_code"] = region_code
+    ws.data["vector_chunks"] = chunks
+    rnd = ws.data.get("recall_round", 0) + 1
+    ws.data["recall_round"] = rnd
+    ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
+                  channel="vector_recall", region_code=region_code,
+                  titles=[c.doc_title for c in chunks],
+                  scores=[c.score for c in chunks])
+    logger.info("vector_recall 完成: query=%r region=%s size=%d → chunks=%d",
+                query, region_code, size, len(chunks))
+    return _obs(recalled=len(chunks), titles=[c.doc_title for c in chunks],
+                scores=[c.score for c in chunks])
+
 
 RETRIEVAL_TOOLS = [query_understanding, question_rewrite,
-                   keyword_extraction, coarse_recall, intergrate_all]
+                   keyword_extraction, coarse_recall, intergrate_all,
+                   vector_recall]

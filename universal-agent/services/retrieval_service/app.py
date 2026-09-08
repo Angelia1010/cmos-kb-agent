@@ -8,6 +8,8 @@
 服务定位:
     只调用固定检索流水线(intergrate_all,全程零 LLM),不拼接对话历史、
     不做答案生成;需要完整问答(检索 + 加工 + 生成)时走 kbagent_service。
+    另提供 {base}/vector 纯向量检索端点,直接走 embedding 向量服务,
+    按语义相似度召回,不经槽位提取/关键词召回。
 
 并发模型:
     - es 全局共享(ES client 需线程安全);
@@ -58,7 +60,8 @@ from .models import (
     RetrievalResponse,
     error_body,
 )
-from .runner import run_retrieval_request
+# from .runner import run_retrieval_keyword_request, run_vector_retrieval_request
+from .runner import run_keyword_retrieval_request, run_vector_retrieval_request
 
 logger = logging.getLogger("retrieval_service")
 
@@ -193,9 +196,9 @@ def _register_routes(app: FastAPI, base: str) -> None:
         request_id = _request_id(request)
         try:
             result = await asyncio.wait_for(
-                run_retrieval_request(payload,
-                                      es=request.app.state.es,
-                                      request_id=request_id),
+                run_keyword_retrieval_request(payload,
+                                            es=request.app.state.es,
+                                            request_id=request_id),
                 timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
             logger.error("request_id=%s 检索端到端超时", request_id)
@@ -206,6 +209,33 @@ def _register_routes(app: FastAPI, base: str) -> None:
 
         logger.info("request_id=%s traceId=%s outcome=%s degraded=%s "
                     "region=%s recalled=%d elapsedMs=%d",
+                    request_id, result.trace_id, result.outcome,
+                    result.degraded, result.region_code,
+                    result.recalled_count, result.elapsed_ms)
+        return RetrievalResponse(rtnCode=RTN_OK, rtnMsg="success", object=result)
+
+    @app.post(f"{base}/vector", response_model=RetrievalResponse)
+    async def vector(payload: RetrievalRequest, request: Request):
+        """纯向量检索:直接走在线知识 embedding 向量检索服务,
+        按语义相似度返回候选片段,不经槽位提取/关键词召回。
+        后端不支持向量检索时自动退化为关键词召回(标记 degraded=True)。
+        """
+        request_id = _request_id(request)
+        try:
+            result = await asyncio.wait_for(
+                run_vector_retrieval_request(payload,
+                                             es=request.app.state.es,
+                                             request_id=request_id),
+                timeout=request.app.state.timeout_s)
+        except asyncio.TimeoutError:
+            logger.error("request_id=%s 向量检索端到端超时", request_id)
+            return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))
+        except Exception:  # noqa: BLE001
+            logger.exception("request_id=%s 向量检索未预期异常", request_id)
+            return JSONResponse(error_body(RTN_INTERNAL, "服务内部错误"))
+
+        logger.info("request_id=%s traceId=%s channel=vector outcome=%s "
+                    "degraded=%s region=%s recalled=%d elapsedMs=%d",
                     request_id, result.trace_id, result.outcome,
                     result.degraded, result.region_code,
                     result.recalled_count, result.elapsed_ms)

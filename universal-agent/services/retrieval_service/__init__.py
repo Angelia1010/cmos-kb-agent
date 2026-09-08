@@ -6,15 +6,25 @@
     python -m uvicorn retrieval_service.app:app --host 0.0.0.0 --port 8000
 """
 from .app import app, create_app
+# from .models import (
+#     RetrievalChunk,
+#     RetrievalRequest,
+#     RetrievalResponse,
+#     RetrievalResponseObject,
+# )
 from .models import (
     RetrievalChunk,
+    RetrievalKeywordResponseObject,
     RetrievalRequest,
     RetrievalResponse,
-    RetrievalResponseObject,
+    RetrievalVectorResponseObject,
 )
 
 __all__ = [
     "app", "create_app",
-    "RetrievalRequest", "RetrievalResponse", "RetrievalResponseObject",
     "RetrievalChunk",
+    "RetrievalRequest",
+    "RetrievalResponse",
+    "RetrievalKeywordResponseObject",
+    "RetrievalVectorResponseObject",
 ]
