@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from .scripted_model import ScriptedChatModel
 from .shared.config import Config, DEFAULT_CONFIG
-from .shared.search import ESClient, MockESClient, ProduceESClient
+from .shared.search import ESClient,ProduceESClient
 
 # if TYPE_CHECKING:
 #     from .answer.agent import AnswerSubAgent
@@ -65,7 +65,7 @@ __all__ = [
     "Config", "DEFAULT_CONFIG",
     "MainAgent",
     "ScriptedChatModel",
-    "ESClient", "MockESClient", "ProduceESClient",
+    "ESClient","ProduceESClient",
     "RetrievalKeywordSubAgent", "RetrievalVectorSubAgent",
     "ProcessingSubAgent", "AnswerSubAgent",
 ]

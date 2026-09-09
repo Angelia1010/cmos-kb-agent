@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Retrieval Service 调试台</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1f2329; font-size: 14px; line-height: 1.5;
+  }
+  h1 { margin: 0 0 12px; font-size: 18px; }
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+  .card {
+    background: #fff; border: 1px solid #e5e6eb; border-radius: 6px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 14px; color: #4e5969; font-weight: 600; }
+  label { display: block; margin-bottom: 10px; }
+  label > span { display: block; margin-bottom: 4px; color: #4e5969; }
+  input[type=text], textarea, select {
+    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
+    font-family: inherit; font-size: 13px; background: #fff;
+  }
+  textarea { resize: vertical; min-height: 72px; }
+  button {
+    background: #165dff; color: #fff; border: none; border-radius: 4px;
+    padding: 8px 16px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: #0e42d2; }
+  button:disabled { background: #94bfff; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .meta div { background: #f7f8fa; border-radius: 4px; padding: 6px 8px; }
+  .meta .k { color: #86909c; font-size: 12px; }
+  .meta .v { font-weight: 600; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+  .badge.ok { background: #e8ffea; color: #00b42a; }
+  .badge.warn { background: #fff3e0; color: #ff7d00; }
+  .badge.err { background: #ffece8; color: #f53f3f; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: #e8f3ff; color: #165dff; border-radius: 3px; padding: 1px 6px; font-size: 12px; }
+  .chunk { border: 1px solid #e5e6eb; border-radius: 4px; margin-bottom: 8px; }
+  .chunk-head { padding: 8px 10px; background: #f7f8fa; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .chunk-head .t { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chunk-head .s { color: #86909c; font-size: 12px; white-space: nowrap; }
+  .chunk-body { padding: 10px; display: none; }
+  .chunk.open .chunk-body { display: block; }
+  .chunk-body pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  .chunk-body .kv { font-size: 12px; color: #4e5969; margin-bottom: 6px; }
+  details summary { cursor: pointer; color: #4e5969; margin: 6px 0; }
+  details pre { background: #1f2329; color: #c9cdd4; padding: 10px; border-radius: 4px; overflow: auto; font-size: 12px; }
+  .hint { color: #86909c; font-size: 12px; margin-top: 4px; }
+  .empty { color: #86909c; text-align: center; padding: 20px; }
+</style>
+</head>
+<body>
+<h1>Retrieval Service 调试台</h1>
+<div class="layout">
+  <div>
+    <div class="card">
+      <h2>请求参数</h2>
+      <label>
+        <span>query *</span>
+        <textarea id="query" placeholder="输入检索问题,如:如何办理5G套餐"></textarea>
+      </label>
+      <label>
+        <span>region_code</span>
+        <input type="text" id="region_code" value="000" placeholder="省份名或区号,如 福建/591/000">
+      </label>
+      <label>
+        <span>mode(召回路径)</span>
+        <select id="mode">
+          <option value="keyword">keyword — 关键词召回</option>
+          <option value="vector">vector — 纯向量召回</option>
+          <option value="integrate">integrate — 双路去重</option>
+        </select>
+      </label>
+      <div class="row">
+        <button id="send">发送</button>
+        <span id="status" class="hint"></span>
+      </div>
+      <div class="hint">请求路径:POST <span id="basePath"></span>/retrieve</div>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>响应结果</h2>
+      <div id="result"><div class="empty">尚未发送请求</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// 由后端注入当前业务路由前缀,避免跨域与 base 漂移
+var BASE = "__BASE_PATH__";
+document.getElementById("basePath").textContent = BASE;
+
+var sendBtn = document.getElementById("send");
+var statusEl = document.getElementById("status");
+
+sendBtn.addEventListener("click", function() {
+  var query = document.getElementById("query").value.trim();
+  var region_code = document.getElementById("region_code").value.trim() || "000";
+  var mode = document.getElementById("mode").value;
+  if (!query) { alert("query 不能为空"); return; }
+
+  sendBtn.disabled = true;
+  statusEl.textContent = "请求中...";
+  document.getElementById("result").innerHTML = '<div class="empty">请求中...</div>';
+
+  var t0 = performance.now();
+  fetch(BASE + "/retrieve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: query, region_code: region_code, mode: mode })
+  })
+  .then(function(r) { return r.text().then(function(txt){ return {ok: r.ok, status: r.status, text: txt}; }); })
+  .then(function(resp) {
+    var dt = Math.round(performance.now() - t0);
+    statusEl.textContent = "HTTP " + resp.status + " · 网关 " + dt + "ms";
+    var data;
+    try { data = JSON.parse(resp.text); }
+    catch(e) { renderRaw(resp.text, resp.status); return; }
+    render(data);
+  })
+  .catch(function(err) {
+    statusEl.textContent = "请求失败";
+    document.getElementById("result").innerHTML =
+      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
+  })
+  .finally(function() { sendBtn.disabled = false; });
+});
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function badge(cls, txt) { return '<span class="badge ' + cls + '">' + txt + "</span>"; }
+
+function render(data) {
+  var rtnCode = data.rtnCode, rtnMsg = data.rtnMsg || "", obj = data.object || {};
+  var el = document.getElementById("result");
+
+  if (rtnCode === "0" && obj && obj.chunks) {
+    var bc = obj.outcome === "success" ? "ok"
+           : obj.outcome === "degraded" ? "warn" : "err";
+    var deg = obj.degraded ? badge("warn", "已降级") : "";
+    var html = "";
+    html += '<div class="meta">';
+    html += metaCell("rtnCode", badge(bc, rtnCode));
+    html += metaCell("outcome", obj.outcome || "-");
+    html += metaCell("recalled", obj.recalled_count);
+    html += metaCell("elapsedMs", obj.elapsed_ms);
+    html += metaCell("region", obj.region_code || "-");
+    html += metaCell("traceId", obj.trace_id || "-");
+    html += metaCell("requestId", obj.request_id || "-");
+    html += metaCell("rtnMsg", escapeHtml(rtnMsg) + deg);
+    html += "</div>";
+
+    var kws = obj.keywords || [];
+    html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">keywords(' + kws.length + ")</div>";
+    html += '<div class="tags">' + (kws.length ? kws.map(function(k){ return '<span class="tag">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
+
+    var chunks = obj.chunks || [];
+    html += '<div style="margin-top:10px"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:6px">chunks(' + chunks.length + ")</div>";
+    if (!chunks.length) html += '<div class="empty">零召回</div>';
+    else chunks.forEach(function(c, i) {
+      html += '<div class="chunk" id="chunk-' + i + '">';
+      html += '<div class="chunk-head" onclick="toggleChunk(' + i + ')">';
+      html += '<span class="t">#' + (i+1) + " " + escapeHtml(c.doc_title || c.chunk_id) + "</span>";
+      html += '<span class="s">score ' + (c.score != null ? Number(c.score).toFixed(4) : "-") + " · " + escapeHtml(c.category || "-") + "</span>";
+      html += "</div>";
+      html += '<div class="chunk-body">';
+      html += '<div class="kv">chunk_id: ' + escapeHtml(c.chunk_id) + " · doc_id: " + escapeHtml(c.doc_id) + " · v" + escapeHtml(c.version || "-") + " · " + escapeHtml(c.updated_at || "-") + "</div>";
+      html += '<pre>' + escapeHtml(c.content || "") + "</pre>";
+      if (c.source_chunk_ids && c.source_chunk_ids.length)
+        html += '<div class="kv">source_chunk_ids: ' + escapeHtml(c.source_chunk_ids.join(", ")) + "</div>";
+      if (c.position && Object.keys(c.position).length)
+        html += '<div class="kv">position: ' + escapeHtml(JSON.stringify(c.position)) + "</div>";
+      if (c.extra && Object.keys(c.extra).length)
+        html += '<div class="kv">extra: ' + escapeHtml(JSON.stringify(c.extra)) + "</div>";
+      html += "</div></div>";
+    });
+    html += "</div>";
+    html += rawJson(data);
+    el.innerHTML = html;
+  } else {
+    var eb = rtnCode && rtnCode !== "0" ? "err" : "warn";
+    el.innerHTML = '<div class="meta">' +
+      metaCell("rtnCode", badge(eb, rtnCode || "-")) +
+      metaCell("rtnMsg", escapeHtml(rtnMsg)) +
+      "</div>" + rawJson(data);
+  }
+}
+
+function renderRaw(txt, status) {
+  document.getElementById("result").innerHTML =
+    '<div class="meta">' + metaCell("HTTP", badge("err", status)) + "</div>" +
+    "<details open><summary>原始响应</summary><pre>" + escapeHtml(txt) + "</pre></details>";
+}
+
+function metaCell(k, v) { return '<div><div class="k">' + k + '</div><div class="v">' + v + "</div></div>"; }
+
+function rawJson(data) {
+  return "<details><summary>原始 JSON</summary><pre>" + escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
+}
+
+function toggleChunk(i) {
+  var el = document.getElementById("chunk-" + i);
+  if (el) el.classList.toggle("open");
+}
+</script>
+</body>
+</html>

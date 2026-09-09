@@ -22,7 +22,8 @@ from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.knowledge_processing.bridge import retrieval_to_candidates
 from .shared.models import FinalAnswer, RetrievalParams, SourceRef
-from .shared.search import ESClient, build_dsl
+# from .shared.search import ESClient, build_dsl
+from .shared.search import ESClient
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
 
@@ -112,9 +113,13 @@ class MainAgent:
         """降级:原始 query → 保守单轮关键词检索 → 返回 topN 原始片段。"""
         try:
             from .shared import lexicon
-            params = RetrievalParams(keywords=lexicon.extract_keywords(query),
-                                     retrieval_mode="keyword")
-            hits = self.es.keyword_search(build_dsl(params, size=5))
+            from .shared.search import merged_to_chunks
+            # params = RetrievalParams(keywords=lexicon.extract_keywords(query),
+            #                          retrieval_mode="keyword")
+            # hits = self.es.keyword_search(build_dsl(params, size=5))
+            result = self.es.keyword_search(query=query) if hasattr(self.es, "keyword_search") else {}
+            merged = result.get("merged", []) if isinstance(result, dict) else []
+            hits = merged_to_chunks(merged)[:5]
         except Exception:                               # noqa: BLE001
             hits = []
         ans = FinalAnswer(

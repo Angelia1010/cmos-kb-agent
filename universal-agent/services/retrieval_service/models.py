@@ -10,8 +10,7 @@
 """
 from __future__ import annotations
 
-# from typing import Any, Literal
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +23,9 @@ class RetrievalRequest(BaseModel):
     region_code: str = Field(
         default="000",
         description="区域编码,支持省份名或区号(如 福建/591/000),缺省 000 表示全国")
+    mode: str = Field(
+        default="keyword",
+        description="召回路径:keyword(缺省,关键词召回)/vector(纯向量召回)/integrate(双路去重)")
     # 多余字段直接拒绝,避免调用方拼错字段名被静默忽略
     model_config = ConfigDict(extra="forbid")
 
@@ -49,51 +51,29 @@ class RetrievalChunk(BaseModel):
     extra: dict[str, Any] = Field(description="扩展字段")
 
 
-# class RetrievalResponseObject(BaseModel):
-#     """object 层 — 纯检索业务载荷。"""
-#     request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
-#     trace_id: str = Field(description="检索智能体内部trace ID")
-#     outcome: Literal["success", "no_results", "degraded"] = Field(
-#         description="结果:success 正常召回;no_results 零召回;degraded 走兜底降级路径")
-#     degraded: bool = Field(description="是否降级兜底结果;true 时未经一体化流水线,请人工核实")
-#     recalled_count: int = Field(description="召回片段数")
-#     elapsed_ms: int = Field(description="端到端耗时(毫秒)")
-#     region_code: str = Field(description="本次检索使用的区域编码")
-#     keywords: list[str] = Field(default_factory=list, description="检索关键词(槽位提取结果)")
-#     chunks: list[RetrievalChunk] = Field(description="召回片段列表")
-class RetrievalKeywordResponseObject(BaseModel):
-    """object 层 — 纯关键词检索业务载荷。"""
+class RetrievalResponseObject(BaseModel):
+    """object 层 — 检索业务载荷(关键词/向量/混合召回共用)。
+
+    keywords:关键词召回为槽位提取结果;向量召回固定为空列表(向量通道不经槽位提取)。
+    degraded:true 时表示未经主路径召回(走兜底降级),请人工核实。
+    """
     request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
     trace_id: str = Field(description="检索智能体内部trace ID")
     outcome: Literal["success", "no_results", "degraded"] = Field(
         description="结果:success 正常召回;no_results 零召回;degraded 走兜底降级路径")
-    degraded: bool = Field(description="是否降级兜底结果;true 时未经一体化流水线,请人工核实")
+    degraded: bool = Field(description="是否降级兜底结果;true 时未经主路径召回,请人工核实")
     recalled_count: int = Field(description="召回片段数")
     elapsed_ms: int = Field(description="端到端耗时(毫秒)")
     region_code: str = Field(description="本次检索使用的区域编码")
-    keywords: list[str] = Field(default_factory=list, description="检索关键词(槽位提取结果)")
+    keywords: list[str] = Field(default_factory=list, description="检索关键词(关键词召回为槽位提取结果;向量召回固定为空列表)")
     chunks: list[RetrievalChunk] = Field(description="召回片段列表")
 
-class RetrievalVectorResponseObject(BaseModel):
-    """object 层 — 纯向量检索业务载荷。"""
-    request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
-    trace_id: str = Field(description="检索智能体内部trace ID")
-    outcome: Literal["success", "no_results", "degraded"] = Field(
-        description="结果:success 正常召回;no_results 零召回;degraded 走兜底降级路径")
-    degraded: bool = Field(description="是否降级兜底结果;true 时向量召回失败退化为关键词召回,请人工核实")
-    recalled_count: int = Field(description="召回片段数")
-    elapsed_ms: int = Field(description="端到端耗时(毫秒)")
-    region_code: str = Field(description="本次检索使用的区域编码")
-    keywords: list[str] = Field(default_factory=list, description="向量召回固定为空列表(向量通道不经槽位提取)")
-    chunks: list[RetrievalChunk] = Field(description="召回片段列表")
 
 class RetrievalResponse(BaseModel):
     """灵犀返回信封。"""
     rtnCode: str = Field(default="0", description="返回码:0成功,非0见错误码表")
     rtnMsg: str = Field(default="success", description="返回消息")
-    # object: RetrievalResponseObject
-    object: Union[RetrievalKeywordResponseObject, RetrievalVectorResponseObject] = Field(
-        description="业务载荷:关键词检索返回 RetrievalKeywordResponseObject,向量检索返回 RetrievalVectorResponseObject")
+    object: RetrievalResponseObject = Field(description="业务载荷(检索召回明细 + 降级标记)")
 
 
 # ── 错误码 ──────────────────────────────────────────────────────────────────

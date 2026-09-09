@@ -43,13 +43,14 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from kbagent.shared.search import ESClient, MockESClient, ProduceESClient
+from kbagent.shared.search import ESClient, ProduceESClient
 
 from .models import (
     RTN_BAD_REQUEST,
@@ -60,8 +61,7 @@ from .models import (
     RetrievalResponse,
     error_body,
 )
-# from .runner import run_retrieval_keyword_request, run_vector_retrieval_request
-from .runner import run_keyword_retrieval_request, run_vector_retrieval_request
+from .runner import run_retrieval_request
 
 logger = logging.getLogger("retrieval_service")
 
@@ -116,7 +116,6 @@ def _resolve_base_path(base_path: Optional[str]) -> str:
         bp = "/" + bp
     return bp.rstrip("/")
 
-
 def _request_id(request: Request) -> str:
     """请求标识:优先取 X-Request-ID 头(合法时),缺省服务端生成。"""
     supplied = request.headers.get("X-Request-ID", "").strip()
@@ -126,19 +125,12 @@ def _request_id(request: Request) -> str:
 
 
 def _default_es() -> ESClient:
-    """按环境变量选择检索后端;**缺省即生产后端**。
+    """按环境变量构建生产检索后端 ProduceESClient。
 
-    默认/RETRIEVAL_SERVICE_BACKEND=produce → ProduceESClient(生产 ngkm
-    一体化流水线:槽位提取 → 知识主索引召回 → 原子表拼接,full_recall 必然可用);
-    仅 RETRIEVAL_SERVICE_BACKEND=mock → 离线 MockESClient(内置样例,本地演示)。
     ProduceESClient 构造本身不发网络请求,故不做异常回退;
-    真实失败发生在 full_recall 调用时,由 runner/app 的异常路径处理。
+    真实失败发生在 keyword_search/vector_search 调用时,由 runner/app 的
+    异常路径处理。
     """
-    backend = os.environ.get(ENV_BACKEND, "").strip().lower()
-    if backend == "mock":
-        logger.warning("RETRIEVAL_SERVICE_BACKEND=mock: 使用离线 MockESClient(仅内置样例)")
-        return MockESClient()
-
     region = os.environ.get(ENV_REGION, "000").strip() or "000"
     try:
         ngkm_timeout = int(os.environ.get(ENV_TIMEOUT, str(DEFAULT_NGKM_TIMEOUT_S)))
@@ -147,7 +139,6 @@ def _default_es() -> ESClient:
     logger.info("检索后端: 生产 ngkm ProduceESClient region=%s timeout=%ss",
                 region, ngkm_timeout)
     return ProduceESClient(region_code=region, timeout=ngkm_timeout)
-
 
 def create_app(es: Any = None,
                timeout_s: float = DEFAULT_TIMEOUT_S,
@@ -191,52 +182,46 @@ def _register_routes(app: FastAPI, base: str) -> None:
         return {"status": "ok",
                 "backend": type(request.app.state.es).__name__}
 
+    @app.get("/debug", response_class=HTMLResponse)
+    async def debug_page() -> HTMLResponse:
+        """调试台:表单构造 /retrieve 请求并展示返回。启动后访问
+        http://localhost:8000/debug(端口随 uvicorn --port)。"""
+        html_path = Path(__file__).parent / "frontend" / "index.html"
+        html = html_path.read_text(encoding="utf-8")
+        # 注入当前业务路由前缀,前端据此 fetch 到 {base}/retrieve
+        return html.replace("__BASE_PATH__", base)
+
     @app.post(f"{base}/retrieve", response_model=RetrievalResponse)
     async def retrieve(payload: RetrievalRequest, request: Request):
-        request_id = _request_id(request)
-        try:
-            result = await asyncio.wait_for(
-                run_keyword_retrieval_request(payload,
-                                            es=request.app.state.es,
-                                            request_id=request_id),
-                timeout=request.app.state.timeout_s)
-        except asyncio.TimeoutError:
-            logger.error("request_id=%s 检索端到端超时", request_id)
-            return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))
-        except Exception:  # noqa: BLE001
-            logger.exception("request_id=%s 检索未预期异常", request_id)
-            return JSONResponse(error_body(RTN_INTERNAL, "服务内部错误"))
+        """检索端点:按 body.mode 选择召回路径(缺省 keyword)。
 
-        logger.info("request_id=%s traceId=%s outcome=%s degraded=%s "
-                    "region=%s recalled=%d elapsedMs=%d",
-                    request_id, result.trace_id, result.outcome,
-                    result.degraded, result.region_code,
-                    result.recalled_count, result.elapsed_ms)
-        return RetrievalResponse(rtnCode=RTN_OK, rtnMsg="success", object=result)
-
-    @app.post(f"{base}/vector", response_model=RetrievalResponse)
-    async def vector(payload: RetrievalRequest, request: Request):
-        """纯向量检索:直接走在线知识 embedding 向量检索服务,
-        按语义相似度返回候选片段,不经槽位提取/关键词召回。
-        后端不支持向量检索时自动退化为关键词召回(标记 degraded=True)。
+        - mode=keyword(缺省):关键词召回(槽位提取 → 知识主索引 → 原子表拼接)
+        - mode=vector:纯向量召回(在线 embedding 向量相似度)
+        - mode=integrate:keyword+vector 双路召回,跨路去重
         """
         request_id = _request_id(request)
+        mode = payload.mode
         try:
             result = await asyncio.wait_for(
-                run_vector_retrieval_request(payload,
-                                             es=request.app.state.es,
-                                             request_id=request_id),
+                run_retrieval_request(payload,
+                                      es=request.app.state.es,
+                                      request_id=request_id,
+                                      mode=mode),
                 timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
-            logger.error("request_id=%s 向量检索端到端超时", request_id)
+            logger.error("request_id=%s 检索端到端超时 mode=%s", request_id, mode)
             return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))
+        except ValueError as exc:
+            # 非法 mode
+            logger.warning("request_id=%s 非法 mode=%s err=%s", request_id, mode, exc)
+            return JSONResponse(error_body(RTN_BAD_REQUEST, str(exc)))
         except Exception:  # noqa: BLE001
-            logger.exception("request_id=%s 向量检索未预期异常", request_id)
+            logger.exception("request_id=%s 检索未预期异常 mode=%s", request_id, mode)
             return JSONResponse(error_body(RTN_INTERNAL, "服务内部错误"))
 
-        logger.info("request_id=%s traceId=%s channel=vector outcome=%s "
-                    "degraded=%s region=%s recalled=%d elapsedMs=%d",
-                    request_id, result.trace_id, result.outcome,
+        logger.info("request_id=%s traceId=%s mode=%s outcome=%s degraded=%s "
+                    "region=%s recalled=%d elapsedMs=%d",
+                    request_id, result.trace_id, mode, result.outcome,
                     result.degraded, result.region_code,
                     result.recalled_count, result.elapsed_ms)
         return RetrievalResponse(rtnCode=RTN_OK, rtnMsg="success", object=result)
