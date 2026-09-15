@@ -70,6 +70,7 @@ def build_candidate_markdown(
     base = copy.deepcopy(candidate)
     result = ProcessedKnowledge(
         knowledge_id=base.knowledge_id,
+        chunk_id=base.chunk_id,
         name=base.name,
         content=base.content,
         atoms=atoms,

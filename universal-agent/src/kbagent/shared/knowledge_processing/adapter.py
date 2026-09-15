@@ -400,6 +400,7 @@ def _normalize_candidate(
         return normalize_candidate_applicability(candidate, warnings)
     data = _mapping(raw)
     knowledge_id = _text(data.get("knowledge_id"))
+    chunk_id = _text(data.get("chunk_id")) or ""
     name = _text(data.get("knowledge_name"))
     rank_raw = data.get("retrieval_rank")
     rank = _int(rank_raw, source_index + 1)
@@ -449,12 +450,14 @@ def _normalize_candidate(
         applicability_raw, warnings, source_index, knowledge_id
     )
     known = {
-        "knowledge_id", "knowledge_name", "content", "retrieval_rank", "retrieval_score",
+        "chunk_id", "knowledge_id", "knowledge_name", "content", "retrieval_rank", "source_index",
+        "retrieval_score",
         "matched_atom_ids", "source_routes", "knowledge_type", "template_id",
         "applicability", "atoms",
     }
     candidate = KnowledgeCandidate(
         knowledge_id=knowledge_id,
+        chunk_id=chunk_id,
         name=name,
         content=copy.deepcopy(content if content is not None else ""),
         atoms=atoms,

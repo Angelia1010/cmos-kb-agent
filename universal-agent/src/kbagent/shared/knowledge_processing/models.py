@@ -92,6 +92,8 @@ class KnowledgeCandidate(Serializable):
     # 候选顶层公开适用性字段；Adapter 会与 applicability 双向同步。
     region_ids: List[str] = dc_field(default_factory=list)
     channel_codes: List[str] = dc_field(default_factory=list)
+    # Retrieval Chunk 的稳定关联键；放在旧字段后保持位置参数兼容。
+    chunk_id: str = ""
 
 
 @dataclass

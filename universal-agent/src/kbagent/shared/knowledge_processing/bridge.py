@@ -1,18 +1,9 @@
 # -*- coding: utf-8 -*-
-"""检索产物 → Processing 标准候选的边界桥接。
-
-主链路检索阶段会产出两类工件:
-- merged_results: 生产一体化流水线(intergrate_all)的原始 camelCase 条目;
-- chunks:         merged_to_chunks / coarse_recall 的标准 Chunk 列表。
-
-处理阶段(analyze → filter → build_markdown → rerank)只认蛇形命名的
-标准候选(knowledge_id/knowledge_name/atoms[...]),本模块完成映射:
-有 merged 时按知识拆原子(camelCase → snake_case);
-离线环境无 merged 时把每个 Chunk 适配为一条单原子候选。
-"""
+"""Retrieval Chunk → Processing 内部候选的边界桥接。"""
 from __future__ import annotations
 
 import copy
+from collections.abc import Sequence
 from typing import Any, Dict, List, Optional
 
 from ..models import Chunk
@@ -27,7 +18,10 @@ def _text(value: Any) -> Optional[str]:
 
 def _applicability_of(raw: Dict[str, Any]) -> Dict[str, Any]:
     """从 ngkm 条目/原子映射适用性字段;只映射明确存在的字段,不猜测。"""
-    applicability: Dict[str, Any] = {}
+    nested = raw.get("applicability")
+    applicability: Dict[str, Any] = (
+        copy.deepcopy(nested) if isinstance(nested, dict) else {}
+    )
     status = _text(raw.get("statusCode") or raw.get("status"))
     if status:
         applicability["status"] = status
@@ -61,54 +55,65 @@ def _merged_atom_to_dict(knowledge_id: str, position: int,
     }
 
 
-def _merged_entry_to_candidate(index: int, entry: Dict[str, Any]) -> Dict[str, Any]:
-    kid = _text(entry.get("knowledgeId") or entry.get("knowledge_id")) \
-        or f"MERGED-{index + 1:03d}"
+def _chunk_to_candidate(index: int, chunk: Chunk) -> Dict[str, Any]:
+    extra = chunk.extra if isinstance(chunk.extra, dict) else {}
+    raw_atoms = extra.get("atoms")
     atoms: List[Dict[str, Any]] = []
-    for atom in entry.get("atoms") or []:
-        if not isinstance(atom, dict) or atom.get("error"):
-            continue
-        atoms.append(_merged_atom_to_dict(kid, len(atoms), atom))
+    if isinstance(raw_atoms, (list, tuple)):
+        for atom in raw_atoms:
+            if not isinstance(atom, dict) or atom.get("error"):
+                continue
+            atoms.append(_merged_atom_to_dict(chunk.doc_id, len(atoms), atom))
     return {
-        "knowledge_id": kid,
-        "knowledge_name": _text(
-            entry.get("knowledgeName") or entry.get("knowledge_name"))
-            or f"未命名知识-{kid}",
-        # 生产侧无显式相关性得分,留空由下游按缺分处理
+        "chunk_id": chunk.chunk_id,
+        "knowledge_id": chunk.doc_id,
+        "knowledge_name": chunk.doc_title,
+        "content": "",
         "retrieval_rank": index + 1,
-        "retrieval_score": None,
-        "applicability": _applicability_of(entry),
+        "source_index": index,
+        "retrieval_score": chunk.score,
+        "matched_atom_ids": copy.deepcopy(
+            extra.get("matched_atom_ids", extra.get("matchedAtomIds", []))
+        ),
+        "source_routes": copy.deepcopy(
+            extra.get("source_routes", extra.get("sourceRoutes", []))
+        ),
+        "knowledge_type": _text(
+            extra.get("knowledge_type", extra.get("knowledgeType"))
+        ),
+        "template_id": _text(
+            extra.get("template_id", extra.get("templateId"))
+        ),
+        "applicability": _applicability_of(extra),
         "atoms": atoms,
     }
 
 
-def _chunk_to_candidate(index: int, chunk: Chunk) -> Dict[str, Any]:
-    kid = chunk.chunk_id or f"CHUNK-{index + 1:03d}"
-    return {
-        "knowledge_id": kid,
-        "knowledge_name": chunk.doc_title or kid,
-        "retrieval_rank": index + 1,
-        "retrieval_score": chunk.score,
-        "applicability": _applicability_of(chunk.extra or {}),
-        "atoms": [{
-            "atom_id": f"{kid}-ATOM-001",
-            "param_name": "业务内容",
-            "content": chunk.content,
-            "arrange_seq_number": 1,
-            "applicability": {},
-        }],
-    }
+def index_source_chunks(chunks: Sequence[Chunk]) -> Dict[str, Chunk]:
+    """按 chunk_id 建立当前 Processing 调用的原 Chunk 映射并拒绝重复 ID。"""
+    source_chunks: Dict[str, Chunk] = {}
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, Chunk):
+            raise TypeError(f"chunks[{index}] 不是 Chunk")
+        if not chunk.chunk_id:
+            raise ValueError(f"chunks[{index}] 缺少 chunk_id")
+        if chunk.chunk_id in source_chunks:
+            raise ValueError(f"重复 chunk_id: {chunk.chunk_id}")
+        source_chunks[chunk.chunk_id] = chunk
+    return source_chunks
 
 
-def retrieval_to_candidates(merged: Optional[List[Dict[str, Any]]] = None,
-                            chunks: Optional[List[Chunk]] = None,
-                            ) -> List[Dict[str, Any]]:
-    """检索产物 → Processing 标准候选列表。
+def retrieval_to_candidates(
+    merged: Optional[List[Dict[str, Any]]] = None,
+    chunks: Optional[Sequence[Chunk]] = None,
+) -> List[Dict[str, Any]]:
+    """按输入顺序把 Retrieval Chunk 映射为 Processing 候选。
 
-    优先使用一体化流水线的 merged 原始条目;无 merged(离线 coarse_recall
-    路径)时退化为 Chunk 适配,一条 Chunk 映射一条单原子候选。
+    ``merged`` 仅为保持 MainAgent 已提交调用签名而保留；当前主链只允许
+    ``merged_results → chunks → candidates``，不再直接转换 merged。
     """
-    if merged:
-        return [_merged_entry_to_candidate(i, e)
-                for i, e in enumerate(merged) if isinstance(e, dict)]
-    return [_chunk_to_candidate(i, c) for i, c in enumerate(chunks or [])]
+    del merged
+    if chunks is None:
+        raise ValueError("缺少 Retrieval chunks，不能直接从 merged_results 构造候选")
+    index_source_chunks(chunks)
+    return [_chunk_to_candidate(index, chunk) for index, chunk in enumerate(chunks)]
