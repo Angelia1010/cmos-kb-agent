@@ -7,7 +7,6 @@
 """
 from .app import app, create_app
 from .models import (
-    RetrievalChunk,
     RetrievalRequest,
     RetrievalResponse,
     RetrievalResponseObject,
@@ -15,7 +14,6 @@ from .models import (
 
 __all__ = [
     "app", "create_app",
-    "RetrievalChunk",
     "RetrievalRequest",
     "RetrievalResponse",
     "RetrievalResponseObject",

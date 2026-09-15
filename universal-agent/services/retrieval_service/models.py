@@ -26,6 +26,9 @@ class RetrievalRequest(BaseModel):
     mode: str = Field(
         default="keyword",
         description="召回路径:keyword(缺省,关键词召回)/vector(纯向量召回)/integrate(双路去重)")
+    vector_mode: str = Field(
+        default="new",
+        description="向量模板选择:new(缺省,新模板)/old(旧模板)/both(双模板按权重混合)")
     # 多余字段直接拒绝,避免调用方拼错字段名被静默忽略
     model_config = ConfigDict(extra="forbid")
 
@@ -51,22 +54,32 @@ class RetrievalChunk(BaseModel):
     extra: dict[str, Any] = Field(description="扩展字段")
 
 
+# class RetrievalResponseObject(BaseModel):
+#     """object 层 — 检索业务载荷(关键词/向量/混合召回共用)。
+
+#     keywords:关键词召回为槽位提取结果;向量召回固定为空列表(向量通道不经槽位提取)。
+#     degraded:true 时表示未经主路径召回(走兜底降级),请人工核实。
+#     """
+#     request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
+#     trace_id: str = Field(description="检索智能体内部trace ID")
+#     outcome: Literal["success", "no_results", "degraded"] = Field(
+#         description="结果:success 正常召回;no_results 零召回;degraded 走兜底降级路径")
+#     degraded: bool = Field(description="是否降级兜底结果;true 时未经主路径召回,请人工核实")
+#     recalled_count: int = Field(description="召回片段数")
+#     elapsed_ms: int = Field(description="端到端耗时(毫秒)")
+#     region_code: str = Field(description="本次检索使用的区域编码")
+#     keywords: list[str] = Field(default_factory=list, description="检索关键词(关键词召回为槽位提取结果;向量召回固定为空列表)")
+#     chunks: list[RetrievalChunk] = Field(description="召回片段列表")
+#     kids: Any = Field(default_factory=list, description="知识ID集合;integrate为kid_scores(dict{kid:score}),keyword为keyword_kid列表,vector为vector_kid列表")
+#     example: dict[str, Any] = Field(default_factory=dict, description="检索各阶段示例数据(info_resp/atom_resp原始响应、parsed解析结果、infos/atoms条目列表)")
+
 class RetrievalResponseObject(BaseModel):
     """object 层 — 检索业务载荷(关键词/向量/混合召回共用)。
 
     keywords:关键词召回为槽位提取结果;向量召回固定为空列表(向量通道不经槽位提取)。
     degraded:true 时表示未经主路径召回(走兜底降级),请人工核实。
     """
-    request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
-    trace_id: str = Field(description="检索智能体内部trace ID")
-    outcome: Literal["success", "no_results", "degraded"] = Field(
-        description="结果:success 正常召回;no_results 零召回;degraded 走兜底降级路径")
-    degraded: bool = Field(description="是否降级兜底结果;true 时未经主路径召回,请人工核实")
-    recalled_count: int = Field(description="召回片段数")
-    elapsed_ms: int = Field(description="端到端耗时(毫秒)")
-    region_code: str = Field(description="本次检索使用的区域编码")
-    keywords: list[str] = Field(default_factory=list, description="检索关键词(关键词召回为槽位提取结果;向量召回固定为空列表)")
-    chunks: list[RetrievalChunk] = Field(description="召回片段列表")
+    example: dict[str, Any] = Field(default_factory=dict, description="检索各阶段示例数据(info_resp/atom_resp原始响应、parsed解析结果、infos/atoms条目列表)")
 
 
 class RetrievalResponse(BaseModel):

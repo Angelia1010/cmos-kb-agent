@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>召回率测试</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1f2329; font-size: 14px; line-height: 1.5;
+  }
+  h1 { margin: 0 0 12px; font-size: 18px; }
+  .nav { margin-bottom: 12px; }
+  .nav a { color: #165dff; text-decoration: none; font-size: 13px; margin-right: 12px; }
+  .nav a:hover { text-decoration: underline; }
+  .card {
+    background: #fff; border: 1px solid #e5e6eb; border-radius: 6px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 14px; color: #4e5969; font-weight: 600; }
+  .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .form-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .form-row .field .lbl { color: #4e5969; font-size: 13px; }
+  .form-row .field.mode { flex: 1; min-width: 180px; }
+  .form-row .field.vmode { flex: 1; min-width: 160px; }
+  .form-row .field.region { flex: 1; min-width: 140px; }
+  .form-row .field.action { flex: 0 0 auto; }
+  select {
+    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
+    font-family: inherit; font-size: 13px; background: #fff;
+  }
+  input[type=text] {
+    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
+    font-family: inherit; font-size: 13px; background: #fff;
+  }
+  button {
+    background: #165dff; color: #fff; border: none; border-radius: 4px;
+    padding: 8px 16px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: #0e42d2; }
+  button:disabled { background: #94bfff; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+  .badge.ok { background: #e8ffea; color: #00b42a; }
+  .badge.err { background: #ffece8; color: #f53f3f; }
+  .hint { color: #86909c; font-size: 12px; margin-top: 4px; }
+  .empty { color: #86909c; text-align: center; padding: 20px; }
+  details summary { cursor: pointer; color: #4e5969; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/test">召回率测试</a>
+</div>
+<h1>召回率测试</h1>
+<div class="card">
+  <h2>测试参数</h2>
+  <div class="form-row">
+    <div class="field mode">
+      <span class="lbl">mode(召回路径)</span>
+      <select id="mode">
+        <option value="keyword">keyword — 关键词召回</option>
+        <option value="vector">vector — 纯向量召回</option>
+        <option value="integrate" selected>integrate — 双路去重</option>
+      </select>
+    </div>
+    <div class="field vmode" id="vmodeField">
+      <span class="lbl">vector_mode(向量模板)</span>
+      <select id="vector_mode">
+        <option value="new">new — 新模板</option>
+        <option value="old">old — 旧模板</option>
+        <option value="both">both — 双模板混合</option>
+      </select>
+    </div>
+    <div class="field region">
+      <span class="lbl">全国召回</span>
+      <div class="row" style="gap:4px">
+        <button type="button" id="regionToggle" style="padding:6px 12px">✓ 使用全国(000)</button>
+      </div>
+    </div>
+    <div class="field action">
+      <span class="lbl">&nbsp;</span>
+      <div class="row">
+        <button id="startTest">开始测试</button>
+        <span id="status" class="hint"></span>
+      </div>
+    </div>
+  </div>
+  <div class="hint" style="margin-top:10px">请求路径:GET <span id="basePath"></span>/test-recall/stream</div>
+</div>
+<div class="card">
+  <h2>测试结果</h2>
+  <div id="result"><div class="empty">尚未开始测试</div></div>
+</div>
+
+<script>
+var BASE = "__BASE_PATH__";
+document.getElementById("basePath").textContent = BASE;
+
+var startBtn = document.getElementById("startTest");
+var statusEl = document.getElementById("status");
+var ev = null;
+var useNational = true;
+
+var modeSel = document.getElementById("mode");
+var vmodeField = document.getElementById("vmodeField");
+var regionToggle = document.getElementById("regionToggle");
+
+function toggleVmodeVisibility() {
+  vmodeField.style.display = modeSel.value === "keyword" ? "none" : "";
+}
+modeSel.addEventListener("change", toggleVmodeVisibility);
+toggleVmodeVisibility();
+
+regionToggle.addEventListener("click", function() {
+  useNational = !useNational;
+  if (useNational) {
+    regionToggle.textContent = "✓ 使用全国(000)";
+    regionToggle.style.background = "#165dff";
+    regionToggle.style.color = "#fff";
+  } else {
+    regionToggle.textContent = "✗ 禁用全国(用测试集省份)";
+    regionToggle.style.background = "#ffece8";
+    regionToggle.style.color = "#f53f3f";
+  }
+});
+regionToggle.click();
+
+startBtn.addEventListener("click", function() {
+  var mode = document.getElementById("mode").value;
+  var vector_mode = document.getElementById("vector_mode").value;
+  var region_code = useNational ? "000" : "__province__";
+  startBtn.disabled = true;
+  statusEl.textContent = "测试中...";
+  document.getElementById("result").innerHTML = '<div class="empty">启动测试...</div>';
+
+  if (ev) ev.close();
+  var url = BASE + "/test-recall/stream?mode=" + encodeURIComponent(mode)
+           + "&region_code=" + encodeURIComponent(region_code);
+  if (mode !== "keyword") {
+    url += "&vector_mode=" + encodeURIComponent(vector_mode);
+  }
+  ev = new EventSource(url);
+  var details = [];
+  var total = 0, hit = 0, rate = 0;
+
+  ev.addEventListener("start", function(e) {
+    var d = JSON.parse(e.data);
+    total = d.total;
+    document.getElementById("result").innerHTML = renderTestProgress(0, total, 0, 0, mode, vector_mode, []);
+  });
+
+  ev.addEventListener("progress", function(e) {
+    var d = JSON.parse(e.data);
+    total = d.total; hit = d.hit; rate = d.rate;
+    if (d.detail) details.push(d.detail);
+    document.getElementById("result").innerHTML =
+      renderTestProgress(d.done, total, hit, rate, mode, vector_mode, details);
+  });
+
+  ev.addEventListener("done", function(e) {
+    var d = JSON.parse(e.data);
+    statusEl.textContent = "完成: " + d.hit + "/" + d.total + " · 召回率 " + (d.rate * 100).toFixed(1) + "%";
+    document.getElementById("result").innerHTML =
+      renderTestProgress(d.total, d.total, d.hit, d.rate, mode, vector_mode, d.details || details);
+    ev.close();
+    ev = null;
+    startBtn.disabled = false;
+  });
+
+  ev.onerror = function() {
+    statusEl.textContent = "测试连接中断";
+    if (ev) { ev.close(); ev = null; }
+    startBtn.disabled = false;
+  };
+});
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function renderTestProgress(done, total, hit, rate, mode, vector_mode, details) {
+  var pct = total ? Math.round(done / total * 100) : 0;
+  var html = '<div class="card" style="margin-bottom:10px;padding:10px 14px">';
+  html += '<h2>召回率测试 · mode=' + escapeHtml(mode) + ' · vector_mode=' + escapeHtml(vector_mode) + '</h2>';
+  html += '<div style="background:#f7f8fa;border-radius:4px;overflow:hidden;height:20px;margin:8px 0">';
+  html += '<div style="width:' + pct + '%;height:100%;background:#165dff;transition:width .2s"></div></div>';
+  html += '<div class="row" style="justify-content:space-between">';
+  html += '<span class="hint">进度 ' + done + '/' + total + ' (' + pct + '%)</span>';
+  html += '<span class="hint">命中 ' + hit + '</span>';
+  html += '<span class="hint">召回率 <b style="color:#165dff">' + (rate * 100).toFixed(1) + '%</b></span>';
+  html += '</div></div>';
+
+  if (details.length) {
+    var hitDetails = details.filter(function(d) { return d.hit; });
+    if (hitDetails.length) {
+      html += '<details open style="margin-top:10px"><summary>命中列表(' + hitDetails.length + ')</summary>';
+      html += '<div style="max-height:300px;overflow:auto;border:1px solid #e8ffea;border-radius:4px">';
+      html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
+      html += '<tr style="background:#f0fff0;position:sticky;top:0">'
+           + '<th style="padding:6px;text-align:left">#</th>'
+           + '<th style="padding:6px;text-align:left">用户问</th>'
+           + '<th style="padding:6px;text-align:left">命中kid</th>'
+           + '</tr>';
+      hitDetails.forEach(function(d) {
+        var expectedHit = (d.actual || []).filter(function(x){ return (d.expected || []).indexOf(x) >= 0; });
+        html += '<tr style="border-top:1px solid #e8ffea">'
+              + '<td style="padding:6px;color:#00b42a;font-weight:600">#' + (d.index || '-') + '</td>'
+              + '<td style="padding:6px">' + escapeHtml(d.user_query || '') + '</td>'
+              + '<td style="padding:6px"><span style="color:#00b42a;font-weight:600">' + escapeHtml(expectedHit.join('、')) + '</span></td>'
+              + '</tr>';
+      });
+      html += '</table></div></details>';
+    }
+
+    html += '<details open style="margin-top:8px"><summary>全部明细(' + details.length + ')</summary>';
+    html += '<div style="max-height:400px;overflow:auto;border:1px solid #e5e6eb;border-radius:4px">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
+    html += '<tr style="background:#f7f8fa;position:sticky;top:0">'
+         + '<th style="padding:6px;text-align:left">#</th>'
+         + '<th style="padding:6px;text-align:left">用户问</th>'
+         + '<th style="padding:6px;text-align:left">省份</th>'
+         + '<th style="padding:6px;text-align:center">命中</th>'
+         + '<th style="padding:6px;text-align:left">期望ID</th>'
+         + '<th style="padding:6px;text-align:left">实际命中ID</th>'
+         + '</tr>';
+    details.forEach(function(d) {
+      var hitMark = d.hit ? '<span class="badge ok">✓</span>' : '<span class="badge err">✗</span>';
+      var expectedHit = (d.actual || []).filter(function(x){ return (d.expected || []).indexOf(x) >= 0; });
+      html += '<tr style="border-top:1px solid #e5e6eb">'
+            + '<td style="padding:6px">' + (d.index || '-') + '</td>'
+            + '<td style="padding:6px">' + escapeHtml(d.user_query || '') + '</td>'
+            + '<td style="padding:6px">' + escapeHtml(d.province || '') + '</td>'
+            + '<td style="padding:6px;text-align:center">' + hitMark + '</td>'
+            + '<td style="padding:6px;color:#86909c">' + escapeHtml((d.expected || []).join(', ')) + '</td>'
+            + '<td style="padding:6px;color:#00b42a">' + escapeHtml(expectedHit.join(', ')) + '</td>'
+            + '</tr>';
+    });
+    html += '</table></div></details>';
+  }
+  return html;
+}
+</script>
+</body>
+</html>

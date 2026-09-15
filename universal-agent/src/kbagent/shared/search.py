@@ -58,14 +58,82 @@ def _extract_doc_list(parsed: Any) -> List[dict]:
         return [parsed] if parsed else []
     return []
 
-def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
+def vresult_to_chunks(resp: Any, source: str = "vector") -> List[Chunk]:
+    """处理 vector_search 返回的结果 → 标准 Chunk 列表。
+
+    支持两种输入:
+    1. both 模式返回的 dict(含 new/old/all 键):直接处理 all 条目列表(已去重);
+    2. new/old 单路原始响应:walk 提取条目(兼容 object JSON 字符串包裹)。
+    """
+    chunks: List[Chunk] = []
+    seen: set = set()
+
+    def _info_of(entry: Dict[str, Any]) -> Dict[str, Any]:
+        info = entry.get("info")
+        return info if isinstance(info, dict) else {}
+
+    def add_entry(entry: Dict[str, Any]) -> None:
+        info = _info_of(entry)
+        kid = str(entry.get(_VECTOR_ID_FIELD) or info.get(_VECTOR_ID_FIELD) or "")
+        title = str(entry.get(_VECTOR_TITLE_FIELD) or info.get(_VECTOR_TITLE_FIELD) or "")
+        content = str(entry.get(_VECTOR_CONTENT_FIELD) or "") or title
+        key = kid or new_id("vec")
+        if kid and key in seen:
+            return
+        seen.add(key)
+        chunks.append(Chunk(
+            chunk_id=f"{kid}" if kid else key,
+            doc_id=kid or "unknown",
+            doc_title=title,
+            content=content,
+            category="",
+            position={"knowledge_id": kid, "rank": len(chunks)},
+            score=0.0,
+            extra={"source": "vector",
+                   "vector_channel": source,
+                   "raw": entry},
+        ))
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            raw_obj = node.get("object")
+            if isinstance(raw_obj, str):
+                try:
+                    walk(json.loads(raw_obj))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            info = _info_of(node)
+            has_id = (node.get(_VECTOR_ID_FIELD) not in (None, "")
+                      or info.get(_VECTOR_ID_FIELD) not in (None, ""))
+            has_title = (node.get(_VECTOR_TITLE_FIELD) not in (None, "")
+                         or info.get(_VECTOR_TITLE_FIELD) not in (None, ""))
+            has_content = node.get(_VECTOR_CONTENT_FIELD) not in (None, "")
+            if (has_id or has_title) and has_content:
+                add_entry(node)
+                return
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    if isinstance(resp, dict) and "all" in resp:
+        for entry in resp["all"]:
+            if isinstance(entry, dict):
+                add_entry(entry)
+    else:
+        walk(resp)
+    return chunks
+
+def kresult_to_chunks(kresult: List[Dict[str, Any]]) -> List[Chunk]:
     """一体化流水线的知识条目(info+atoms)→ 标准 Chunk 列表。
 
     一条知识映射一个 Chunk:content 由原子字段拼接(参数名:内容),
     原始条目完整保留在 extra 供溯源;生产侧无显式相关性得分,按出现顺序衰减。
     """
     chunks: List[Chunk] = []
-    for rank, entry in enumerate(merged or []):
+    for rank, entry in enumerate(kresult or []):
         if not isinstance(entry, dict):
             continue
         kid = str(entry.get("knowledgeId") or entry.get("knowledge_id") or "")
@@ -89,7 +157,7 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
                 updated_at = str(entry[key])
                 break
         chunks.append(Chunk(
-            chunk_id=f"ngkm_{kid}" if kid else new_id("ngkm"),
+            chunk_id=f"{kid}" if kid else new_id("ngkm"),
             doc_id=kid or "unknown",
             doc_title=title,
             content=content,
@@ -102,70 +170,33 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
                    "source": "ngkm",
                    "atoms": atoms},
         ))
-    if len(chunks) < len(merged or []):
-        logger.info("merged_to_chunks: %d 条知识条目 → %d 条有效 Chunk"
+    if len(chunks) < len(kresult or []):
+        logger.info("kresult_to_chunks: %d 条知识条目 → %d 条有效 Chunk"
                     "(无内容/原子全失败的条目被丢弃)",
-                    len(merged or []), len(chunks))
+                    len(kresult or []), len(chunks))
     for c in chunks[:5]:
-        logger.info("merged_to_chunks 产出: id=%s title=%r content_len=%d",
+        logger.info("kresult_to_chunks 产出: id=%s title=%r content_len=%d",
                     c.chunk_id, c.doc_title, len(c.content))
     return chunks
 
-def _vector_raw_to_chunks(resp: Any, source: str) -> List[Chunk]:
-    """向量检索原始返回 → 标准 Chunk 列表(按响应顺序,即服务端相关性顺序)。
+def get_kid_score(keyword_kid: List[str], vector_kid: List[str]) -> Dict[str, float]:
+    """根据 keyword/vector 两路 kid 列表计算每个 kid 的得分。
 
-    条目标定为含 knowledgeId/knowledgeName 之一且含 content 的 dict,命中即收、
-    不再下钻;兼容 ngkm 风格 ``object``(JSON 字符串)包裹;每个 Chunk 的
-    ``extra.raw`` 保留对应条目原文供溯源,``source`` 标记来源模板(new/old)。
+    权重:keyword=2.0, vector=1.0。kid 同时出现在两路得 2+1=3,
+    只在 keyword 路得 2,只在 vector 路得 1。
+    返回 {kid: score} 字典。
     """
-    chunks: List[Chunk] = []
-    seen: set = set()
-
-    def add_entry(entry: Dict[str, Any]) -> None:
-        kid = str(entry.get(_VECTOR_ID_FIELD) or "")
-        title = str(entry.get(_VECTOR_TITLE_FIELD) or "")
-        content = str(entry.get(_VECTOR_CONTENT_FIELD) or "") or title
-        # 有 knowledgeId 用它去重;无 id 的条目用随机 id,不互相合并
-        key = kid or new_id("vec")
-        if kid and key in seen:
-            return
-        seen.add(key)
-        chunks.append(Chunk(
-            chunk_id=f"vec_{kid}" if kid else key,
-            doc_id=kid or "unknown",
-            doc_title=title,
-            content=content,
-            category="",
-            position={"knowledge_id": kid, "rank": len(chunks)},
-            score=0.0,  # 最终位置分由 vector_search 按返回顺序统一编号
-            extra={"source": "vector",
-                   "vector_channel": source,
-                   "raw": entry},
-        ))
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            raw_obj = node.get("object")
-            if isinstance(raw_obj, str):
-                try:
-                    walk(json.loads(raw_obj))
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            has_id = node.get(_VECTOR_ID_FIELD) not in (None, "")
-            has_title = node.get(_VECTOR_TITLE_FIELD) not in (None, "")
-            has_content = node.get(_VECTOR_CONTENT_FIELD) not in (None, "")
-            if (has_id or has_title) and has_content:
-                add_entry(node)
-                return
-            for v in node.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item)
-
-    walk(resp)
-    return chunks
+    keyword_set = set(keyword_kid or [])
+    vector_set = set(vector_kid or [])
+    scores: Dict[str, float] = {}
+    for kid in keyword_set | vector_set:
+        score = 0.0
+        if kid in keyword_set:
+            score += 1.0
+        if kid in vector_set:
+            score += 1.0
+        scores[kid] = score
+    return scores
 
 class ESClient(ABC):
     @abstractmethod
@@ -175,54 +206,40 @@ class ESClient(ABC):
     def vector_search(self, query_text: str, filters: Dict[str, str],
                       size: int = 10, vector_mode: str = "new",
                       vector_weights: Optional[Dict[str, float]] = None
-                      ) -> List[Chunk]: ...
+                      ) -> Any: ...
 
 class ProduceESClient(ESClient):
 
-    def __init__(self, region_code: str = "000", timeout: int = 30):
+    def __init__(self, region_code: str = "000"):
         self.region_code = region_code      # 支持省份名,内部自动转区号
-        self.timeout = timeout
-    def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10, vector_mode: str = "new",
-                      vector_weights: Optional[Dict[str, float]] = None
-                      ) -> List[Chunk]:
-        """向量通道(ESClient 接口):按 ``vector_mode`` 调度召回,返回标准 Chunk。
+    def vector_search(self, query_text: str, region_code: str, vector_mode: str = "new") -> Any:
+        """向量通道:按 ``vector_mode`` 选择召回函数,直接返回对应结果。
 
-        vector_mode/vector_weights 逐次调用传入(默认 new 单模板;both 时按
-        vector_weights 分配新旧两路返回名额),召回/选路见 ``_vector_recall``;
-        过滤条件中 region 经请求体 provinceId 下推,向量响应仅含
-        knowledgeId/knowledgeName/content,不做 category/status 客户端过滤。
-        返回顺序即最终相关性顺序,位置分按 1/(rank+1) 统一编号。
+        new/old 单路只请求对应模板;both 时按 vector_weights 混合召回。
         """
         if not query_text or not query_text.strip():
-            return []
-        mode = (vector_mode or "new").strip().lower()
-        weights = vector_weights or {"new": 0.6, "old": 0.4}
-        province = str(filters.get("region") or "")
-        chunks = self._vector_recall(query_text, province, self.timeout, size,
-                                     mode, weights)
-        for rank, chunk in enumerate(chunks):
-            chunk.position["rank"] = rank
-            chunk.score = round(1.0 / (rank + 1), 4)
-        return chunks
+            return None
+        mode = vector_mode or "both"
+        province = _region_code(region_code or "")
+        if mode == "new":
+            return self._vector_recall_new(query_text, province)
+        if mode == "old":
+            return self._vector_recall_old(query_text, province)
+        return self._vector_recall(query_text, province)
 
-    def _vector_recall_new(self, query_text: str, province: str,
-                           timeout: int) -> Optional[dict]:
+    def _vector_recall_new(self, query_text: str, province: str) -> Optional[dict]:
         try:
-            resp = self._post_vector_search("new", query_text, timeout,
-                                            province=province)
+            resp = self._post_vector_search("new", query_text, province=province)
             logger.info("向量召回(新模板) query=%r 完成", query_text)
             return resp
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc: 
             logger.warning("向量召回(新模板)失败,降级为空 query=%r err=%r",
                            query_text, exc)
             return None
 
-    def _vector_recall_old(self, query_text: str, province: str,
-                           timeout: int) -> Optional[dict]:
+    def _vector_recall_old(self, query_text: str, province: str) -> Optional[dict]:
         try:
-            resp = self._post_vector_search("old", query_text, timeout,
-                                            province=province)
+            resp = self._post_vector_search("old", query_text, province=province)
             logger.info("向量召回(旧模板) query=%r 完成", query_text)
             return resp
         except Exception as exc:  # noqa: BLE001
@@ -230,63 +247,41 @@ class ProduceESClient(ESClient):
                            query_text, exc)
             return None
 
-    def _vector_recall(self, query_text: str, province: str, timeout: int,
-                       size: int, vector_mode: str,
-                       vector_weights: Dict[str, float]) -> List[Chunk]:
-        if vector_mode == "new":
-            return _vector_raw_to_chunks(
-                self._vector_recall_new(query_text, province, timeout),
-                "new")[:size]
-        if vector_mode == "old":
-            return _vector_raw_to_chunks(
-                self._vector_recall_old(query_text, province, timeout),
-                "old")[:size]
+    def _vector_recall(self, query_text: str, province: str) -> Dict[str, Any]:
+        """根据权重召回混合的新旧模板响应,返回各路原始响应 + all(去重合并)。
 
-        # both: 新旧两路均请求;权重为 0 的路不请求、不占名额、不参与去重
-        w_new = vector_weights.get("new", 0.5)
-        w_old = vector_weights.get("old", 0.5)
-        new_chunks = (_vector_raw_to_chunks(
-            self._vector_recall_new(query_text, province, timeout), "new")
-            if w_new > 0 else [])
-        old_chunks = (_vector_raw_to_chunks(
-            self._vector_recall_old(query_text, province, timeout), "old")
-            if w_old > 0 else [])
+        权重 > 0 的路才请求;返回 {"new": raw, "old": raw, "all": [...]}
+        (new/old 为原始响应,all 为两路条目按 kid 去重后的合并列表)。
+        """
+        results: Dict[str, Any] = {}
 
-        # 跨路去重(新模板优先保留;无 knowledgeId 的 chunk_id 随机,不合并)
-        seen: set = set()
-        new_unique: List[Chunk] = []
-        old_unique: List[Chunk] = []
-        for c in new_chunks:
-            if c.chunk_id not in seen:
-                seen.add(c.chunk_id)
-                new_unique.append(c)
-        for c in old_chunks:
-            if c.chunk_id not in seen:
-                seen.add(c.chunk_id)
-                old_unique.append(c)
+        results["new"] = self._vector_recall_new(query_text, province)
+        results["old"] = self._vector_recall_old(query_text, province)
 
-        # 按新旧比例分配返回名额
-        n_new = round(size * w_new) if w_new > 0 else 0
-        n_old = size - n_new
-        picked = new_unique[:n_new] + old_unique[:n_old]
-        # 某路不足名额:用另一路剩余 Chunk 补齐到 size
-        if len(picked) < size:
-            rest = new_unique[n_new:] + old_unique[n_old:]
-            picked += rest[:size - len(picked)]
+        seen_kids: set = set()
+        all_entries: List[dict] = []
+        for source in ("new", "old"):
+            raw = results.get(source)
+            if not raw:
+                continue
+            entries = _extract_doc_list(raw)
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                kid = str(entry.get(_VECTOR_ID_FIELD)
+                         or "")
+                if kid and kid in seen_kids:
+                    continue
+                if kid:
+                    seen_kids.add(kid)
+                all_entries.append(entry)
+        results["all"] = all_entries
+        return results
 
-        logger.info("向量混合召回: 新模板=%d条 旧模板=%d条 两路总条数=%d; "
-                    "新旧比例=%.2f:%.2f → 分配名额 新%d/旧%d(size=%d), 实际返回=%d条",
-                    len(new_chunks), len(old_chunks),
-                    len(new_chunks) + len(old_chunks),
-                    w_new, w_old, n_new, n_old, size, len(picked))
-        return picked[:size]
-
-    def _post_vector_search(self, mode: str, query_text: str,
-                            timeout: int, province: str = "") -> dict:
+    def _post_vector_search(self, mode: str, query_text: str, province: str = "") -> dict:
         payload = dict(_VECTOR_PAYLOADS[mode])
         payload["content"] = query_text
-        if province:
-            payload["provinceId"] = province
+        payload["provinceId"] = province
         payload["reqId"] = uuid.uuid4().hex
         payload["xTransId"] = uuid.uuid4().hex
         logger.info("向量检索请求 mode=%s content=%r top=%s embeddingTop=%s "
@@ -297,26 +292,23 @@ class ProduceESClient(ESClient):
             resp = requests.post(
                 _VECTOR_SEARCH_URL,
                 headers={"Content-Type": "application/json"},
-                json=payload, timeout=timeout,
+                json=payload
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("向量检索请求失败(网络/超时/DNS) mode=%s url=%s err=%r",
                            mode, _VECTOR_SEARCH_URL, exc)
             raise
-        logger.info("向量检索响应 mode=%s status=%s body=%s",
-                    mode, resp.status_code, resp.text[:800])
+        logger.info("向量检索响应 mode=%s status=%s",
+                    mode, resp.status_code)
         resp.raise_for_status()
         return resp.json()
 
-    def keyword_search(self, query: str, region_code: str = "",
-                    timeout: int = 0) -> dict:
+    def keyword_search(self, query: str, region_code: str = "") -> dict:
         """完整流水线,返回 {keywords, knowledge_ids, info, atom, merged_count, merged}。"""
-        raw_region = region_code or self.region_code
-        region_code = _region_code(raw_region)
-        timeout = timeout or self.timeout
+        region_code = _region_code(region_code or self.region_code)
         logger.info("keyword_search 开始 query=%r region=%r→%r "
-                    "索引=ngkm.knowledges_%s / ngkm.knowledge_atom_%s timeout=%ss",
-                    query, raw_region, region_code, region_code, region_code, timeout)
+                    "索引=ngkm.knowledges_%s / ngkm.knowledge_atom_%s",
+                    query, region_code, region_code, region_code)
         try:
             keywords = self._extract_keywords(query)
             logger.info("槽位提取关键词 query=%r: %s", query, keywords)
@@ -327,7 +319,7 @@ class ProduceESClient(ESClient):
             logger.warning("keyword_search 未提取到有效关键词 → 零召回 query=%r", query)
             return {"keywords": [], "info": [], "atom": [], "merged": [],
                     "message": "未提取到有效关键词"}
-        return self._info_atom_recall(keywords, region_code, timeout)
+        return self._info_atom_recall(keywords, region_code)
 
     def _extract_keywords(self, query: str) -> List[str]: #优化槽位提取结果，只保留有效信息（代办）
         """Step 1:槽位抽取服务提取检索关键词。"""
@@ -381,6 +373,13 @@ class ProduceESClient(ESClient):
         """Step 2-4:info 召回 → 按 knowledgeId 拉 atom → 合并。"""
         region_code = _region_code(region_code)
 
+        info_eg: dict = {}
+        info_parsed_eg: Any = {}
+        info_list_eg: List[dict] = []
+        atom_eg: dict = {}
+        atom_parsed_eg: Any = {}
+        atom_list_eg: List[dict] = []
+
         # ---- Step 2: 收集所有 info 条目(跨所有 keyword) ----
         all_infos: List[dict] = []
         for kw in keywords:
@@ -401,6 +400,12 @@ class ProduceESClient(ESClient):
                                kw, exc, str(raw_obj)[:200])
                 continue
             infos = _extract_doc_list(parsed)
+            if not info_eg and isinstance(info_resp, dict):
+                info_eg = dict(info_resp)
+            if not info_parsed_eg:
+                info_parsed_eg = parsed
+            if not info_list_eg and infos:
+                info_list_eg = [dict(d) for d in infos[:1] if isinstance(d, dict)]
             for info in infos:
                 if not isinstance(info, dict):
                     continue
@@ -439,6 +444,12 @@ class ProduceESClient(ESClient):
                 raw_obj = atom_resp.get("object", "") if isinstance(atom_resp, dict) else ""
                 parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
                 atoms = _extract_doc_list(parsed)
+                if not atom_eg and isinstance(atom_resp, dict):
+                    atom_eg = dict(atom_resp)
+                if not atom_parsed_eg:
+                    atom_parsed_eg = parsed
+                if not atom_list_eg and atoms:
+                    atom_list_eg = [dict(d) for d in atoms[:1] if isinstance(d, dict)]
                 for a in atoms:
                     if isinstance(a, dict):
                         a["knowledgeId"] = kid
@@ -469,13 +480,20 @@ class ProduceESClient(ESClient):
             "knowledge_ids": kid_order,
             "info": all_info_clean,
             "atom": all_atoms,
+            "example": {
+                "info_resp": info_eg,
+                "info_parsed": info_parsed_eg,
+                "infos": info_list_eg,
+                "atom_resp": atom_eg,
+                "atom_parsed": atom_parsed_eg,
+                "atoms": atom_list_eg,
+            },
             "merged_count": len(merged),
             "merged": merged,
         }
 
     # ------------------------------------------------------------------
-    # ngkm HTTP 调用
-    # ------------------------------------------------------------------
+    # ngkm HTTP 调-----------
     def _get_info(self, keyword: str, region_code: str = "000",
                   timeout: int = 30) -> dict:
         """知识主索引关键词检索(ngkm.knowledges_{region_code})。"""

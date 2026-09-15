@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 
 from ..shared import lexicon
 from ..shared.models import Chunk
-from ..shared.search import merged_to_chunks
+from ..shared.search import kresult_to_chunks, vresult_to_chunks,get_kid_score
 from ..shared.workspace import get_workspace
 
 logger = logging.getLogger("kbagent.retrieval")
@@ -26,7 +26,7 @@ def _obs(**kw) -> str:
 
 @tool
 def intergrate_all(query: str = "", region_code: str = "000",
-                   timeout: int = 30) -> str:
+                   timeout: int = 30, vector_mode: str = "new") -> str:
     """生产一体化检索流水线:同时调 keyword(槽位提取→知识主索引→原子表)与
     vector(在线 embedding)两路召回,跨路去重后产出最终候选片段。
     region_code 支持区号或省份名(如 000/福建)。
@@ -49,17 +49,19 @@ def intergrate_all(query: str = "", region_code: str = "000",
             if not kmerged and isinstance(kresult, dict) and kresult.get("message"):
                 logger.warning("intergrate_all keyword 零召回: %s (keywords=%s)",
                                kresult["message"], kresult.get("keywords"))
-            kchunks = merged_to_chunks(kmerged)
+            kchunks = kresult_to_chunks(kresult)
     else:
         kerror = f"当前检索后端 {type(ws.es).__name__} 无 keyword_search"
         logger.warning("intergrate_all: %s,跳过 keyword 通道", kerror)
 
     vchunks: List[Chunk] = []
+    vresult: Any = None
     verror: str = ""
     if vector_search is not None:
         try:
-            vchunks = vector_search(query, {"region": region_code} if region_code else {},
-                                    ws.cfg.recall_size)
+            vresult = vector_search(query, {"region": region_code} if region_code else {},
+                                    ws.cfg.recall_size, vector_mode=vector_mode)
+            vchunks = vresult_to_chunks(vresult)
         except Exception as exc:  # noqa: BLE001
             verror = repr(exc)
             logger.warning("intergrate_all vector 通道异常,降级为空: %r", exc)
@@ -74,16 +76,29 @@ def intergrate_all(query: str = "", region_code: str = "000",
             seen.add(c.chunk_id)
             merged_chunks.append(c)
 
+    keyword_kid = list((kresult.get("knowledge_ids") if isinstance(kresult, dict) else []) or [])
+    vector_kid = [c.doc_id for c in vchunks if c.doc_id and c.doc_id != "unknown"]
+    kid_scores = get_kid_score(keyword_kid, vector_kid)
+    sorted_kids = sorted(kid_scores.keys(), key=lambda k: kid_scores[k], reverse=True)
+    kid_rank = {kid: rank for rank, kid in enumerate(sorted_kids)}
+    merged_chunks.sort(key=lambda c: kid_rank.get(c.doc_id, len(sorted_kids)))
+
     chunks = merged_chunks
     logger.info("intergrate_all 合并: keyword=%d vector=%d → 去重后=%d",
                 len(kchunks), len(vchunks), len(chunks))
     ws.data["chunks"] = chunks
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
-    ws.data["merged_results"] = kresult.get("merged", []) if isinstance(kresult, dict) else []
     ws.data["keywords"] = list((kresult.get("keywords") if isinstance(kresult, dict) else []) or [])
+    ws.data["merged_results"] = kresult.get("merged", []) if isinstance(kresult, dict) else []
     ws.data["keyword_chunks"] = kchunks
+    ws.data["keyword_kid"] = keyword_kid
+    ws.data["vector_results"] = vresult
     ws.data["vector_chunks"] = vchunks
+    ws.data["vector_kid"] = vector_kid
+    ws.data["kid_scores"] = kid_scores
+    ws.data["ranked_kids"] = sorted_kids
+    ws.data["example"] = kresult.get("example", {}) if isinstance(kresult, dict) else {}
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
@@ -103,8 +118,7 @@ def intergrate_all(query: str = "", region_code: str = "000",
 
 
 @tool
-def vector_recall(query: str = "", region_code: str = "000",
-                  timeout: int = 30) -> str:
+def vector_recall(query: str = "", region_code: str = "000", vector_mode: str = "new") -> str:
     """纯向量召回:直接走在线知识 embedding 向量检索服务,按语义相似度返回候选片段,
     不经过关键词/槽位提取。region_code 支持区号或省份名(如 000/福建),经 provinceId
     下推到向量服务。后端不支持向量检索时返回 error,由 agent 走兜底降级。
@@ -116,17 +130,19 @@ def vector_recall(query: str = "", region_code: str = "000",
                        "回退关键词召回", type(ws.es).__name__)
         return _obs(error="当前检索后端不支持向量召回,请改用 coarse_recall")
     query = query or ws.query
-    filters: Dict[str, str] = {"region": region_code} if region_code else {}
-    size = ws.cfg.recall_size
+    region_code = region_code or ws.region_code
     try:
-        chunks: List[Chunk] = vector_search(query, filters, size)
+        result = vector_search(query, region_code, vector_mode=vector_mode)
     except Exception as exc:  # noqa: BLE001
         logger.warning("vector_recall 异常: query=%r region=%s err=%r", query, region_code, exc)
         return _obs(error=f"向量召回异常: {exc!r}")
+    chunks = vresult_to_chunks(result)
+    for rank, chunk in enumerate(chunks):
+        chunk.position["rank"] = rank
     ws.data["chunks"] = chunks
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
-    ws.data["vector_chunks"] = chunks
+    ws.data["vector_results"] = result
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
@@ -162,13 +178,13 @@ def keyword_recall(query: str = "", region_code: str = "000",
     if not merged and isinstance(result, dict) and result.get("message"):
         logger.warning("keyword_recall 零召回: %s (keywords=%s)",
                        result["message"], result.get("keywords"))
-    chunks = merged_to_chunks(merged)
+    chunks = kresult_to_chunks(merged)
     logger.info("keyword_recall chunks=%d", len(chunks))
     ws.data["chunks"] = chunks
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
     ws.data["merged_results"] = merged
-    ws.data["keywords"] = list((result.get("keywords") if isinstance(result, dict) else []) or [])
+    ws.data["example"] = result.get("example", {})
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",

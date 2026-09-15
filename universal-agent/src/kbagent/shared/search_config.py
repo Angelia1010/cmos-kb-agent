@@ -26,7 +26,8 @@ _INFO_RECALL_TEMPLATE = """{
     "searchInfo": "knowledgeName=10,klgAliasName=5",
     "analysisType": "smart",
     "relCalculus": "OR",
-    "highlightField": "knowledgeName,klgAliasName"
+    "highlightField": "knowledgeName,klgAliasName"{% if mandatory_field %},
+    "mandatoryField": "{{ mandatory_field }}"{% endif %}
   }
 }"""
 

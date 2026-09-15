@@ -11,19 +11,28 @@
     background: #f5f6f8; color: #1f2329; font-size: 14px; line-height: 1.5;
   }
   h1 { margin: 0 0 12px; font-size: 18px; }
-  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+  .nav { margin-bottom: 12px; }
+  .nav a { color: #165dff; text-decoration: none; font-size: 13px; margin-right: 12px; }
+  .nav a:hover { text-decoration: underline; }
+  .layout { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
   .card {
     background: #fff; border: 1px solid #e5e6eb; border-radius: 6px;
     padding: 14px 16px; margin-bottom: 14px;
   }
   .card h2 { margin: 0 0 10px; font-size: 14px; color: #4e5969; font-weight: 600; }
-  label { display: block; margin-bottom: 10px; }
-  label > span { display: block; margin-bottom: 4px; color: #4e5969; }
+  .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .form-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .form-row .field .lbl { color: #4e5969; font-size: 13px; }
+  .form-row .field.query { flex: 2; min-width: 280px; }
+  .form-row .field.region { flex: 1; min-width: 140px; }
+  .form-row .field.mode { flex: 1; min-width: 180px; }
+  .form-row .field.vmode { flex: 1; min-width: 160px; }
+  .form-row .field.action { flex: 0 0 auto; }
   input[type=text], textarea, select {
     width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
     font-family: inherit; font-size: 13px; background: #fff;
   }
-  textarea { resize: vertical; min-height: 72px; }
+  textarea { resize: vertical; min-height: 38px; }
   button {
     background: #165dff; color: #fff; border: none; border-radius: 4px;
     padding: 8px 16px; cursor: pointer; font-size: 13px;
@@ -56,65 +65,90 @@
 </style>
 </head>
 <body>
+<div class="nav">
+  <a href="/debug">检索调试</a>
+  <a href="/test">召回率测试</a>
+</div>
 <h1>Retrieval Service 调试台</h1>
 <div class="layout">
-  <div>
-    <div class="card">
-      <h2>请求参数</h2>
-      <label>
-        <span>query *</span>
+  <div class="card">
+    <h2>请求参数</h2>
+    <div class="form-row">
+      <div class="field query">
+        <span class="lbl">query *</span>
         <textarea id="query" placeholder="输入检索问题,如:如何办理5G套餐"></textarea>
-      </label>
-      <label>
-        <span>region_code</span>
+      </div>
+      <div class="field region">
+        <span class="lbl">region_code</span>
         <input type="text" id="region_code" value="000" placeholder="省份名或区号,如 福建/591/000">
-      </label>
-      <label>
-        <span>mode(召回路径)</span>
+      </div>
+      <div class="field mode">
+        <span class="lbl">mode(召回路径)</span>
         <select id="mode">
           <option value="keyword">keyword — 关键词召回</option>
           <option value="vector">vector — 纯向量召回</option>
           <option value="integrate">integrate — 双路去重</option>
         </select>
-      </label>
-      <div class="row">
-        <button id="send">发送</button>
-        <span id="status" class="hint"></span>
       </div>
-      <div class="hint">请求路径:POST <span id="basePath"></span>/retrieve</div>
+      <div class="field vmode" id="vmodeField">
+        <span class="lbl">vector_mode(向量模板)</span>
+        <select id="vector_mode">
+          <option value="new">new — 新模板</option>
+          <option value="old">old — 旧模板</option>
+          <option value="both">both — 双模板混合</option>
+        </select>
+      </div>
+      <div class="field action">
+        <span class="lbl">&nbsp;</span>
+        <div class="row">
+          <button id="send">发送</button>
+          <span id="status" class="hint"></span>
+        </div>
+      </div>
     </div>
+    <div class="hint" style="margin-top:10px">请求路径:POST <span id="basePath"></span>/retrieve</div>
   </div>
-  <div>
-    <div class="card">
-      <h2>响应结果</h2>
-      <div id="result"><div class="empty">尚未发送请求</div></div>
-    </div>
+  <div class="card">
+    <h2>响应结果</h2>
+    <div id="result"><div class="empty">尚未发送请求</div></div>
   </div>
 </div>
 
 <script>
-// 由后端注入当前业务路由前缀,避免跨域与 base 漂移
 var BASE = "__BASE_PATH__";
 document.getElementById("basePath").textContent = BASE;
 
 var sendBtn = document.getElementById("send");
 var statusEl = document.getElementById("status");
 
+var modeSel = document.getElementById("mode");
+var vmodeField = document.getElementById("vmodeField");
+
+function toggleVmodeVisibility() {
+  vmodeField.style.display = modeSel.value === "keyword" ? "none" : "";
+}
+modeSel.addEventListener("change", toggleVmodeVisibility);
+toggleVmodeVisibility();
+
 sendBtn.addEventListener("click", function() {
   var query = document.getElementById("query").value.trim();
   var region_code = document.getElementById("region_code").value.trim() || "000";
   var mode = document.getElementById("mode").value;
+  var vector_mode = document.getElementById("vector_mode").value;
   if (!query) { alert("query 不能为空"); return; }
 
   sendBtn.disabled = true;
   statusEl.textContent = "请求中...";
   document.getElementById("result").innerHTML = '<div class="empty">请求中...</div>';
 
+  var body = { query: query, region_code: region_code, mode: mode };
+  if (mode !== "keyword") body.vector_mode = vector_mode;
+
   var t0 = performance.now();
   fetch(BASE + "/retrieve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query: query, region_code: region_code, mode: mode })
+    body: JSON.stringify(body)
   })
   .then(function(r) { return r.text().then(function(txt){ return {ok: r.ok, status: r.status, text: txt}; }); })
   .then(function(resp) {
@@ -162,6 +196,19 @@ function render(data) {
     var kws = obj.keywords || [];
     html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">keywords(' + kws.length + ")</div>";
     html += '<div class="tags">' + (kws.length ? kws.map(function(k){ return '<span class="tag">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
+
+    var mode = document.getElementById("mode").value;
+    var kids = obj.kids;
+    var kidsLabel = mode === "integrate" ? "kid_scores" : (mode === "vector" ? "vector_kid" : "keyword_kid");
+    if (kids && typeof kids === "object" && !Array.isArray(kids)) {
+      var entries = Object.entries(kids);
+      html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">' + kidsLabel + '(' + entries.length + ")</div>";
+      html += '<div class="tags">' + (entries.length ? entries.map(function(e){ return '<span class="tag" style="background:#fff7e6;color:#ff7d00">' + escapeHtml(e[0]) + ": " + e[1] + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
+    } else {
+      var kidsArr = Array.isArray(kids) ? kids : [];
+      html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">' + kidsLabel + '(' + kidsArr.length + ")</div>";
+      html += '<div class="tags">' + (kidsArr.length ? kidsArr.map(function(k){ return '<span class="tag" style="background:#fff7e6;color:#ff7d00">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
+    }
 
     var chunks = obj.chunks || [];
     html += '<div style="margin-top:10px"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:6px">chunks(' + chunks.length + ")</div>";

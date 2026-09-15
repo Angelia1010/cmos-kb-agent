@@ -49,6 +49,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.responses import StreamingResponse
 
 from kbagent.shared.search import ESClient, ProduceESClient
 
@@ -62,6 +63,7 @@ from .models import (
     error_body,
 )
 from .runner import run_retrieval_request
+from .test_runner import run_recall_test_stream
 
 logger = logging.getLogger("retrieval_service")
 
@@ -184,11 +186,18 @@ def _register_routes(app: FastAPI, base: str) -> None:
 
     @app.get("/debug", response_class=HTMLResponse)
     async def debug_page() -> HTMLResponse:
-        """调试台:表单构造 /retrieve 请求并展示返回。启动后访问
+        """检索调试台:表单构造 /retrieve 请求并展示返回。启动后访问
         http://localhost:8000/debug(端口随 uvicorn --port)。"""
         html_path = Path(__file__).parent / "frontend" / "index.html"
         html = html_path.read_text(encoding="utf-8")
-        # 注入当前业务路由前缀,前端据此 fetch 到 {base}/retrieve
+        return html.replace("__BASE_PATH__", base)
+
+    @app.get("/test", response_class=HTMLResponse)
+    async def test_page() -> HTMLResponse:
+        """召回率测试台:选择 mode/vector_mode 后一键跑测试集,流式展示进度。
+        启动后访问 http://localhost:8000/test(端口随 uvicorn --port)。"""
+        html_path = Path(__file__).parent / "frontend" / "test.html"
+        html = html_path.read_text(encoding="utf-8")
         return html.replace("__BASE_PATH__", base)
 
     @app.post(f"{base}/retrieve", response_model=RetrievalResponse)
@@ -201,12 +210,14 @@ def _register_routes(app: FastAPI, base: str) -> None:
         """
         request_id = _request_id(request)
         mode = payload.mode
+        vector_mode = payload.vector_mode
         try:
             result = await asyncio.wait_for(
                 run_retrieval_request(payload,
                                       es=request.app.state.es,
                                       request_id=request_id,
-                                      mode=mode),
+                                      mode=mode,
+                                      vector_mode=vector_mode),
                 timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
             logger.error("request_id=%s 检索端到端超时 mode=%s", request_id, mode)
@@ -225,6 +236,40 @@ def _register_routes(app: FastAPI, base: str) -> None:
                     result.degraded, result.region_code,
                     result.recalled_count, result.elapsed_ms)
         return RetrievalResponse(rtnCode=RTN_OK, rtnMsg="success", object=result)
+
+    @app.get(f"{base}/test-recall/stream")
+    async def test_recall_stream(request: Request):
+        """召回率测试 SSE 流:逐条推送进度,完成后推送最终统计。
+
+        Query 参数:
+        - mode: 召回路径(keyword/vector/integrate),缺省 integrate
+        - vector_mode: 向量模板(new/old/both),缺省 new
+        - region_code: 兜底区域(测试集中无省份时使用),缺省 000
+        """
+        mode = request.query_params.get("mode", "integrate")
+        vector_mode = request.query_params.get("vector_mode", "new")
+        region_code = request.query_params.get("region_code", "000")
+        try:
+            stream = run_recall_test_stream(
+                es=request.app.state.es,
+                mode=mode,
+                vector_mode=vector_mode,
+                region_code=region_code,
+                timeout_s=request.app.state.timeout_s,
+            )
+            return StreamingResponse(
+                stream,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except FileNotFoundError as exc:
+            return JSONResponse(error_body(RTN_INTERNAL, str(exc)))
+        except ValueError as exc:
+            return JSONResponse(error_body(RTN_BAD_REQUEST, str(exc)))
 
 
 # 默认应用实例:python -m uvicorn retrieval_service.app:app

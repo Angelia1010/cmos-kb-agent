@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from .scripted_model import ScriptedChatModel
 from .shared.config import Config, DEFAULT_CONFIG
-from .shared.search import ESClient,ProduceESClient
+# from .shared.search import ESClient,ProduceESClient
+from .shared.search_recall import ESClient,ProduceESClient
 
 # if TYPE_CHECKING:
 #     from .answer.agent import AnswerSubAgent
