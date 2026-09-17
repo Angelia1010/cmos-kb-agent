@@ -148,10 +148,13 @@ def _default_es() -> ESClient:
 
 def create_app(es: Any = None,
                timeout_s: float = DEFAULT_TIMEOUT_S,
-               base_path: Optional[str] = None) -> FastAPI:
+               base_path: Optional[str] = None,
+               model: Any = None) -> FastAPI:
     """创建服务应用。
 
     es 可显式注入(测试或生产接真实依赖),缺省按环境变量构建;
+    model 可选 LLM 模型;注入时启用检索→处理→验证 Agent Loop,
+    未注入时回退零 LLM 直调(DirectRetrievalSubAgent);
     base_path 为业务路由前缀,缺省取环境变量 RETRIEVAL_SERVICE_BASE_PATH,
     再缺省为 DEFAULT_BASE_PATH(/api/retrieval-service/prod)。
     """
@@ -160,9 +163,11 @@ def create_app(es: Any = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.es = es or _default_es()
+        app.state.model = model
         app.state.timeout_s = timeout_s
-        logger.info("retrieval 服务就绪 base=%s es=%s",
-                    base, type(app.state.es).__name__)
+        logger.info("retrieval 服务就绪 base=%s es=%s model=%s",
+                    base, type(app.state.es).__name__,
+                    type(model).__name__ if model is not None else "none")
         yield
 
     app = FastAPI(title="retrieval-service", version="1.0.0", lifespan=lifespan)
@@ -195,7 +200,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
             result = await asyncio.wait_for(
                 run_retrieval_request(payload,
                                       es=request.app.state.es,
-                                      request_id=request_id),
+                                      request_id=request_id,
+                                      model=getattr(request.app.state, 'model', None)),
                 timeout=request.app.state.timeout_s)
         except asyncio.TimeoutError:
             logger.error("request_id=%s 检索端到端超时", request_id)

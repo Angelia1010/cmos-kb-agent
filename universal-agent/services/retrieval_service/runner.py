@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Retrieval 服务边界:绑定 Workspace、调用固定检索流水线并构造安全响应。
+"""Retrieval 服务边界:绑定 Workspace、调用检索流水线并构造安全响应。
 
 设计要点(对照 processing_service/runner.py):
 - 每次请求新建独立 RunWorkspace,不跨请求共享状态;
 - 注入 ESClient(生产 ProduceESClient / 离线 MockESClient),不在此处硬编码;
-- 复用 RetrievalSubAgent.run 已封装的降级护栏
-  (intergrate_all 失败 → keyword_extraction + coarse_recall 兜底);
+- 当注入 model 时使用 RetrievalSubAgent(检索→处理→验证 Agent Loop);
+  未注入 model 时回退 DirectRetrievalSubAgent(零 LLM 直调);
 - 对外只暴露 HTTP 白名单字段,不回显内部 merged_results / DSL。
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from kbagent.retrieval.agent import RetrievalSubAgent
+from kbagent.retrieval.agent import DirectRetrievalSubAgent, RetrievalSubAgent
 from kbagent.shared.config import DEFAULT_CONFIG, Config
 from kbagent.shared.models import Chunk
 from kbagent.shared.search import ESClient
@@ -50,6 +50,7 @@ async def run_retrieval_request(
     es: ESClient,
     request_id: str,
     cfg: Config | None = None,
+    model: Any = None,
 ) -> RetrievalResponseObject:
     """执行一次检索请求;不共享 Workspace,也不返回 merged_results 等内部字段。
 
@@ -58,6 +59,8 @@ async def run_retrieval_request(
         es: 检索后端客户端(生产 ProduceESClient / 离线 MockESClient)。
         request_id: HTTP 边界下发的请求标识(用于日志关联)。
         cfg: 领域配置;缺省使用 DEFAULT_CONFIG。
+        model: 可选 LLM 模型;注入时启用检索→处理→验证 Agent Loop,
+               未注入时回退零 LLM 直调(DirectRetrievalSubAgent)。
     """
     cfg = cfg or DEFAULT_CONFIG
     tracer = Tracer()
@@ -71,23 +74,23 @@ async def run_retrieval_request(
 
     degraded = False
     with workspace_scope(ws):
-        # RetrievalSubAgent 的 model 参数在直调形态下不参与推理
-        # (全程零 LLM),传 None 仅满足构造签名。
-        agent = RetrievalSubAgent(model=None, cfg=cfg, tracer=tracer)
+        if model is not None:
+            # Agent Loop: 检索 → 处理 → 验证
+            agent = RetrievalSubAgent(model=model, cfg=cfg, tracer=tracer)
+        else:
+            # 零 LLM 直调: 纯检索无 processing/verification
+            agent = DirectRetrievalSubAgent(
+                model=None, cfg=cfg, tracer=tracer,
+            )
         try:
             chunks: list[Chunk] = await agent.run(
                 query=request.query,
                 region_code=request.region_code,
             )
         except RuntimeError as exc:
-            # intergrate_all + coarse_recall 兜底均失败 → 显式失败,
-            # 交由 app 层转为 500 错误响应。此处不再降级返回空列表,
-            # 避免掩盖检索后端故障。
             tracer.log("retrieval", "fatal", reason=str(exc))
             raise
 
-        # 若主路径(intergrate_all)报错走了兜底,RetrievalSubAgent 已在
-        # tracer 中记录 intergrate_all_fallback 事件,据此标记降级。
         events = [e.event for e in tracer.events]
         degraded = "intergrate_all_fallback" in events
         keywords: list[str] = list(ws.data.get("keywords") or [])

@@ -5,9 +5,11 @@
 并发服务请为每个请求创建 MainAgent(轻量),或在外层加锁。
 已在事件循环中时请调用 arun(),run() 内部使用 asyncio.run 会与现有循环冲突。
 
-职责(与原方案图一致):
-  快速通道(缓存) → ① 检索子智能体 → ② 处理子智能体 → ③ 答案子智能体 → 降级兜底
-自主性全部下放到三个子智能体内部;主智能体只持有编排、缓存、降级与全链路 trace。
+职责(更新后):
+  快速通道(缓存) → ① 检索子智能体(内含 检索→处理→验证 Agent Loop)
+                 → ② 答案子智能体 → 降级兜底
+检索模块内部自主完成 Processing + Top3AnswerabilityVerifier;
+MainAgent 不再单独调用 ProcessingSubAgent。
 """
 from __future__ import annotations
 
@@ -15,11 +17,9 @@ import asyncio
 from typing import Any, List, Optional
 
 from .answer.agent import AnswerSubAgent
-from .processing.agent import ProcessingSubAgent
 from .retrieval.agent import RetrievalSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
-from .shared.knowledge_processing.bridge import retrieval_to_candidates
 from .shared.models import (
     USABILITY_NOT,
     FinalAnswer,
@@ -33,6 +33,12 @@ from .shared.workspace import RunWorkspace, set_workspace
 
 
 class MainAgent:
+    """主智能体:快速通道 → 检索(含处理+验证) → 答案生成 → 降级兜底。
+
+    检索子智能体内部已包含 Processing + Top3AnswerabilityVerifier,
+    MainAgent 不再直接调度 ProcessingSubAgent。
+    """
+
     def __init__(self, model: Any, es: ESClient,
                  cfg: Config = DEFAULT_CONFIG,
                  cache: Optional[AnswerCache] = None,
@@ -47,8 +53,6 @@ class MainAgent:
         self._enable_skills = enable_skills
         if enable_skills:
             self._init_skills(skill_dirs or ["skills"])
-        # 处理子智能体可复用(固定流水线,无请求级状态)
-        self._processing = ProcessingSubAgent(model)
 
     @staticmethod
     def _init_skills(dirs: List[str]) -> None:
@@ -69,7 +73,12 @@ class MainAgent:
         return asyncio.run(self.arun(query, region_code))
 
     async def arun(self, query: str, region_code: str = "000") -> FinalAnswer:
-        """region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。"""
+        """region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。
+
+        流程:
+          快速通道(缓存) → 检索(内含 Processing+Verifier Agent Loop)
+                        → 答案生成 → 降级兜底
+        """
         self.tracer = Tracer()
         self.tracer.log("run", "start", query=query, region_code=region_code)
         ws = RunWorkspace(query=query, cfg=self.cfg, es=self.es,
@@ -86,21 +95,20 @@ class MainAgent:
                 hit.elapsed_ms = self.tracer.elapsed_ms()   # 命中耗时,而非原次耗时
                 return hit
 
-            # ---- ① 检索子智能体(直调一体化流水线,传省份信息) ----
+            # ---- ① 检索子智能体(内含 Agent Loop:检索→处理→验证) ----
+            # RetrievalSubAgent 内部已完成:
+            #   retrieval_to_candidates → ProcessingSubAgent.run
+            #   → Top3AnswerabilityVerifier.verify
+            # 产物写入 workspace: processed_chunks / top3_candidates
             chunks = await RetrievalSubAgent(
                 self.model, self.cfg, self.tracer,
-                judge_model=self.judge_model).run(query, region_code)
+                judge_model=self.judge_model,
+            ).run(query, region_code)
 
-            # ---- 阶段衔接:检索产物 → 处理阶段标准候选 ----
-            ws.data["knowledge_candidates"] = retrieval_to_candidates(
-                merged=ws.data.get("merged_results"), chunks=chunks)
+            # 取 processing 后的 chunks(已包含 Markdown 内容和 rerank 排名)
+            processed = ws.data.get("processed_chunks") or chunks
 
-            # ---- ② 数据处理子智能体(知识级固定流水线) ----
-            await self._processing.run()
-            processed = ws.data.get("processed_chunks") or []
-
-            # ---- ③ 答案生成子智能体(自主组织 + 确定性锚定) ----
-            # generate 使用标准 model.invoke,直接传原始模型即可
+            # ---- ② 答案生成子智能体(自主组织 + 确定性锚定) ----
             ans = AnswerSubAgent(self.model, self.cfg, self.tracer).run(
                 query, processed, self.tracer.trace_id)
             ans.elapsed_ms = self.tracer.elapsed_ms()
