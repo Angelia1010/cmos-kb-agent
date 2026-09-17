@@ -71,6 +71,11 @@ class ScriptedChatModel(BaseChatModel):
             return ChatResult(generations=[ChatGeneration(
                 message=AIMessage(content=self._scripted_rerank(all_text)))])
 
+        # ---- Top3 回答充分性校验直调 ----
+        if "[TASK:top3_answerability]" in all_text:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content=self._scripted_top3_answerability(all_text)))])
+
         # ---- 答案生成直调 ----
         if "[TASK:answer]" in all_text:
             return ChatResult(generations=[ChatGeneration(
@@ -163,6 +168,96 @@ class ScriptedChatModel(BaseChatModel):
         overlap = sum(1 for ch in set(sent) if ch in chunk and not ch.isspace())
         consistent = overlap >= max(3, int(len(set(sent)) * 0.3))
         return json.dumps({"consistent": consistent}, ensure_ascii=False)
+
+    # ---- Top3 回答充分性校验脚本 ----
+    def _scripted_top3_answerability(self, text: str) -> str:
+        if "TOP3_VERIFICATION_INPUT_BEGIN" not in text:
+            return "{}"
+        serialized = text.rsplit("TOP3_VERIFICATION_INPUT_BEGIN", 1)[-1]
+        serialized = serialized.split("TOP3_VERIFICATION_INPUT_END", 1)[0].strip()
+        try:
+            payload = json.loads(serialized)
+        except json.JSONDecodeError:
+            return "{}"
+
+        query = str(payload.get("query") or "").strip()
+        candidates = payload.get("candidates") or []
+        suggested_keywords = [
+            keyword for keyword in dict.fromkeys(lexicon.extract_keywords(query))
+            if keyword not in {"信息", "内容", "知识", "问题", "相关", "业务"}
+        ] or [f"{query}业务规则"]
+        if not candidates:
+            return json.dumps({
+                "status": "failed",
+                "reason_codes": ["no_valid_candidates"],
+                "summary": "当前没有可用于验证的有效候选知识。",
+                "evidence_ids": [],
+                "retrieval_feedback": {
+                    "suggested_query": query,
+                    "missing_aspects": [f"缺少能够回答“{query}”的有效候选知识"],
+                    "suggested_keywords": suggested_keywords,
+                    "retry_strategy": "broaden_semantic_recall",
+                },
+            }, ensure_ascii=False)
+
+        def terms(value: str) -> set[str]:
+            value = value.casefold()
+            found = set(re.findall(r"[a-z0-9]+", value))
+            chinese = "".join(re.findall(r"[\u4e00-\u9fff]", value))
+            ignored = set("的了呢吗啊呀和与及或请问如何怎么是否可以能否")
+            found.update(ch for ch in chinese if ch not in ignored)
+            found.update(
+                chinese[index:index + 2]
+                for index in range(max(0, len(chinese) - 1))
+                if not set(chinese[index:index + 2]) <= ignored
+            )
+            return found
+
+        query_terms = terms(query)
+        candidate_terms: list[tuple[str, set[str]]] = []
+        combined_terms: set[str] = set()
+        for candidate in candidates:
+            evidence_id = str(candidate.get("evidence_id") or "")
+            value = f"{candidate.get('title') or ''}\n{candidate.get('content_md') or ''}"
+            current_terms = terms(value)
+            candidate_terms.append((evidence_id, current_terms))
+            combined_terms.update(current_terms)
+        overlap = query_terms & combined_terms
+        coverage = len(overlap) / max(1, len(query_terms))
+        evidence_ids = [
+            evidence_id for evidence_id, current_terms in candidate_terms
+            if evidence_id and query_terms & current_terms
+        ]
+        if coverage >= 0.65 and evidence_ids:
+            return json.dumps({
+                "status": "passed",
+                "reason_codes": [],
+                "summary": "当前候选已覆盖回答用户问题所需的主要信息。",
+                "evidence_ids": evidence_ids,
+                "retrieval_feedback": None,
+            }, ensure_ascii=False)
+
+        off_topic = not overlap
+        reason = "off_topic" if off_topic else (
+            "partial_intent_coverage"
+            if re.search(r"[、，,]|(?:和|及|与)", query)
+            else "missing_key_fact"
+        )
+        strategy = (
+            "replace_off_topic_results" if off_topic else "supplement_missing_aspects"
+        )
+        return json.dumps({
+            "status": "failed",
+            "reason_codes": [reason],
+            "summary": "当前候选与问题偏离。" if off_topic else "当前候选缺少回答所需的关键信息。",
+            "evidence_ids": evidence_ids,
+            "retrieval_feedback": {
+                "suggested_query": query,
+                "missing_aspects": [f"缺少关于“{query}”的完整回答依据"],
+                "suggested_keywords": suggested_keywords,
+                "retry_strategy": strategy,
+            },
+        }, ensure_ascii=False)
 
     # ---- 知识候选重排脚本 ----
     def _scripted_rerank(self, text: str) -> str:

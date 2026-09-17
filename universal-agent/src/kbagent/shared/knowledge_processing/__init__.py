@@ -29,7 +29,12 @@ from .models import (
     ProcessingContext,
     ProcessingMeta,
     ProcessingWarning,
+    RetrievalFeedback,
+    RetryStrategy,
     RerankResult,
+    Top3VerificationResult,
+    VerificationReasonCode,
+    VerificationStatus,
 )
 
 __all__ = [
@@ -44,7 +49,12 @@ __all__ = [
     "ProcessingContext",
     "ProcessingMeta",
     "ProcessingWarning",
+    "RetrievalFeedback",
+    "RetryStrategy",
     "RerankResult",
+    "Top3VerificationResult",
+    "VerificationReasonCode",
+    "VerificationStatus",
     "normalize_knowledge_atom",
     "normalize_candidate_applicability",
     "normalize_knowledge_candidate",
