@@ -523,10 +523,14 @@ def _to_object(ans: FinalAnswer, p: AskParams, arrived: str,
                                 reasons=ans.usability.reasons,
                                 uncovered=ans.usability.uncovered),
         sources=[
-            SourceItem(chunkId=s.chunk_id, docId=s.doc_id, docTitle=s.doc_title,
-                       relevance=s.relevance, keyFragment=s.key_fragment,
-                       content=s.content, updatedAt=s.updated_at,
-                       stale=s.stale)
+            SourceItem(chunkId=getattr(s, 'chunk_id', ''),
+                       docId=getattr(s, 'doc_id', getattr(s, 'docId', '')),
+                       docTitle=getattr(s, 'doc_title', ''),
+                       relevance=getattr(s, 'relevance', 0),
+                       keyFragment=getattr(s, 'key_fragment', ''),
+                       content=getattr(s, 'content', ''),
+                       updatedAt=getattr(s, 'updated_at', ''),
+                       stale=getattr(s, 'stale', False))
             for s in ans.sources
         ],
         processTrace=trace_events or [],
