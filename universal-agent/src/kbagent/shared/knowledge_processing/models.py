@@ -2,7 +2,82 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field as dc_field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, get_args
+
+
+VerificationStatus = Literal[
+    "passed",
+    "failed",
+    "unknown",
+]
+
+VerificationReasonCode = Literal[
+    "no_valid_candidates",
+    "off_topic",
+    "partial_intent_coverage",
+    "missing_key_fact",
+    "conflicting_evidence",
+    "verifier_timeout",
+    "verifier_model_error",
+    "verifier_invalid_output",
+]
+
+RetryStrategy = Literal[
+    "supplement_missing_aspects",
+    "replace_off_topic_results",
+    "broaden_semantic_recall",
+    "narrow_to_business_dimension",
+]
+
+
+_BUSINESS_REASON_CODES = frozenset({
+    "no_valid_candidates",
+    "off_topic",
+    "partial_intent_coverage",
+    "missing_key_fact",
+    "conflicting_evidence",
+})
+_TECHNICAL_REASON_CODES = frozenset({
+    "verifier_timeout",
+    "verifier_model_error",
+    "verifier_invalid_output",
+})
+_GENERIC_MISSING_ASPECTS = frozenset({
+    "信息不足",
+    "缺少信息",
+    "知识不足",
+    "资料不足",
+    "内容不足",
+    "无法回答",
+})
+_GENERIC_KEYWORDS = frozenset({"信息", "内容", "知识", "问题", "相关", "业务"})
+
+
+def _clean_string_list(values: list[str], field_name: str) -> list[str]:
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError(f"{field_name} 必须是字符串列表")
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+def _validate_reason_strategy(
+    reason_codes: list[VerificationReasonCode],
+    retry_strategy: RetryStrategy,
+) -> None:
+    reasons = set(reason_codes)
+    if "no_valid_candidates" in reasons:
+        if reasons != {"no_valid_candidates"} or retry_strategy != "broaden_semantic_recall":
+            raise ValueError("no_valid_candidates 只能使用 broaden_semantic_recall")
+        return
+    if "off_topic" in reasons:
+        if reasons != {"off_topic"} or retry_strategy != "replace_off_topic_results":
+            raise ValueError("off_topic 只能使用 replace_off_topic_results")
+        return
+    if "conflicting_evidence" in reasons:
+        if retry_strategy != "narrow_to_business_dimension":
+            raise ValueError("conflicting_evidence 应使用 narrow_to_business_dimension")
+        return
+    if retry_strategy != "supplement_missing_aspects":
+        raise ValueError("意图覆盖或关键事实缺失应使用 supplement_missing_aspects")
 
 
 class Serializable:
@@ -92,6 +167,8 @@ class KnowledgeCandidate(Serializable):
     # 候选顶层公开适用性字段；Adapter 会与 applicability 双向同步。
     region_ids: List[str] = dc_field(default_factory=list)
     channel_codes: List[str] = dc_field(default_factory=list)
+    # Retrieval Chunk 的稳定关联键；放在旧字段后保持位置参数兼容。
+    chunk_id: str = ""
 
 
 @dataclass
@@ -195,3 +272,77 @@ class RerankResult(Serializable):
     @property
     def top_candidates(self) -> List[ProcessedKnowledge]:
         return self.candidates
+
+
+@dataclass
+class RetrievalFeedback(Serializable):
+    suggested_query: str
+    missing_aspects: list[str]
+    suggested_keywords: list[str]
+    retry_strategy: RetryStrategy
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.suggested_query, str) or not self.suggested_query.strip():
+            raise ValueError("suggested_query 必须是非空字符串")
+        self.suggested_query = self.suggested_query.strip()
+        self.missing_aspects = _clean_string_list(self.missing_aspects, "missing_aspects")
+        self.suggested_keywords = _clean_string_list(
+            self.suggested_keywords, "suggested_keywords"
+        )
+        if not self.missing_aspects:
+            raise ValueError("missing_aspects 不能为空")
+        if any(value in _GENERIC_MISSING_ASPECTS for value in self.missing_aspects):
+            raise ValueError("missing_aspects 必须描述具体缺失内容")
+        if not self.suggested_keywords:
+            raise ValueError("suggested_keywords 不能为空")
+        if any(value in _GENERIC_KEYWORDS for value in self.suggested_keywords):
+            raise ValueError("suggested_keywords 不能包含无意义泛词")
+        if self.retry_strategy not in get_args(RetryStrategy):
+            raise ValueError(f"非法 retry_strategy: {self.retry_strategy}")
+
+
+@dataclass
+class Top3VerificationResult(Serializable):
+    status: VerificationStatus
+    reason_codes: list[VerificationReasonCode]
+    summary: str
+    evidence_chunk_ids: list[str]
+    retrieval_feedback: RetrievalFeedback | None
+
+    def __post_init__(self) -> None:
+        if self.status not in get_args(VerificationStatus):
+            raise ValueError(f"非法 status: {self.status}")
+        self.reason_codes = _clean_string_list(self.reason_codes, "reason_codes")
+        if any(reason not in get_args(VerificationReasonCode) for reason in self.reason_codes):
+            raise ValueError("reason_codes 包含非法值")
+        if not isinstance(self.summary, str) or not self.summary.strip():
+            raise ValueError("summary 必须是非空字符串")
+        self.summary = self.summary.strip()
+        self.evidence_chunk_ids = _clean_string_list(
+            self.evidence_chunk_ids, "evidence_chunk_ids"
+        )
+        if self.retrieval_feedback is not None and not isinstance(
+            self.retrieval_feedback, RetrievalFeedback
+        ):
+            raise ValueError("retrieval_feedback 类型非法")
+
+        reasons = set(self.reason_codes)
+        if self.status == "passed":
+            if reasons or self.retrieval_feedback is not None:
+                raise ValueError("passed 时 reason_codes 必须为空且不能携带检索反馈")
+            if not self.evidence_chunk_ids:
+                raise ValueError("passed 时 evidence_chunk_ids 不能为空")
+            return
+        if self.status == "failed":
+            if not reasons or not reasons <= _BUSINESS_REASON_CODES:
+                raise ValueError("failed 时必须且只能包含业务原因")
+            if self.retrieval_feedback is None:
+                raise ValueError("failed 时必须提供 retrieval_feedback")
+            _validate_reason_strategy(
+                self.reason_codes, self.retrieval_feedback.retry_strategy
+            )
+            return
+        if not reasons or not reasons <= _TECHNICAL_REASON_CODES:
+            raise ValueError("unknown 时必须且只能包含技术异常原因")
+        if self.retrieval_feedback is not None:
+            raise ValueError("unknown 时不能生成 retrieval_feedback")

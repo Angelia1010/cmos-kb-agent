@@ -19,6 +19,24 @@ class ProcessingContextInput(BaseModel):
     customer_type: str | None = None
 
 
+class RetrievalChunk(BaseModel):
+    """检索阶段输入的共享 Chunk 契约。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chunk_id: str = Field(min_length=1)
+    doc_id: str
+    doc_title: str
+    content: str
+    category: str
+    position: dict[str, Any] = Field(default_factory=dict)
+    version: str = "v1.0"
+    updated_at: str = ""
+    score: float = 0.0
+    source_chunk_ids: list[str] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProcessingRequest(BaseModel):
     """独立 Processing 服务的标准输入。"""
 
@@ -27,10 +45,11 @@ class ProcessingRequest(BaseModel):
     query: str = Field(min_length=1)
     retrieval_query: str = Field(min_length=1)
     processing_context: ProcessingContextInput
-    candidates: list[dict[str, Any]]
+    chunks: list[RetrievalChunk]
 
 
 class TopCandidate(BaseModel):
+    chunk_id: str
     knowledge_id: str
     knowledge_name: str
     retrieval_rank: int

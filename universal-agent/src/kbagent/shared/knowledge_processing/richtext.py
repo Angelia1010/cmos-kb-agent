@@ -241,6 +241,12 @@ def _render_first_content(node: Dict[str, Any], warnings: List[ProcessingWarning
 
 
 def _render(value: Any, warnings: List[ProcessingWarning], path: str) -> str:
+    """类型分类器，将普通文本、HTML、JSON 和结构化富文本渲染为 Markdown。
+    1. 普通文本 → Markdown 转义
+    2. HTML → Markdown 转义
+    3. JSON → 递归渲染
+    4. 结构化富文本 → 递归渲染
+    5. 其他类型 → 转为文本，记录警告"""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -276,12 +282,33 @@ def _render(value: Any, warnings: List[ProcessingWarning], path: str) -> str:
     ))
     return _clean(str(value))
 
-
+# 渲染富文本
 def render_richtext(
     value: Any,
     warnings: List[ProcessingWarning] | None = None,
     path: str = "content",
 ) -> str:
+    """
+    render_richtext()
+    ↓ 对外统一入口
+
+    _render()
+        ↓
+    识别数据类型
+    ├─ None → ""
+    ├─ str
+    │   ├─ JSON字符串 → 解析后递归
+    │   ├─ HTML → 转 Markdown
+    │   └─ 普通字符串 → 直接清理
+    ├─ dict → _render_mapping()
+    ├─ list/tuple → 每项递归处理
+    ├─ 数字/布尔 → 普通文本
+    └─ 不支持类型 → warning + str()兜底
+        ↓
+    _clean()
+        ↓
+    整理空格、空行，同时保护 Markdown 列表缩进
+    """
     target = warnings if warnings is not None else []
     return _clean(_render(value, target, path))
 
@@ -292,7 +319,7 @@ def is_supported_content_type(value: Any) -> bool:
 
 
 def is_renderable_content(value: Any) -> bool:
-    """正文类型受支持且实际渲染后存在可见内容。"""
+    """正文类型受支持且实际渲染后存在可见内容。(用于判断候选是否有可用正文)"""
     return is_supported_content_type(value) and bool(render_richtext(value))
 
 

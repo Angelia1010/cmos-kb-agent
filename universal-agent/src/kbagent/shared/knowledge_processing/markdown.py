@@ -30,6 +30,9 @@ def build_candidate_markdown(
     context: ProcessingContext | None = None,
     options: KnowledgeProcessingOptions | None = None,
 ) -> ProcessedKnowledge:
+    """先处理 atoms → 拼主标题和正文
+    → 按组拼 atom → 生成 content_md
+    → 再包装成 ProcessedKnowledge → 最后检查是不是“空壳内容”"""
     context = context or ProcessingContext()
     options = options or KnowledgeProcessingOptions()
     warnings: List[ProcessingWarning] = []
@@ -67,6 +70,7 @@ def build_candidate_markdown(
     base = copy.deepcopy(candidate)
     result = ProcessedKnowledge(
         knowledge_id=base.knowledge_id,
+        chunk_id=base.chunk_id,
         name=base.name,
         content=base.content,
         atoms=atoms,
@@ -107,7 +111,18 @@ def build_knowledge_markdown(
     context: ProcessingContext | None = None,
     options: KnowledgeProcessingOptions | None = None,
 ) -> Tuple[List[ProcessedKnowledge], List[ProcessingWarning]]:
-    """批量构建且隔离单篇异常。"""
+    """批量构建且隔离单篇异常。
+    candidates
+    ↓
+    逐条 candidate
+    ↓
+    build_candidate_markdown()
+    ↓
+    成功 → 收集 warning → 判断内容可不可用 → 加入 processed
+    失败 → 记 markdown_build_error → 跳过这一条
+    ↓
+    返回 processed + warnings
+    """
     processed: List[ProcessedKnowledge] = []
     warnings: List[ProcessingWarning] = []
     for candidate in candidates:

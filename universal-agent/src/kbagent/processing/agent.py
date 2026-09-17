@@ -17,7 +17,7 @@ from ..shared.knowledge_processing.models import (
     KnowledgeProcessingOptions,
     ProcessedKnowledge,
 )
-from ..shared.models import Chunk
+from ..shared.knowledge_processing.bridge import index_source_chunks
 from ..shared.tracing import Tracer
 from ..shared.workspace import get_workspace
 from .output import top3_to_processed_chunks
@@ -104,6 +104,12 @@ class ProcessingSubAgent:
         ws.stage = "processing"
         # 防止同一个 Workspace 重跑或本轮异常时误用上一次的输出。
         ws.data.pop("processed_chunks", None)
+        if "chunks" not in ws.data:
+            raise RuntimeError("Processing Workspace 缺少原始 chunks")
+        raw_chunks = ws.data["chunks"]
+        if not isinstance(raw_chunks, (list, tuple)):
+            raise TypeError("Processing Workspace 的 chunks 必须是 Chunk 序列")
+        source_chunks = index_source_chunks(raw_chunks)
         for tool_name, artifact_key in self._STEPS:
             tool = self.tools[tool_name]
             await tool.ainvoke({})
@@ -118,7 +124,7 @@ class ProcessingSubAgent:
                 count=len(artifact),
             )
         top3 = ws.data["top3_candidates"]
-        ws.data["processed_chunks"] = top3_to_processed_chunks(top3)
+        ws.data["processed_chunks"] = top3_to_processed_chunks(top3, source_chunks)
         ws.tracer.log(
             "processing.knowledge",
             "processed_chunks_adapted",

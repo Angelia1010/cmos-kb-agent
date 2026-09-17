@@ -252,7 +252,10 @@ def filter_candidates(
     candidates: Sequence[KnowledgeCandidate],
     context: ProcessingContext,
 ) -> Tuple[List[KnowledgeCandidate], List[FilterDecision], List[ProcessingWarning]]:
-    """深复制后过滤，不修改标准输入对象。"""
+    """深复制后过滤，不修改标准输入对象。
+    逻辑：先检查整条知识的适用性，再检查里面每个 atom 的适用性；
+    不适用的 atom 单独删掉；
+    如果整条知识本身不适用，或者删完 atom 后已经没有可用内容，就整条候选过滤掉。"""
     accepted: List[KnowledgeCandidate] = []
     decisions: List[FilterDecision] = []
     warnings: List[ProcessingWarning] = []
@@ -306,6 +309,16 @@ def filter_candidates(
             copied.atoms = kept_atoms
             accepted.append(copied)
     return accepted, decisions, warnings
+"""
+    accepted
+    → 最终保留的候选
+
+    decisions
+    → 每条候选的过滤判定记录
+
+    warnings
+    → 过滤过程中产生的警告
+"""
 
 
 filter_knowledge_candidates = filter_candidates

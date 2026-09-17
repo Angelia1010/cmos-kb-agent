@@ -6,6 +6,7 @@ from typing import Any
 
 from kbagent.processing.agent import KnowledgeProcessingOrchestrator
 from kbagent.scripted_model import ScriptedChatModel
+from kbagent.shared.knowledge_processing.bridge import retrieval_to_candidates
 from kbagent.shared.knowledge_processing.models import (
     ProcessingMeta,
     ProcessingWarning,
@@ -62,12 +63,14 @@ async def run_processing_request(
     request_id: str,
 ) -> ProcessingResponseObject:
     """执行一次请求；不共享 Workspace，也不返回 raw/metadata 等内部字段。"""
+    chunks = [Chunk(**item.model_dump()) for item in request.chunks]
     ws = RunWorkspace(
         query=request.query,
         data={
             "retrieval_query": request.retrieval_query,
             "processing_context": copy.deepcopy(request.processing_context.model_dump()),
-            "knowledge_candidates": copy.deepcopy(request.candidates),
+            "chunks": chunks,
+            "knowledge_candidates": retrieval_to_candidates(chunks=chunks),
         },
     )
     with workspace_scope(ws):
@@ -86,6 +89,7 @@ async def run_processing_request(
 
     top_rows = [
         TopCandidate(
+            chunk_id=item.chunk_id,
             knowledge_id=item.knowledge_id or "",
             knowledge_name=item.name,
             retrieval_rank=item.retrieval_rank,
