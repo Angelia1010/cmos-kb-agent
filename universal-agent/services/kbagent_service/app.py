@@ -34,6 +34,7 @@ from typing import Any, Optional
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from kbagent import MainAgent, MockESClient, ProduceESClient, ScriptedChatModel
 from kbagent.shared.models import FinalAnswer
@@ -48,6 +49,7 @@ from .models import (
     AskRequest,
     AskResponse,
     SourceItem,
+    UsabilityInfo,
     error_body,
 )
 
@@ -84,6 +86,9 @@ ENV_APP_IDS = "KB_SERVICE_APP_IDS"
 ENV_ES_BACKEND = "KB_SERVICE_ES"
 # ProduceESClient 缺省区域(请求未携带省份时使用);支持省份名或区号
 ENV_ES_REGION = "KB_SERVICE_ES_REGION"
+# 是否在响应 object.processTrace 中透出智能体执行 trace(前端演示页
+# "检索处理过程"时间线用);默认开启,设 KB_SERVICE_EXPOSE_TRACE=0 关闭
+ENV_EXPOSE_TRACE = "KB_SERVICE_EXPOSE_TRACE"
 # 技能包目录:按本文件位置定位到仓库根,不依赖启动时 CWD
 _SKILLS_DIR = str(Path(__file__).resolve().parents[2] / "skills")
 
@@ -122,6 +127,42 @@ def _trace_dump(agent: Optional[MainAgent]) -> str:
     if agent is None:
         return "<MainAgent 未初始化>"
     return agent.tracer.export()
+
+
+def _expose_trace() -> bool:
+    """是否向调用方透出 processTrace(默认开;0/false/no 关闭)。"""
+    return os.environ.get(ENV_EXPOSE_TRACE, "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+def _jsonable(v: Any) -> Any:
+    """payload 值 JSON 安全化:原生类型原样,容器递归,其余 str() 兜底。
+
+    tracer payload 里可能混入 Chunk/Pydantic 对象等非 JSON 原生类型,
+    直接塞进响应会让 pydantic 序列化失败,统一在这里降级为字符串。
+    """
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_jsonable(x) for x in v]
+    return str(v)
+
+
+def _trace_events(agent: Optional[MainAgent]) -> list:
+    """智能体 trace 事件列表,供响应 object.processTrace 透出。
+
+    与 _trace_dump(落服务日志的完整 JSON)同源;此处输出结构化 list,
+    前端演示页据此渲染"检索处理过程"时间线。未暴露/未初始化时为空。
+    """
+    if agent is None or not _expose_trace():
+        return []
+    return [
+        {"ts_ms": e.ts_ms, "stage": e.stage, "event": e.event,
+         "payload": _jsonable(e.payload)}
+        for e in agent.tracer.events
+    ]
 
 
 def _default_model() -> Any:
@@ -187,7 +228,39 @@ def create_app(model: Any = None, es: Any = None,
 
     app = FastAPI(title="kbagent-service", version="1.0.0", lifespan=lifespan)
     _register_routes(app, base)
+    _mount_frontend(app, base)
     return app
+
+
+def _mount_frontend(app: FastAPI, base: str) -> None:
+    """托管前端演示页(static/index.html);目录不存在时静默跳过。
+
+    - 页面挂在两个路径:
+        /            直连服务时访问
+        {base}/ui    经网关访问时(网关可能只转发 {base} 前缀)
+      两处共用同一静态目录,内容一致
+    - frontend-config 告知页面实际业务路由前缀(兼容 KB_SERVICE_BASE_PATH
+      覆盖);同样注册两个路径,页面 JS 用相对地址请求,两种入口都能命中
+    - "/" 挂载必须最后注册:StaticFiles 会兜底所有未匹配路径,
+      先注册的 /health、/diag、{base}/retrieve 不受影响
+    - 纯静态单文件,零外部依赖/零 CDN,适配无外网生产环境
+    """
+    static_dir = Path(__file__).resolve().parent / "static"
+    if not static_dir.is_dir():
+        return
+
+    async def frontend_config() -> dict:
+        return {"basePath": base}
+
+    app.add_api_route("/frontend-config", frontend_config, methods=["GET"])
+    app.add_api_route(f"{base}/ui/frontend-config", frontend_config,
+                      methods=["GET"])
+
+    app.mount(f"{base}/ui", StaticFiles(directory=str(static_dir), html=True),
+              name="ui-gateway")
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True),
+              name="ui-root")
+    logger.info("前端演示页已挂载: / 与 %s/ui (static=%s)", base, static_dir)
 
 
 def _register_routes(app: FastAPI, base: str) -> None:
@@ -289,11 +362,13 @@ def _register_routes(app: FastAPI, base: str) -> None:
         except asyncio.TimeoutError:
             logger.error("requestId=%s 端到端超时,已执行链路:\n%s",
                          p.requestId, _trace_dump(agent))
-            return JSONResponse(error_body(RTN_TIMEOUT, "服务处理超时"))
+            return JSONResponse(error_body(
+                RTN_TIMEOUT, "服务处理超时", _trace_events(agent)))
         except Exception:  # noqa: BLE001
             logger.exception("requestId=%s 未预期异常,已执行链路:\n%s",
                              p.requestId, _trace_dump(agent))
-            return JSONResponse(error_body(RTN_INTERNAL, "服务内部错误"))
+            return JSONResponse(error_body(
+                RTN_INTERNAL, "服务内部错误", _trace_events(agent)))
 
         logger.info("requestId=%s traceId=%s degraded=%s elapsedMs=%s sources=%d",
                     p.requestId, ans.trace_id, ans.degraded,
@@ -302,7 +377,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
         # 处理快照 / 答案素材与锚定校验,排查"无检索结果"看这一段即可
         logger.info("requestId=%s 链路追踪:\n%s", p.requestId, _trace_dump(agent))
         return AskResponse(rtnCode=RTN_OK, rtnMsg="success",
-                           object=_to_object(ans, p, arrived))
+                           object=_to_object(ans, p, arrived,
+                                             _trace_events(agent)))
 
 
 def _extract_query(p: AskParams) -> Optional[str]:
@@ -313,7 +389,8 @@ def _extract_query(p: AskParams) -> Optional[str]:
     return None
 
 
-def _to_object(ans: FinalAnswer, p: AskParams, arrived: str) -> AnswerObject:
+def _to_object(ans: FinalAnswer, p: AskParams, arrived: str,
+               trace_events: Optional[list] = None) -> AnswerObject:
     """FinalAnswer → 灵犀 object 层。"""
     return AnswerObject(
         requestId=p.requestId,
@@ -331,6 +408,15 @@ def _to_object(ans: FinalAnswer, p: AskParams, arrived: str) -> AnswerObject:
                        stale=s.stale)
             for s in ans.sources
         ],
+        # 坐席向增量字段(可用性判定 + 结构化内容)
+        usability=UsabilityInfo(level=ans.usability.level,
+                                reasons=ans.usability.reasons,
+                                uncovered=ans.usability.uncovered),
+        directConclusion=ans.direct_conclusion,
+        keyElements=ans.key_elements,
+        script=ans.script,
+        caveats=ans.caveats,
+        processTrace=trace_events or [],
     )
 
 

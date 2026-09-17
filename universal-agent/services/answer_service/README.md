@@ -2,15 +2,19 @@
 
 只跑 `src/kbagent/answer` 模块(**AnswerSubAgent**)的 FastAPI 测试服务:
 请求直接携带 `query + chunks`(即检索/处理阶段的输出),跳过检索与处理,
-专门用于验证**真实大模型**下的答案组织与逐句锚定校验效果。
+专门用于验证**真实大模型**下的答案组织、逐句锚定校验,以及**文档内证据片段定位**效果。
 
 ```
 请求(query + chunks)
+  → 文档内证据片段定位([TASK:locate_fragments],对每篇文档摘出能回答问题的原文逐字片段)
   → select_fragments 片段精选(取前 4,同文档最多 2)
   → LLM 组织答案([TASK:answer],内联引用,输出 JSON)
   → 逐句锚定校验([TASK:anchor_check],硬事实锚定失败直接删句)
-  → FinalAnswer(业务说明 + 办理建议 + 句子级锚定明细 + 知识溯源 + 全链路 trace)
+  → FinalAnswer(业务说明 + 办理建议 + 句子级锚定明细 + 知识溯源 + 文档内片段定位 + 全链路 trace)
 ```
+
+> 片段定位与答案生成相互独立(additive):答案生成仍基于整篇文档,定位结果单独以
+> `matchedFragments` 暴露,供坐席核对「这篇文档里到底哪一段回答了问题」。
 
 模型经 `config.yaml` 的 `models[].use` 解析,生产路径为
 `kbagent.shared.lingxi_provider:LingxiSSLChatOpenAI`(灵犀 SSL 策略,已 vendor)。
@@ -177,6 +181,36 @@ EOF
         "stale": false
       }
     ],
+    "matchedFragments": [
+      {
+        "chunkId": "chk_5g_59_001",
+        "docId": "doc_5g_taocan",
+        "docTitle": "5G畅享套餐资费说明",
+        "answerable": true,
+        "fragments": [
+          {
+            "text": "每月包含国内流量20GB、国内通话300分钟",
+            "start": 11,
+            "end": 33,
+            "reason": "直接给出59元档的流量与通话额度"
+          }
+        ]
+      },
+      {
+        "chunkId": "chk_5g_59_002",
+        "docId": "doc_5g_taocan",
+        "docTitle": "5G畅享套餐资费说明",
+        "answerable": false,
+        "fragments": []
+      },
+      {
+        "chunkId": "chk_4g_58_001",
+        "docId": "doc_4g_taocan",
+        "docTitle": "4G飞享套餐(已停售)",
+        "answerable": false,
+        "fragments": []
+      }
+    ],
     "trace": {
       "trace_id": "trace_3f9a1c2d4e5b",
       "started_ms": 1788321332481,
@@ -202,6 +236,10 @@ EOF
 - 硬事实(`hardFact=true`)锚定失败会被**直接删除**,不会出现在 `sentences` 里
   (如需排查被删句子,看 `trace.events` 中 `anchor_check` 的 `dropped=true` 记录)
 - `sources[].stale=true`:知识更新日期超过溯源天数(默认 365 天)或日期非法
+- `matchedFragments`:对**每篇输入文档**定位「能回答问题的原文逐字片段」。
+  `fragments[].text` 保证是对应 `chunks[].content` 的连续子串(`content[start:end]`,`start/end`
+  为字符偏移),非原文/改写/概括的片段会被代码侧丢弃;`answerable=false` 表示该文档未能
+  提供可验证的相关片段。定位范围为全部输入文档,每篇 1 次大模型调用(文档多时注意端到端耗时)
 - `trace`:全链路 trace,badcase 回放用;生产化时可去掉
 
 ## 输出示例(错误)

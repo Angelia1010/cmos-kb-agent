@@ -51,6 +51,8 @@ from .models import (
     AnswerParams,
     AnswerRequest,
     AnswerResponse,
+    DocFragmentsItem,
+    LocatedFragmentItem,
     SentenceItem,
     SourceItem,
     error_body,
@@ -288,6 +290,17 @@ def _to_object(ans: Any, p: AnswerParams, arrived: str,
                        snippet=s.snippet, updatedAt=s.updated_at,
                        stale=s.stale)
             for s in ans.sources
+        ],
+        matchedFragments=[
+            DocFragmentsItem(
+                chunkId=d.chunk_id, docId=d.doc_id, docTitle=d.doc_title,
+                answerable=d.answerable,
+                fragments=[
+                    LocatedFragmentItem(text=f.text, start=f.start,
+                                        end=f.end, reason=f.reason)
+                    for f in d.fragments
+                ])
+            for d in ans.matched_fragments
         ],
         trace=json.loads(tracer.export()),
     )

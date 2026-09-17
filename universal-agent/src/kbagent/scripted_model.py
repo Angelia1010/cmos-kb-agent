@@ -3,7 +3,8 @@
 
 用规则模拟子智能体的工具调用决策,让整套 uniagent/LangGraph ReAct
 机制(工具绑定、ToolMessage 回灌、GoalLoop 反馈注入)真实跑通。
-同时处理答案生成和锚定校验的直调请求([TASK:answer] / [TASK:anchor_check])。
+同时处理答案环节的直调请求([TASK:answer] / [TASK:anchor_check] /
+[TASK:locate_fragments])。
 
 生产接入:换成 langchain_openai.ChatOpenAI 即可。
 """
@@ -81,6 +82,11 @@ class ScriptedChatModel(BaseChatModel):
             return ChatResult(generations=[ChatGeneration(
                 message=AIMessage(content=self._scripted_anchor(all_text)))])
 
+        # ---- 文档内证据片段定位直调 ----
+        if "[TASK:locate_fragments]" in all_text:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content=self._scripted_locate(all_text)))])
+
         # ---- ReAct 工具调用模式 ----
         retry = "[验证失败]" in all_text
         called = _called_tools(messages, since_last_feedback=retry)
@@ -138,22 +144,53 @@ class ScriptedChatModel(BaseChatModel):
                                                 {"category": cat})])
 
     # ---- 答案生成脚本 ----
+    @staticmethod
+    def _clean_demo_text(s: str) -> str:
+        """演示数据清洗:去 markdown 标题符与换行,拼出的话术才像人话。"""
+        s = s.replace("\\n", " ").replace("\n", " ")
+        s = re.sub(r"#+\s*", "", s)
+        return re.sub(r"\s+", " ", s).strip()
+
     def _scripted_answer(self, text: str) -> str:
         chunks = re.findall(r'<chunk id="(.+?)">(.+?)</chunk>', text, re.S)
         if not chunks:
             return json.dumps({"business_explanation": "", "handling_suggestion": "",
-                               "sentences": []}, ensure_ascii=False)
+                               "sentences": [],
+                               "usability": {"level": "not_usable",
+                                             "reasons": ["无可用知识素材"],
+                                             "uncovered": []}},
+                              ensure_ascii=False)
         expl, sentences = [], []
         for cid, content in chunks[:3]:
-            first = content.strip().split("。")[0][:60] + "。"
+            content = self._clean_demo_text(content)
+            first = content.split("。")[0][:60] + "。"
             expl.append(first)
             sentences.append({"text": first, "citations": [cid],
                               "hard_fact": any(w in first for w in
                                                ("元", "资费", "条件", "生效"))})
         sugg = "可为客户办理上述业务,办理前请与客户确认需求与资费。"
         sentences.append({"text": sugg, "citations": [chunks[0][0]], "hard_fact": False})
+        # 坐席向结构化内容(离线演示用,规则化拼装)
+        conclusion = expl[0] if expl else ""
+        script = "您好," + "".join(expl) + sugg
+        elements = {}
+        joined = " ".join(expl)
+        if "元" in joined:
+            elements["资费"] = next((e for e in expl if "元" in e), "")
+        if any(w in joined for w in ("APP", "渠道", "营业厅")):
+            elements["渠道"] = next((e for e in expl
+                                     if any(w in e for w in ("APP", "渠道", "营业厅"))), "")
+        if "条件" in joined:
+            elements["条件"] = next((e for e in expl if "条件" in e), "")
         return json.dumps({"business_explanation": " ".join(expl),
-                           "handling_suggestion": sugg, "sentences": sentences},
+                           "handling_suggestion": sugg, "sentences": sentences,
+                           "direct_conclusion": conclusion,
+                           "key_elements": elements,
+                           "script": script,
+                           "caveats": ["离线演示话术,生产以真实模型输出为准"],
+                           "usability": {"level": "verify_first",
+                                         "reasons": ["离线脚本模型生成,仅演示"],
+                                         "uncovered": []}},
                           ensure_ascii=False)
 
     # ---- 锚定校验脚本 ----
@@ -163,6 +200,34 @@ class ScriptedChatModel(BaseChatModel):
         overlap = sum(1 for ch in set(sent) if ch in chunk and not ch.isspace())
         consistent = overlap >= max(3, int(len(set(sent)) * 0.3))
         return json.dumps({"consistent": consistent}, ensure_ascii=False)
+
+    # ---- 文档内证据片段定位脚本 ----
+    def _scripted_locate(self, text: str) -> str:
+        """离线模拟 [TASK:locate_fragments]:按句切分文档,挑与问题字符重叠的句子。
+
+        返回的 text 必为文档原文连续子串,使 locate_fragments 的逐字校验通过。
+        """
+        m = re.search(r"用户问题[:：]\s*(.*?)\s*文档内容[:：]\s*(.*)$", text, re.S)
+        if not m:
+            return json.dumps({"answerable": False, "fragments": []},
+                              ensure_ascii=False)
+        query, content = m.group(1), m.group(2)
+        qchars = {c for c in query if not c.isspace()}
+        if not qchars or not content.strip():
+            return json.dumps({"answerable": False, "fragments": []},
+                              ensure_ascii=False)
+        sentences = [s.strip() for s in
+                     re.split(r"(?<=[。;!?；！?\n])", content) if s.strip()]
+        threshold = max(2, int(len(qchars) * 0.3))
+        fragments = []
+        for s in sentences:
+            schars = {c for c in s if not c.isspace()}
+            if len(qchars & schars) >= threshold:
+                fragments.append({"text": s, "reason": "离线脚本:与问题字符重叠"})
+            if len(fragments) >= 3:
+                break
+        return json.dumps({"answerable": bool(fragments), "fragments": fragments},
+                          ensure_ascii=False)
 
     # ---- 知识候选重排脚本 ----
     def _scripted_rerank(self, text: str) -> str:

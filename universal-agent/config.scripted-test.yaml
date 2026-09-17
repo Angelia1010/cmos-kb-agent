@@ -1,0 +1,9 @@
+# 临时验证用配置:离线 ScriptedChatModel(验证完整链路新字段后删除)
+log_level: info
+
+models:
+  - name: default
+    use: "kbagent.scripted_model:ScriptedChatModel"
+    model: scripted-mock
+    temperature: 0.0
+    kwargs: {}

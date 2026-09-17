@@ -20,7 +20,13 @@ from .retrieval.agent import RetrievalSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.knowledge_processing.bridge import retrieval_to_candidates
-from .shared.models import FinalAnswer, RetrievalParams, SourceRef
+from .shared.models import (
+    USABILITY_NOT,
+    FinalAnswer,
+    RetrievalParams,
+    SourceRef,
+    Usability,
+)
 from .shared.search import ESClient, build_dsl
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
@@ -121,6 +127,9 @@ class MainAgent:
             handling_suggestion="",
             sources=[SourceRef(c.chunk_id, c.doc_title, c.content, c.updated_at)
                      for c in hits],
-            degraded=True, elapsed_ms=self.tracer.elapsed_ms())
+            degraded=True, elapsed_ms=self.tracer.elapsed_ms(),
+            usability=Usability(
+                level=USABILITY_NOT,
+                reasons=["系统降级兜底结果,未经答案生成与锚定校验,不可直接答复用户"]))
         self.tracer.log("degrade", "done", reason=reason, hit_count=len(hits))
         return ans

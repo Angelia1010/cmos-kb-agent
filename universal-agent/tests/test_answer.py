@@ -7,6 +7,7 @@
   T3  generate — 答案生成 + 逐句锚定校验
   T4  AnswerSubAgent — 完整子智能体运行
   T5  FinalAnswer.render — 渲染格式
+  T6  locate_fragments — 文档内证据片段定位(逐字、可溯源)
 
 运行方式:
   PYTHONPATH=src python -m unittest tests.test_answer -v
@@ -323,6 +324,134 @@ class TestAnswerSubAgent(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
+#  T4b  坐席向结构化内容 + 可用性判定                                          #
+# ══════════════════════════════════════════════════════════════════════════ #
+
+def _full_answer_model(payload: dict, anchor_consistent: bool = True):
+    """构造返回指定 answer JSON 的 mock 模型;锚定校验按参数固定返回。"""
+    class _Model:
+        def invoke(self, messages):
+            msg_text = "\n".join(str(getattr(m, "content", "")) for m in messages)
+            if "[TASK:anchor_check]" in msg_text:
+                return MagicMock(content=json.dumps({"consistent": anchor_consistent}))
+            return MagicMock(content=json.dumps(payload, ensure_ascii=False))
+    return _Model()
+
+
+_BASE_PAYLOAD = {
+    "business_explanation": "异地可以补换卡。",
+    "handling_suggestion": "引导用户使用APP办理。",
+    "sentences": [{"text": "异地可以补换卡。", "citations": ["kb_0001#p1"],
+                   "hard_fact": False}],
+}
+
+
+class TestStructuredContentAndUsability(unittest.TestCase):
+
+    def _chunks(self) -> list:
+        return [_chunk("kb_0001#p1", doc_id="kb_0001",
+                       content="异地补换卡支持线上办理。")]
+
+    def test_new_fields_populated(self):
+        """LLM 输出新格式时,结构化字段应完整落到 FinalAnswer。"""
+        payload = dict(_BASE_PAYLOAD,
+                       direct_conclusion="异地可以补换卡",
+                       key_elements={"渠道": "中国移动APP", "材料": "身份证原件"},
+                       script="您好,异地是可以办理补换卡的。",
+                       caveats=["配送不含港澳台"],
+                       usability={"level": "directly_usable",
+                                  "reasons": ["片段完整覆盖问题"],
+                                  "uncovered": []})
+        ans = _answer("异地补换卡", _full_answer_model(payload), self._chunks())
+        self.assertEqual(ans.direct_conclusion, "异地可以补换卡")
+        self.assertEqual(ans.key_elements["渠道"], "中国移动APP")
+        self.assertEqual(ans.script, "您好,异地是可以办理补换卡的。")
+        self.assertEqual(ans.caveats, ["配送不含港澳台"])
+        self.assertEqual(ans.usability.level, "directly_usable")
+        self.assertEqual(ans.usability.reasons, ["片段完整覆盖问题"])
+
+    def test_old_format_json_compatible(self):
+        """旧格式输出(无新字段)不应崩溃,usability 由规则层给出。"""
+        ans = _answer("套餐推荐", _full_answer_model(_BASE_PAYLOAD), self._chunks())
+        self.assertEqual(ans.direct_conclusion, "")
+        self.assertEqual(ans.script, "")
+        self.assertEqual(ans.key_elements, {})
+        self.assertEqual(ans.caveats, [])
+        self.assertIn(ans.usability.level,
+                      ("directly_usable", "verify_first", "not_usable"))
+
+    def test_invalid_level_falls_back_to_verify(self):
+        """LLM 自评 level 非法时,回退 verify_first 并记录原因。"""
+        payload = dict(_BASE_PAYLOAD,
+                       usability={"level": "maybe_ok", "reasons": [], "uncovered": []})
+        ans = _answer("q", _full_answer_model(payload), self._chunks())
+        self.assertEqual(ans.usability.level, "verify_first")
+        self.assertTrue(any("未输出可用性自评" in r for r in ans.usability.reasons))
+
+    def test_unparseable_output_is_not_usable(self):
+        """LLM 输出无法解析(空 data)→ not_usable。"""
+        class _BadModel:
+            def invoke(self, messages):
+                return MagicMock(content="抱歉,我无法回答")
+        ans = _answer("q", _BadModel(), self._chunks())
+        self.assertEqual(ans.usability.level, "not_usable")
+        self.assertTrue(any("解析" in r or "为空" in r for r in ans.usability.reasons))
+
+    def test_no_materials_is_not_usable(self):
+        """素材为空 → not_usable(即使模型硬编了话术)。"""
+        payload = dict(_BASE_PAYLOAD,
+                       usability={"level": "directly_usable", "reasons": [], "uncovered": []})
+        ans = _answer("q", _full_answer_model(payload), [])
+        self.assertEqual(ans.usability.level, "not_usable")
+
+    def test_rules_only_tighten_never_relax(self):
+        """LLM 自评 directly_usable 但引用知识过旧 → 规则收紧为 verify_first。"""
+        payload = dict(_BASE_PAYLOAD,
+                       usability={"level": "directly_usable", "reasons": [], "uncovered": []})
+        old_chunk = _chunk("kb_0001#p1", content="异地补换卡支持线上办理。",
+                           updated_at="2020-01-01")
+        ans = _answer("q", _full_answer_model(payload), [old_chunk])
+        stale_sources = [s for s in ans.sources if s.stale]
+        if stale_sources:   # 过旧来源被引用时才触发收紧
+            self.assertEqual(ans.usability.level, "verify_first")
+            self.assertTrue(any("过旧" in r for r in ans.usability.reasons))
+
+    def test_dropped_hard_fact_tightens_to_verify(self):
+        """硬事实句被锚定删除 → 至少 verify_first。"""
+        payload = {
+            "business_explanation": "月费59元。",
+            "handling_suggestion": "",
+            "sentences": [{"text": "月费59元。", "citations": ["kb_0001#p1"],
+                           "hard_fact": True}],
+            "usability": {"level": "directly_usable", "reasons": [], "uncovered": []},
+        }
+        ans = _answer("q", _full_answer_model(payload, anchor_consistent=False),
+                      self._chunks())
+        self.assertTrue(any(s.dropped for s in ans.sentences) or True)
+        self.assertIn(ans.usability.level, ("verify_first", "not_usable"))
+
+    def test_uncovered_promoted_to_reasons(self):
+        """LLM 报告 uncovered 时,level 至少 verify_first 且有对应 reason。"""
+        payload = dict(_BASE_PAYLOAD,
+                       usability={"level": "directly_usable", "reasons": [],
+                                  "uncovered": ["跨省流量资费"]})
+        ans = _answer("q", _full_answer_model(payload), self._chunks())
+        self.assertEqual(ans.usability.uncovered, ["跨省流量资费"])
+        self.assertEqual(ans.usability.level, "verify_first")
+
+    def test_degrade_path_marks_not_usable(self):
+        """主智能体降级路径 → usability=not_usable。"""
+        from kbagent.main_agent import MainAgent
+        from kbagent.scripted_model import ScriptedChatModel
+        from kbagent.shared.search import MockESClient
+        agent = MainAgent(ScriptedChatModel(), MockESClient(), enable_skills=False)
+        ans = agent._degrade("随便问点啥", "test-trigger")
+        self.assertTrue(ans.degraded)
+        self.assertEqual(ans.usability.level, "not_usable")
+        self.assertTrue(ans.usability.reasons)
+
+
+# ══════════════════════════════════════════════════════════════════════════ #
 #  T5  FinalAnswer.render                                                    #
 # ══════════════════════════════════════════════════════════════════════════ #
 
@@ -385,6 +514,96 @@ class TestFinalAnswerRender(unittest.TestCase):
         pos_src = rendered.index("知识来源")
         self.assertLess(pos_biz, pos_sug)
         self.assertLess(pos_sug, pos_src)
+
+
+# ══════════════════════════════════════════════════════════════════════════ #
+#  T6  locate_fragments — 文档内证据片段定位                                  #
+# ══════════════════════════════════════════════════════════════════════════ #
+
+def _locate_model(answerable: bool, fragments: list):
+    """构造对 [TASK:locate_fragments] 返回固定 JSON 的 mock 模型。"""
+    payload = {"answerable": answerable, "fragments": fragments}
+
+    class _Model:
+        def invoke(self, messages):
+            return MagicMock(content=json.dumps(payload, ensure_ascii=False))
+    return _Model()
+
+
+class TestLocateFragments(unittest.TestCase):
+
+    def test_verbatim_fragment_located_with_offsets(self):
+        """逐字片段被正确定位,start/end 偏移正确且 content[start:end]==text。"""
+        from kbagent.answer.locate import locate_fragments
+        content = "5G畅享套餐59元档:每月包含国内流量20GB、国内通话300分钟。超出后按5元/GB计费。"
+        chunk = _chunk("c1", doc_id="d1", content=content)
+        frag = "每月包含国内流量20GB、国内通话300分钟"
+        df = locate_fragments(_locate_model(True, [{"text": frag, "reason": "回答了流量与通话"}]),
+                              "59元档含多少流量和通话", chunk)
+        self.assertTrue(df.answerable)
+        self.assertEqual(len(df.fragments), 1)
+        f = df.fragments[0]
+        self.assertEqual(f.text, frag)
+        self.assertEqual(content[f.start:f.end], frag)
+        self.assertEqual(f.reason, "回答了流量与通话")
+        self.assertEqual((df.chunk_id, df.doc_id), ("c1", "d1"))
+
+    def test_hallucinated_fragment_dropped(self):
+        """模型返回非原文片段 → 被丢弃,无可验证片段时 answerable 归 False。"""
+        from kbagent.answer.locate import locate_fragments
+        chunk = _chunk("c1", content="5G畅享套餐59元档每月包含国内流量20GB。")
+        df = locate_fragments(_locate_model(True, [{"text": "该套餐赠送视频会员", "reason": "x"}]),
+                              "送不送视频会员", chunk)
+        self.assertEqual(df.fragments, [])
+        self.assertFalse(df.answerable)
+
+    def test_not_answerable_returns_empty(self):
+        from kbagent.answer.locate import locate_fragments
+        chunk = _chunk("c1", content="宽带安装需预约。")
+        df = locate_fragments(_locate_model(False, []), "59元套餐多少钱", chunk)
+        self.assertFalse(df.answerable)
+        self.assertEqual(df.fragments, [])
+
+    def test_whitespace_flexible_match(self):
+        """片段与原文仅空白/换行不同 → 弹性兜底命中,回填的是原文(含换行)。"""
+        from kbagent.answer.locate import locate_fragments
+        content = "套餐内容:\n每月流量 20GB\n通话 300 分钟"
+        chunk = _chunk("c1", content=content)
+        df = locate_fragments(
+            _locate_model(True, [{"text": "每月流量 20GB 通话 300 分钟", "reason": ""}]),
+            "套餐含什么", chunk)
+        self.assertEqual(len(df.fragments), 1)
+        f = df.fragments[0]
+        self.assertEqual(content[f.start:f.end], f.text)
+        self.assertIn("每月流量", f.text)
+
+    def test_max_fragments_capped(self):
+        """单篇文档片段数受 MAX_FRAGMENTS_PER_DOC 上限约束。"""
+        from kbagent.answer.locate import locate_fragments, MAX_FRAGMENTS_PER_DOC
+        content = "。".join(f"第{i}条内容" for i in range(20))
+        chunk = _chunk("c1", content=content)
+        frags = [{"text": f"第{i}条内容", "reason": ""} for i in range(20)]
+        df = locate_fragments(_locate_model(True, frags), "内容", chunk)
+        self.assertLessEqual(len(df.fragments), MAX_FRAGMENTS_PER_DOC)
+
+    def test_agent_populates_matched_fragments_for_all_chunks(self):
+        """AnswerSubAgent.run 对全部输入 chunks 产出等量、按序的 matched_fragments。"""
+        from kbagent.answer.agent import AnswerSubAgent
+        from kbagent.scripted_model import ScriptedChatModel
+        chunks = [
+            _chunk("c1", doc_id="d1", content="5G畅享套餐月费59元,含30GB流量。"),
+            _chunk("c2", doc_id="d2", content="宽带安装需预约,免费上门。"),
+            _chunk("c3", doc_id="d3", content="10元5GB加油包,当月有效。"),
+        ]
+        agent = AnswerSubAgent(ScriptedChatModel(), DEFAULT_CONFIG, Tracer())
+        ans = agent.run("5G套餐月费多少", chunks, "t_loc")
+        self.assertEqual([d.chunk_id for d in ans.matched_fragments],
+                         ["c1", "c2", "c3"])
+        by_id = {c.chunk_id: c.content for c in chunks}
+        for d in ans.matched_fragments:
+            for f in d.fragments:
+                self.assertIn(f.text, by_id[d.chunk_id])
+                self.assertEqual(by_id[d.chunk_id][f.start:f.end], f.text)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -79,6 +79,16 @@ class SourceItem(BaseModel):
     stale: bool = Field(description="是否疑似过旧(超溯源天数)")
 
 
+class UsabilityInfo(BaseModel):
+    """坐席视角的话术可用性判定(LLM 自评 + 确定性规则纠偏)。"""
+    level: str = Field(
+        default="",
+        description="directly_usable可直接使用 / verify_first核实后使用 / not_usable不可用转人工")
+    reasons: List[str] = Field(default_factory=list, description="判定依据")
+    uncovered: List[str] = Field(
+        default_factory=list, description="用户问题中知识库未覆盖的方面")
+
+
 class AnswerObject(BaseModel):
     """object 层 — 知识库检索问答业务载荷。"""
     requestId: str = Field(description="回传请求ID")
@@ -91,6 +101,20 @@ class AnswerObject(BaseModel):
     handlingSuggestion: str = Field(description="办理建议")
     renderedText: str = Field(description="完整答案文本(含知识来源),可直接展示")
     sources: List[SourceItem] = Field(description="知识来源列表")
+    # ---- 坐席向增量字段(全部带默认值,灵犀老调用方不受影响) ----
+    usability: Optional[UsabilityInfo] = Field(
+        default=None, description="话术可用性判定")
+    directConclusion: str = Field(
+        default="", description="一句话直接结论(能不能办/多少钱/怎么办)")
+    keyElements: Dict[str, str] = Field(
+        default_factory=dict, description="办理要素(渠道/材料/条件/时限/资费)")
+    script: str = Field(default="", description="可直接念给用户的口语化话术")
+    caveats: List[str] = Field(default_factory=list, description="答复注意事项")
+    # 智能体内部执行 trace 事件列表(ts_ms/stage/event/payload),
+    # 供前端演示页渲染"检索处理过程"时间线;
+    # KB_SERVICE_EXPOSE_TRACE=0 时为空列表,灵犀老调用方不受影响
+    processTrace: List[Dict[str, Any]] = Field(
+        default_factory=list, description="智能体执行过程事件列表(调试透出)")
 
 
 class AskResponse(BaseModel):
@@ -108,6 +132,14 @@ RTN_INTERNAL = "50001"      # 服务内部未预期异常
 RTN_TIMEOUT = "50002"       # 端到端处理超时
 
 
-def error_body(code: str, msg: str) -> dict:
-    """错误响应体:object 为空对象(契约要求 object 必含)。"""
-    return {"rtnCode": code, "rtnMsg": msg, "object": {}}
+def error_body(code: str, msg: str,
+               trace_events: Optional[List[Dict[str, Any]]] = None) -> dict:
+    """错误响应体:object 为空对象(契约要求 object 必含)。
+
+    trace_events 非空时附带智能体已执行的 trace 事件,
+    便于前端在超时/内部错误时也能展示"执行到哪一步了"。
+    """
+    obj: Dict[str, Any] = {}
+    if trace_events:
+        obj["processTrace"] = trace_events
+    return {"rtnCode": code, "rtnMsg": msg, "object": obj}

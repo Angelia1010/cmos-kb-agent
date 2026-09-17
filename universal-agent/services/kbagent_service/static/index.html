@@ -1,0 +1,1116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识库检索演示</title>
+<style>
+  :root {
+    --bg: #f3f5f9;
+    --card: #ffffff;
+    --border: #e2e8f0;
+    --text: #1e293b;
+    --muted: #64748b;
+    --primary: #2563eb;
+    --primary-dark: #1d4ed8;
+    --ok-bg: #ecfdf5;
+    --ok-border: #10b981;
+    --ok-text: #065f46;
+    --bad-bg: #fef2f2;
+    --bad-border: #ef4444;
+    --bad-text: #991b1b;
+    --warn-bg: #fffbeb;
+    --warn-border: #f59e0b;
+    --warn-text: #92400e;
+    --mark-bg: #fef08a;
+    --mark-border: #facc15;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; padding: 24px 16px 48px;
+  }
+  .container { max-width: 920px; margin: 0 auto; }
+  header { text-align: center; margin-bottom: 24px; }
+  header h1 { font-size: 22px; font-weight: 600; }
+  header p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin-bottom: 16px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+  }
+  .card h2 {
+    font-size: 15px; font-weight: 600; margin-bottom: 14px;
+    padding-left: 8px; border-left: 3px solid var(--primary);
+  }
+
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  textarea, input[type=text], select {
+    width: 100%; padding: 9px 12px; font-size: 14px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: #fff; color: var(--text); font-family: inherit;
+  }
+  textarea { resize: vertical; min-height: 72px; }
+  textarea:focus, input:focus, select:focus {
+    outline: none; border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, .15);
+  }
+  .row { display: flex; gap: 14px; margin-top: 14px; }
+  .row > div { flex: 1; }
+  .actions { margin-top: 18px; display: flex; align-items: center; gap: 14px; }
+  button {
+    padding: 10px 28px; font-size: 14px; font-weight: 600;
+    color: #fff; background: var(--primary); border: none;
+    border-radius: 6px; cursor: pointer;
+  }
+  button:hover { background: var(--primary-dark); }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  .hint { font-size: 12px; color: var(--muted); font-weight: 400; }
+
+  .banner {
+    padding: 12px 16px; border-radius: 8px; font-size: 14px;
+    font-weight: 600; margin-bottom: 16px; border: 1px solid;
+  }
+  .banner.ok   { background: var(--ok-bg);  border-color: var(--ok-border);  color: var(--ok-text); }
+  .banner.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+  .banner.bad  { background: var(--bad-bg); border-color: var(--bad-border); color: var(--bad-text); }
+  .banner.err  { background: var(--bad-bg); border-color: var(--bad-border); color: var(--bad-text); }
+  .banner small { display: block; font-weight: 400; margin-top: 4px; opacity: .85; }
+  .banner ul { margin: 6px 0 0 18px; font-weight: 400; font-size: 13px; }
+  .banner li { margin-top: 2px; }
+
+  .uncovered-box {
+    background: var(--warn-bg); border: 1px dashed var(--warn-border);
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+    font-size: 13px; color: var(--warn-text);
+  }
+  .uncovered-box b { display: block; margin-bottom: 4px; }
+
+  /* ── 结果概览统计条 ── */
+  .stats { display: flex; flex-wrap: wrap; }
+  .stat {
+    flex: 1; min-width: 120px; text-align: center;
+    padding: 4px 8px; border-right: 1px solid var(--border);
+  }
+  .stat:last-child { border-right: none; }
+  .stat b { display: block; font-size: 24px; font-weight: 700; color: var(--primary); line-height: 1.3; }
+  .stat b.accent { color: var(--ok-text); }
+  .stat span { font-size: 12px; color: var(--muted); }
+
+  .conclusion {
+    font-size: 17px; font-weight: 600; line-height: 1.7;
+    padding: 4px 2px;
+  }
+
+  .script-text {
+    font-size: 15px; line-height: 1.9; white-space: pre-wrap;
+    background: #eff6ff; border: 1px solid #bfdbfe;
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .copy-btn {
+    float: right; padding: 4px 14px; font-size: 12px; font-weight: 500;
+    background: #fff; color: var(--primary); border: 1px solid var(--primary);
+    border-radius: 5px; cursor: pointer;
+  }
+  .copy-btn:hover { background: var(--primary); color: #fff; }
+  .caveats {
+    margin-bottom: 12px; padding: 10px 14px; font-size: 13px;
+    background: var(--warn-bg); border-radius: 6px; color: var(--warn-text);
+  }
+  .caveats ul { margin: 4px 0 0 18px; }
+
+  table.elements { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.elements th, table.elements td {
+    text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border);
+    vertical-align: top; line-height: 1.6;
+  }
+  table.elements th {
+    width: 90px; color: var(--muted); font-weight: 500;
+    background: #f8fafc; white-space: nowrap;
+  }
+  table.elements tr:last-child th, table.elements tr:last-child td { border-bottom: none; }
+
+  .answer-block { margin-bottom: 14px; }
+  .answer-block h3 { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .answer-block .content {
+    font-size: 14px; line-height: 1.8; white-space: pre-wrap;
+    background: #f8fafc; border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px 14px;
+  }
+  details { margin-top: 10px; }
+  details summary { font-size: 13px; color: var(--primary); cursor: pointer; user-select: none; }
+  details .content { margin-top: 8px; }
+
+  /* ── 文档分组与片段 ── */
+  .legend {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted); margin: -6px 0 14px;
+  }
+  .legend mark {
+    background: var(--mark-bg); border-bottom: 2px solid var(--mark-border);
+    padding: 1px 6px; border-radius: 3px; color: var(--text);
+  }
+
+  .doc-group {
+    border: 1px solid var(--border); border-radius: 10px;
+    margin-bottom: 14px; background: #fcfdfe; overflow: hidden;
+  }
+  .doc-group:last-child { margin-bottom: 0; }
+  .doc-group.used { border-color: #86efac; }
+  .doc-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 12px 16px; background: #f8fafc; border-bottom: 1px solid var(--border);
+  }
+  .doc-group.used .doc-head { background: #f0fdf4; }
+  .source-idx {
+    flex: none; width: 22px; height: 22px; border-radius: 50%;
+    background: var(--primary); color: #fff; font-size: 12px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .doc-title { font-size: 14px; font-weight: 600; }
+  .tag {
+    font-size: 11px; padding: 2px 8px; border-radius: 10px;
+    border: 1px solid var(--border); color: var(--muted); background: #fff;
+    white-space: nowrap;
+  }
+  .tag.stale { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 2px 10px; border-radius: 10px;
+    white-space: nowrap;
+  }
+  .badge.used { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); }
+  .badge.unused { background: #f1f5f9; border: 1px solid var(--border); color: var(--muted); }
+  .doc-body { padding: 4px 16px 14px; }
+
+  .chunk { padding-top: 12px; }
+  .chunk + .chunk { border-top: 1px dashed var(--border); margin-top: 12px; }
+  .chunk-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;
+  }
+  .chunk-no { font-size: 12px; font-weight: 600; color: var(--muted); }
+
+  /* ── 关键片段:整篇文档中最能直接回答用户问题的部分,置顶展示 ── */
+  .key-fragment {
+    background: #f0fdf4; border: 1px solid #86efac;
+    border-left: 4px solid var(--ok-border);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 10px;
+  }
+  .key-fragment.plain {
+    background: #f8fafc; border-color: var(--border);
+    border-left-color: #cbd5e1;
+  }
+  .key-fragment .kf-label {
+    font-size: 12px; font-weight: 700; color: var(--ok-text);
+    margin-bottom: 8px;
+  }
+  .key-fragment.plain .kf-label { color: var(--muted); }
+  .key-fragment .kf-text {
+    font-size: 14px; line-height: 1.9; white-space: pre-wrap; color: var(--text);
+  }
+  .key-fragment .kf-text mark {
+    background: var(--mark-bg); border-bottom: 2px solid var(--mark-border);
+    padding: 0 2px; border-radius: 3px;
+  }
+  .key-fragment .kf-text mark.q { background: #dbeafe; border-bottom-color: #60a5fa; }
+  .kf-meta { font-size: 11px; color: #94a3b8; margin-top: 8px; }
+
+  details.full-doc { margin-top: 4px; }
+  details.full-doc summary {
+    font-size: 13px; font-weight: 500; color: var(--primary);
+    cursor: pointer; user-select: none;
+  }
+  details.full-doc .source-snippet { margin-top: 8px; max-height: 420px; overflow-y: auto; }
+
+  .source-snippet {
+    font-size: 13px; line-height: 1.8; color: #334155;
+    background: #f1f5f9; border-left: 3px solid #cbd5e1;
+    border-radius: 0 6px 6px 0; padding: 10px 12px; white-space: pre-wrap;
+  }
+  .source-snippet .label { color: var(--muted); font-size: 12px; display: block; margin-bottom: 4px; }
+  .source-snippet mark {
+    background: var(--mark-bg); border-bottom: 2px solid var(--mark-border);
+    padding: 0 2px; border-radius: 3px; color: inherit;
+  }
+  .source-snippet mark.q { background: #dbeafe; border-bottom-color: #60a5fa; }
+  .legend mark.q { background: #dbeafe; border-bottom-color: #60a5fa; }
+  .source-chunk { margin-top: 8px; font-size: 11px; color: #94a3b8; font-family: Consolas, monospace; }
+
+  /* ── Agent 执行过程时间线 ── */
+  .trace-timeline { padding: 2px 0; }
+  .trace-event {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    padding: 7px 0; border-bottom: 1px dashed var(--border); font-size: 13px;
+  }
+  .trace-event:last-child { border-bottom: none; }
+  .trace-ts {
+    flex: none; width: 58px; text-align: right;
+    font-family: Consolas, monospace; font-size: 12px; color: var(--muted);
+  }
+  .trace-stage {
+    flex: none; font-size: 11px; font-weight: 600; color: #fff;
+    padding: 2px 9px; border-radius: 10px; white-space: nowrap;
+  }
+  .trace-name { font-weight: 600; white-space: nowrap; }
+  .trace-summary {
+    color: var(--muted); font-size: 12px; word-break: break-all; flex: 1 1 200px;
+  }
+  .trace-summary b { color: #334155; font-weight: 500; }
+  .trace-payload { flex-basis: 100%; margin-top: 2px; }
+  .trace-payload summary { font-size: 12px; color: var(--primary); cursor: pointer; }
+  .trace-payload pre {
+    background: #0f172a; color: #e2e8f0; padding: 10px 12px;
+    border-radius: 6px; font-size: 12px; line-height: 1.6;
+    overflow-x: auto; max-height: 320px; margin-top: 6px;
+    font-family: Consolas, "Courier New", monospace;
+  }
+
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 8px 24px;
+    font-size: 12px; color: var(--muted);
+  }
+  .meta span b { color: var(--text); font-weight: 500; }
+
+  .loading { display: none; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .loading.show { display: inline-flex; }
+  .spinner {
+    width: 16px; height: 16px; border: 2px solid #cbd5e1;
+    border-top-color: var(--primary); border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #results { display: none; }
+  .empty-tip { color: var(--muted); font-size: 13px; text-align: center; padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>知识库检索演示</h1>
+    <p>kbagent-service · 输入用户问题与归属地,查看检索话术与知识溯源</p>
+  </header>
+
+  <!-- 输入区 -->
+  <div class="card">
+    <h2>查询条件</h2>
+    <label for="question">用户问题 *</label>
+    <textarea id="question" placeholder="例如:异地能不能补办手机卡?需要什么材料?"></textarea>
+    <div class="row">
+      <div>
+        <label for="province">用户省份 *</label>
+        <select id="province"></select>
+      </div>
+      <div>
+        <label for="city">用户地市</label>
+        <input type="text" id="city" placeholder="例如:福州(选填)">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="submitBtn" onclick="doQuery()">查 询</button>
+      <span class="loading" id="loading"><span class="spinner"></span>检索中,请耐心等待(最长约 2 分钟)...</span>
+    </div>
+  </div>
+
+  <!-- 结果区(重要信息靠前:概览 → 结论 → 话术 → 要素 → 溯源) -->
+  <div id="results">
+    <div id="bannerBox"></div>
+    <div id="uncoveredBox"></div>
+
+    <div class="card" id="statsCard">
+      <div class="stats">
+        <div class="stat"><b id="statDocs">-</b><span>检索到文档</span></div>
+        <div class="stat"><b id="statChunks">-</b><span>引用片段</span></div>
+        <div class="stat"><b id="statUsed" class="accent">-</b><span>片段直接支撑答案</span></div>
+        <div class="stat"><b id="statElapsed">-</b><span>端到端耗时</span></div>
+      </div>
+    </div>
+
+    <div class="card" id="conclusionCard">
+      <h2>一句话结论</h2>
+      <div class="conclusion" id="directConclusion"></div>
+    </div>
+
+    <div class="card" id="scriptCard">
+      <h2>坐席话术(可直接念给用户)
+        <button class="copy-btn" id="copyScriptBtn" onclick="copyScript(this)">复制话术</button>
+      </h2>
+      <div class="caveats" id="caveatsBox" style="display:none"></div>
+      <div class="script-text" id="scriptText"></div>
+    </div>
+
+    <div class="card" id="elementsCard">
+      <h2>办理要素</h2>
+      <table class="elements" id="keyElements"></table>
+    </div>
+
+    <div class="card" id="sourcesCard">
+      <h2>知识来源 <span class="hint" id="sourceCount"></span></h2>
+      <div class="legend">
+        <span>每篇文档将 <b>⭐ 最能回答问题的片段</b> 置顶,点击「查看整篇文档」可展开全文对照。</span>
+        <mark>黄色</mark><span>= 被答案 / 话术直接引用</span>
+        <mark class="q">蓝色</mark><span>= 命中用户问题关键词</span>
+      </div>
+      <div id="sourceList"></div>
+    </div>
+
+    <div class="card" id="traceCard">
+      <details id="traceDetails" open>
+        <summary style="font-size:15px;font-weight:600;color:var(--text);">
+          Agent 检索处理过程 <span class="hint" id="traceCount"></span>
+        </summary>
+        <div class="legend" style="margin:10px 0 6px;">
+          <span>智能体内部执行时间线:主流程 → 缓存判定 → 检索 → 知识处理 → 答案生成/锚定校验;点击事件可展开完整 payload</span>
+        </div>
+        <div class="trace-timeline" id="traceTimeline"></div>
+      </details>
+    </div>
+
+    <div class="card">
+      <details>
+        <summary>业务说明 / 办理建议 / 完整答案文本(兼容视图)</summary>
+        <div class="answer-block" style="margin-top:12px">
+          <h3>业务说明</h3>
+          <div class="content" id="bizExplanation"></div>
+        </div>
+        <div class="answer-block">
+          <h3>办理建议</h3>
+          <div class="content" id="handlingSuggestion"></div>
+        </div>
+        <div class="answer-block">
+          <h3>完整答案文本</h3>
+          <div class="content" id="renderedText"></div>
+        </div>
+      </details>
+    </div>
+
+    <div class="card">
+      <div class="meta" id="metaInfo"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ── 常量与状态 ────────────────────────────────────────────────────────
+var DEFAULT_BASE_PATH = "/api/kb-agent-service/prod";
+var basePath = DEFAULT_BASE_PATH;   // 页面加载时经 /frontend-config 刷新
+
+// 判定"片段被答案引用"的最长公共子串阈值(归一化后的字符数);
+// 太小会把"您可以"这类通用短语误判为引用
+var MIN_MATCH_CHARS = 8;
+// 答案语料归一化后的长度上限,防止极端长答案拖慢比对
+var MAX_CORPUS_CHARS = 6000;
+// 判定"原文命中用户问题关键词"的阈值(比答案引用宽松,4字即有意义)
+var MIN_Q_MATCH_CHARS = 4;
+// 关键片段(⭐置顶摘录)的最大长度,超出则只取最高分句子附近
+var MAX_KF_CHARS = 280;
+
+// 最近一次查询的用户问题(渲染时用于关键词命中分析)
+var lastQuestion = "";
+
+var PROVINCES = [
+  "000(全国)", "北京", "天津", "河北", "山西", "内蒙古",
+  "辽宁", "吉林", "黑龙江", "上海", "江苏", "浙江", "安徽",
+  "福建", "江西", "山东", "河南", "湖北", "湖南", "广东",
+  "广西", "海南", "重庆", "四川", "贵州", "云南", "西藏",
+  "陕西", "甘肃", "青海", "宁夏", "新疆"
+];
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function uid(prefix) {
+  return prefix + "-" + Date.now() + "-" +
+         Math.random().toString(36).slice(2, 10);
+}
+
+// ── 初始化 ────────────────────────────────────────────────────────────
+(function init() {
+  var sel = document.getElementById("province");
+  PROVINCES.forEach(function (p) {
+    var opt = document.createElement("option");
+    var m = p.match(/^(\d+)\((.+)\)$/);   // "000(全国)" → value=000
+    opt.value = m ? m[1] : p;
+    opt.textContent = p;
+    if (p === "福建") opt.selected = true;
+    sel.appendChild(opt);
+  });
+
+  // 取实际路由前缀(兼容 KB_SERVICE_BASE_PATH 覆盖);失败用默认值。
+  // 相对地址:页面挂 / 或 {base}/ui/ 时都能命中各自的 frontend-config
+  fetch("frontend-config")
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (cfg) { if (cfg && cfg.basePath) basePath = cfg.basePath; })
+    .catch(function () { /* 保持默认 */ });
+})();
+
+// ── 查询 ──────────────────────────────────────────────────────────────
+function doQuery() {
+  var question = document.getElementById("question").value.trim();
+  var province = document.getElementById("province").value;
+  var city = document.getElementById("city").value.trim();
+
+  if (!question) {
+    showBanner("err", "请输入用户问题");
+    hideSections();
+    return;
+  }
+  lastQuestion = question;   // 渲染时据此定位"最能回答问题的片段"
+
+  var btn = document.getElementById("submitBtn");
+  btn.disabled = true;
+  document.getElementById("loading").classList.add("show");
+  document.getElementById("results").style.display = "none";
+
+  var body = {
+    params: {
+      appId: "kb-frontend-demo",
+      requestId: uid("req"),
+      sessionId: uid("sess"),
+      userInfo: {
+        phone: "frontend-demo",       // 契约必填,演示页固定占位
+        province: province,
+        location: city || null        // 地市透传
+      },
+      extInfo: {},
+      conversations: [{ role: 1, content: question }]
+    }
+  };
+
+  var startAt = Date.now();
+  fetch(basePath + "/retrieve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  })
+    .then(function (resp) {
+      if (!resp.ok) {
+        // 把网关/服务的错误响应体一并带出,便于定位是哪一层拒绝
+        return resp.text().then(function (t) {
+          var waited = ((Date.now() - startAt) / 1000).toFixed(1);
+          throw new Error("HTTP " + resp.status +
+                          "(等待 " + waited + "s) 响应体: " +
+                          (t || "(空)").slice(0, 300));
+        });
+      }
+      return resp.json();
+    })
+    .then(render)
+    .catch(function (e) {
+      showBanner("err", "请求失败:" + esc(e.message),
+                 "请确认服务已启动、网络可达;检索端到端超时为 120 秒。");
+      hideSections();
+    })
+    .finally(function () {
+      btn.disabled = false;
+      document.getElementById("loading").classList.remove("show");
+    });
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 片段 ↔ 答案 比对(纯前端,无需后端改动)
+//
+// 思路:后端返回的 sources[].snippet 是整篇文档原文,没有"哪几句
+// 被引用/最能回答问题"的标注。这里把答案全文(directConclusion/
+// script/keyElements/...)拼成语料,对文档逐句求"最长公共子串"
+// (忽略标点/空白),达到阈值即认为该句被答案引用;再结合用户问题
+// 的关键词命中,由 pickKeyFragment() 从整篇文档中挑出"最能直接
+// 回答用户问题"的连续片段置顶展示,整篇原文折叠在下方可展开对照。
+// ══════════════════════════════════════════════════════════════════════
+
+// 答案语料:所有会呈现给坐席的答案侧文本
+function buildAnswerCorpus(obj) {
+  var parts = [];
+  if (obj.directConclusion) parts.push(obj.directConclusion);
+  if (obj.script) parts.push(obj.script);
+  if (obj.keyElements) {
+    Object.keys(obj.keyElements).forEach(function (k) {
+      if (obj.keyElements[k]) parts.push(String(obj.keyElements[k]));
+    });
+  }
+  if (obj.caveats && obj.caveats.length) parts.push(obj.caveats.join(" "));
+  if (obj.businessExplanation) parts.push(obj.businessExplanation);
+  if (obj.handlingSuggestion) parts.push(obj.handlingSuggestion);
+  return parts.join("\n");
+}
+
+// 归一化:去掉空白与中英文标点,只留实义字符;
+// map[i] = 归一化后第 i 个字符在原文中的下标(用于把匹配区间映射回原文)
+var PUNCT_RE = /[\s，。、；：！？“”‘’（）《》【】…—·～,.;:!?"'()\[\]<>~\-_|/\\*+#=]/;
+function normalizeWithMap(s) {
+  var chars = [], map = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    if (PUNCT_RE.test(c)) continue;
+    chars.push(c);
+    map.push(i);
+  }
+  return { text: chars.join(""), map: map };
+}
+
+// 最长公共子串(滚动数组 DP);返回长度与 a 中的结束位置(开区间)
+function longestCommonSubstring(a, b) {
+  var n = a.length, m = b.length;
+  if (!n || !m) return { len: 0, aEnd: 0 };
+  var prev = new Array(m + 1).fill(0);
+  var cur = new Array(m + 1).fill(0);
+  var best = 0, aEnd = 0;
+  for (var i = 1; i <= n; i++) {
+    var ai = a.charAt(i - 1);
+    for (var j = 1; j <= m; j++) {
+      if (ai === b.charAt(j - 1)) {
+        cur[j] = prev[j - 1] + 1;
+        if (cur[j] > best) { best = cur[j]; aEnd = i; }
+      } else {
+        cur[j] = 0;
+      }
+    }
+    var t = prev; prev = cur; cur = t;
+    cur.fill(0);
+  }
+  return { len: best, aEnd: aEnd };
+}
+
+// 按句切分,保留每句在原文中的起始偏移
+function splitSentences(s) {
+  var out = [], re = /[^。！？!?；;\n]+[。！？!?；;\n]?/g, m;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0].trim()) out.push({ text: m[0], start: m.index });
+    if (m.index === re.lastIndex) re.lastIndex++;   // 防空转
+  }
+  return out;
+}
+
+// 合并重叠/相邻区间
+function mergeRanges(ranges) {
+  if (!ranges.length) return ranges;
+  ranges.sort(function (x, y) { return x[0] - y[0] || x[1] - y[1]; });
+  var out = [ranges[0].slice()];
+  for (var i = 1; i < ranges.length; i++) {
+    var last = out[out.length - 1], r = ranges[i];
+    if (r[0] <= last[1]) { if (r[1] > last[1]) last[1] = r[1]; }
+    else out.push(r.slice());
+  }
+  return out;
+}
+
+// 去掉被其他摘录包含的短摘录
+function dedupeQuotes(list) {
+  return list.filter(function (q, i) {
+    for (var j = 0; j < list.length; j++) {
+      if (i !== j && list[j].indexOf(q) >= 0 && list[j].length > q.length) return false;
+    }
+    return true;
+  });
+}
+
+// 递归找出一句话内所有达到阈值的公共子串(归一化坐标):
+// 每轮取最长匹配,再对其左右两侧继续找,避免长匹配掩盖同句内的其他引用
+function findNormalizedMatches(a, b, minChars) {
+  minChars = minChars || MIN_MATCH_CHARS;
+  var out = [];
+  (function walk(lo, hi) {
+    if (hi - lo < minChars) return;
+    var r = longestCommonSubstring(a.slice(lo, hi), b);
+    if (r.len < minChars) return;
+    var s = lo + r.aEnd - r.len, e = lo + r.aEnd;
+    out.push([s, e]);
+    walk(lo, s);
+    walk(e, hi);
+  })(0, a.length);
+  return out;
+}
+
+// 原文中对"用户问题"的命中(原文坐标区间 + 命中字数);阈值比答案引用宽松
+function findQuestionMatches(text) {
+  var qNorm = normalizeWithMap(lastQuestion).text;
+  if (!text || !qNorm) return { ranges: [], chars: 0 };
+  var norm = normalizeWithMap(text);
+  if (!norm.text.length) return { ranges: [], chars: 0 };
+  var ranges = [], chars = 0;
+  findNormalizedMatches(norm.text, qNorm, MIN_Q_MATCH_CHARS).forEach(function (m) {
+    ranges.push([norm.map[m[0]], norm.map[m[1] - 1] + 1]);
+    chars += m[1] - m[0];
+  });
+  return { ranges: mergeRanges(ranges), chars: chars };
+}
+
+// 把原文坐标区间裁剪到 [start, end) 窗口内,并平移为窗口内坐标
+function clipRanges(ranges, start, end) {
+  var out = [];
+  (ranges || []).forEach(function (r) {
+    var s = Math.max(r[0], start), e = Math.min(r[1], end);
+    if (e > s) out.push([s - start, e - start]);
+  });
+  return out;
+}
+
+// 从 qs 中扣掉与 as 重叠的部分(避免双色高亮互相覆盖)
+function subtractRanges(qs, as) {
+  var out = [];
+  (qs || []).forEach(function (q) {
+    var cur = [[q[0], q[1]]];
+    (as || []).forEach(function (a) {
+      var next = [];
+      cur.forEach(function (c) {
+        if (a[1] <= c[0] || a[0] >= c[1]) { next.push(c); return; }
+        if (a[0] > c[0]) next.push([c[0], a[0]]);
+        if (a[1] < c[1]) next.push([a[1], c[1]]);
+      });
+      cur = next;
+    });
+    out = out.concat(cur);
+  });
+  return out;
+}
+
+// 双色高亮渲染:黄色 = 被答案/话术引用,蓝色 = 命中问题关键词
+function renderTwoColor(text, aRanges, qRanges) {
+  var segs = [];
+  (aRanges || []).forEach(function (r) { segs.push({ s: r[0], e: r[1], cls: "" }); });
+  subtractRanges(qRanges, aRanges).forEach(function (r) {
+    segs.push({ s: r[0], e: r[1], cls: ' class="q"' });
+  });
+  segs.sort(function (x, y) { return x.s - y.s; });
+  var out = "", pos = 0;
+  segs.forEach(function (g) {
+    var s = Math.max(pos, g.s), e = Math.max(s, Math.min(text.length, g.e));
+    if (e <= s) return;
+    out += esc(text.slice(pos, s)) + "<mark" + g.cls + ">" + esc(text.slice(s, e)) + "</mark>";
+    pos = e;
+  });
+  out += esc(text.slice(pos));
+  return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 关键片段提取:后端返回的 snippet 是整篇文档,这里从全文中挑出
+// "最能直接回答用户问题"的连续片段,置顶展示并关联整篇原文。
+// 句子得分 = 被答案引用字数 × 2 + 命中问题关键词字数 × 1.5,
+// 取最高分句子,再向两侧吸收有得分的邻句(总长不超 MAX_KF_CHARS)。
+// ══════════════════════════════════════════════════════════════════════
+function pickKeyFragment(snippet, usedRanges) {
+  var sentences = splitSentences(snippet);
+  if (!sentences.length) return null;
+  var scored = sentences.map(function (sen) {
+    var aChars = 0;
+    (usedRanges || []).forEach(function (r) {
+      var s = Math.max(r[0], sen.start);
+      var e = Math.min(r[1], sen.start + sen.text.length);
+      if (e > s) aChars += e - s;
+    });
+    var qChars = findQuestionMatches(sen.text).chars;
+    return { sen: sen, score: aChars * 2 + qChars * 1.5 };
+  });
+  var best = 0;
+  scored.forEach(function (x, i) { if (x.score > scored[best].score) best = i; });
+  if (scored[best].score <= 0) {
+    // 全文既没被答案引用、也没命中问题关键词 → 退化为文首摘要
+    return { start: 0, end: Math.min(snippet.length, 160), score: 0, fallback: true };
+  }
+  var lo = best, hi = best, len = scored[best].sen.text.length;
+  while (lo > 0 && scored[lo - 1].score > 0 &&
+         len + scored[lo - 1].sen.text.length <= MAX_KF_CHARS) {
+    lo--; len += scored[lo].sen.text.length;
+  }
+  while (hi < scored.length - 1 && scored[hi + 1].score > 0 &&
+         len + scored[hi + 1].sen.text.length <= MAX_KF_CHARS) {
+    hi++; len += scored[hi].sen.text.length;
+  }
+  var lastSen = scored[hi].sen;
+  return {
+    start: scored[lo].sen.start,
+    end: lastSen.start + lastSen.text.length,
+    score: scored[best].score,
+    fallback: false
+  };
+}
+
+// 分析单个 source:返回高亮区间(原文坐标)与被引用摘录
+function analyzeSnippet(snippet, corpusText) {
+  var ranges = [], quotes = [];
+  if (!snippet || !corpusText) return { ranges: ranges, quotes: quotes };
+  var sentences = splitSentences(snippet);
+  sentences.forEach(function (sen) {
+    var norm = normalizeWithMap(sen.text);
+    if (norm.text.length < MIN_MATCH_CHARS) return;
+    findNormalizedMatches(norm.text, corpusText).forEach(function (m) {
+      var s0 = norm.map[m[0]];                  // 句内起(原文坐标)
+      var s1 = norm.map[m[1] - 1] + 1;          // 句内止(开区间)
+      ranges.push([sen.start + s0, sen.start + s1]);
+      var q = sen.text.slice(s0, s1).trim();
+      if (q) quotes.push(q);
+    });
+  });
+  return { ranges: mergeRanges(ranges), quotes: dedupeQuotes(quotes) };
+}
+
+// 按 docTitle 分组;最能回答问题的文档排前面(重要信息靠前)
+function groupByDoc(analyzed) {
+  var order = [], map = {};
+  analyzed.forEach(function (a) {
+    var key = a.docTitle || "(无标题文档)";
+    if (!map[key]) {
+      map[key] = {
+        title: key, chunks: [], usedCount: 0, bestScore: 0,
+        updatedAt: a.updatedAt, stale: !!a.stale, _order: order.length
+      };
+      order.push(map[key]);
+    }
+    var g = map[key];
+    g.chunks.push(a);
+    if (a.used) g.usedCount++;
+    if ((a.kfScore || 0) > g.bestScore) g.bestScore = a.kfScore || 0;
+    if (a.updatedAt && (!g.updatedAt || a.updatedAt > g.updatedAt)) g.updatedAt = a.updatedAt;
+    if (a.stale) g.stale = true;
+  });
+  order.forEach(function (g) {
+    // 文档内同样:被引用、关键片段得分高的排前面
+    g.chunks.forEach(function (c, i) { c._order = i; });
+    g.chunks.sort(function (x, y) {
+      if (!!y.used !== !!x.used) return y.used ? 1 : -1;
+      if ((y.kfScore || 0) !== (x.kfScore || 0)) return (y.kfScore || 0) - (x.kfScore || 0);
+      return x._order - y._order;
+    });
+  });
+  order.sort(function (x, y) {
+    if (y.usedCount !== x.usedCount) return y.usedCount - x.usedCount;
+    if (y.bestScore !== x.bestScore) return y.bestScore - x.bestScore;
+    return x._order - y._order;
+  });
+  return order;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Agent 执行过程时间线(object.processTrace)
+// 后端 Tracer 每个关键节点记一条 {ts_ms, stage, event, payload}:
+// run/cache/retrieval/processing(.knowledge)/answer/finalize/degrade
+// ══════════════════════════════════════════════════════════════════════
+
+var STAGE_META = {
+  "run":                  { label: "主流程",   color: "#64748b" },
+  "cache":                { label: "缓存",     color: "#8b5cf6" },
+  "retrieval":            { label: "检索",     color: "#2563eb" },
+  "processing":           { label: "知识处理", color: "#d97706" },
+  "processing.knowledge": { label: "知识处理", color: "#d97706" },
+  "answer":               { label: "答案生成", color: "#059669" },
+  "finalize":             { label: "完成",     color: "#0f766e" },
+  "degrade":              { label: "降级",     color: "#dc2626" }
+};
+
+function fmtTraceTs(dt) {
+  return dt >= 1000 ? "+" + (dt / 1000).toFixed(1) + "s" : "+" + dt + "ms";
+}
+
+// payload 一行摘要:标量直接展示(截断),对象/数组只显示规模,细节进折叠 JSON
+function traceSummary(payload) {
+  if (!payload) return "";
+  var parts = [];
+  Object.keys(payload).forEach(function (k) {
+    var v = payload[k];
+    if (v === null || v === undefined) return;
+    if (typeof v === "object") {
+      var n = Array.isArray(v) ? v.length : Object.keys(v).length;
+      parts.push("<b>" + esc(k) + "</b>=" +
+                 (Array.isArray(v) ? "[" + n + " 项]" : "{" + n + " 字段}"));
+    } else {
+      var s = String(v);
+      if (s.length > 60) s = s.slice(0, 60) + "…";
+      parts.push("<b>" + esc(k) + "</b>=" + esc(s));
+    }
+  });
+  return parts.join(" · ");
+}
+
+function renderTrace(events) {
+  var card = document.getElementById("traceCard");
+  if (!events || !events.length) { card.style.display = "none"; return; }
+  card.style.display = "";
+  document.getElementById("traceCount").textContent =
+    "(共 " + events.length + " 个事件)";
+  var t0 = events[0].ts_ms || 0;
+  document.getElementById("traceTimeline").innerHTML = events.map(function (e) {
+    var meta = STAGE_META[e.stage] || { label: e.stage || "?", color: "#475569" };
+    var dt = (e.ts_ms || t0) - t0;
+    var keys = e.payload ? Object.keys(e.payload) : [];
+    var payloadHtml = keys.length
+      ? '<details class="trace-payload"><summary>payload(' + keys.length +
+        ' 字段)</summary><pre>' +
+        esc(JSON.stringify(e.payload, null, 2)) + '</pre></details>'
+      : "";
+    return '<div class="trace-event">' +
+      '<span class="trace-ts">' + fmtTraceTs(dt) + '</span>' +
+      '<span class="trace-stage" style="background:' + meta.color + '">' +
+        esc(meta.label) + '</span>' +
+      '<span class="trace-name">' + esc(e.event || "") + '</span>' +
+      '<span class="trace-summary">' + traceSummary(e.payload) + '</span>' +
+      payloadHtml +
+    '</div>';
+  }).join("");
+}
+
+// ── 渲染 ──────────────────────────────────────────────────────────────
+function render(data) {
+  document.getElementById("results").style.display = "block";
+
+  // 错误信封:rtnCode 非 0
+  if (!data || data.rtnCode !== "0" || !data.object || !data.object.requestId) {
+    var code = data ? data.rtnCode : "?";
+    var msg = data ? data.rtnMsg : "空响应";
+    showBanner("err", "服务返回错误(rtnCode=" + esc(code) + "):" + esc(msg));
+    hideSections();
+    // 超时/内部错误的响应体也会携带 processTrace:展示"执行到哪一步了"
+    renderTrace(data && data.object ? data.object.processTrace : null);
+    return;
+  }
+
+  var obj = data.object;
+  setCardsVisible(true);
+  document.getElementById("uncoveredBox").innerHTML = "";
+
+  // ── 可用性横幅:优先 usability 三态;老服务无该字段时回退 degraded 判定 ──
+  var u = obj.usability;
+  if (u && u.level) {
+    var reasonsHtml = (u.reasons && u.reasons.length)
+      ? "<ul>" + u.reasons.map(function (r) {
+          return "<li>" + esc(r) + "</li>"; }).join("") + "</ul>"
+      : "";
+    if (u.level === "directly_usable") {
+      showBanner("ok", "✓ 话术可直接使用", reasonsHtml || null);
+    } else if (u.level === "verify_first") {
+      showBanner("warn", "⚠ 话术核实后使用",
+                 reasonsHtml || "请结合引用片段核对后再答复用户。");
+    } else {
+      showBanner("bad", "✗ 话术不可用,请转人工处理", reasonsHtml || null);
+    }
+    // 未覆盖方面:明确告诉坐席哪些别指望话术
+    if (u.uncovered && u.uncovered.length) {
+      document.getElementById("uncoveredBox").innerHTML =
+        '<div class="uncovered-box"><b>以下方面知识库未覆盖,需坐席人工补充答复:</b>' +
+        u.uncovered.map(function (x) { return "· " + esc(x); }).join("<br>") +
+        "</div>";
+    }
+  } else if (obj.degraded) {
+    showBanner("bad", "✗ 降级兜底结果 —— 检索不足以支撑用户问题",
+               "该结果未经知识加工,请人工核实原文后再答复用户。");
+  } else {
+    showBanner("ok", "✓ 检索结果可支撑用户问题",
+               "话术基于以下引用文档生成,可结合片段核对。");
+  }
+
+  // ── 片段 ↔ 答案比对 + 关键片段提取 + 按文档分组 ──
+  var sources = obj.sources || [];
+  var corpus = normalizeWithMap(buildAnswerCorpus(obj)).text
+                 .slice(0, MAX_CORPUS_CHARS);
+  var analyzed = sources.map(function (s) {
+    var snippet = s.snippet || "";
+    var r = analyzeSnippet(snippet, corpus);
+    var kf = pickKeyFragment(snippet, r.ranges);
+    return {
+      chunkId: s.chunkId, docTitle: s.docTitle, snippet: snippet,
+      updatedAt: s.updatedAt, stale: s.stale,
+      ranges: r.ranges, quotes: r.quotes, used: r.ranges.length > 0,
+      kf: kf, kfScore: kf ? kf.score : 0
+    };
+  });
+  var docGroups = groupByDoc(analyzed);
+  var usedChunks = analyzed.filter(function (a) { return a.used; }).length;
+
+  // ── 结果概览统计(重要信息放最前) ──
+  document.getElementById("statDocs").textContent = docGroups.length;
+  document.getElementById("statChunks").textContent = analyzed.length;
+  document.getElementById("statUsed").textContent = usedChunks;
+  document.getElementById("statElapsed").textContent =
+    (obj.elapsedMs != null ? (obj.elapsedMs / 1000).toFixed(1) + " s" : "-");
+
+  // ── 一句话结论 ──
+  var conclCard = document.getElementById("conclusionCard");
+  if (obj.directConclusion) {
+    conclCard.style.display = "";
+    document.getElementById("directConclusion").textContent = obj.directConclusion;
+  } else {
+    conclCard.style.display = "none";
+  }
+
+  // ── 坐席话术 + 注意事项 ──
+  var scriptCard = document.getElementById("scriptCard");
+  if (obj.script) {
+    scriptCard.style.display = "";
+    document.getElementById("scriptText").textContent = obj.script;
+    var cav = obj.caveats || [];
+    var cavBox = document.getElementById("caveatsBox");
+    if (cav.length) {
+      cavBox.style.display = "";
+      cavBox.innerHTML = "⚠ 答复时注意:<ul>" + cav.map(function (c) {
+        return "<li>" + esc(c) + "</li>"; }).join("") + "</ul>";
+    } else {
+      cavBox.style.display = "none";
+    }
+  } else {
+    scriptCard.style.display = "none";
+  }
+
+  // ── 办理要素表 ──
+  var elCard = document.getElementById("elementsCard");
+  var elKeys = obj.keyElements ? Object.keys(obj.keyElements) : [];
+  if (elKeys.length) {
+    elCard.style.display = "";
+    document.getElementById("keyElements").innerHTML = elKeys.map(function (k) {
+      return "<tr><th>" + esc(k) + "</th><td>" +
+             esc(obj.keyElements[k]) + "</td></tr>";
+    }).join("");
+  } else {
+    elCard.style.display = "none";
+  }
+
+  // ── 兼容视图(老字段) ──
+  document.getElementById("bizExplanation").textContent =
+    obj.businessExplanation || "(无)";
+  document.getElementById("handlingSuggestion").textContent =
+    obj.handlingSuggestion || "(无)";
+  document.getElementById("renderedText").textContent =
+    obj.renderedText || "(无)";
+
+  // ── 引用文档与片段(按文档分组 + 引用高亮) ──
+  document.getElementById("sourceCount").textContent = analyzed.length
+    ? "(共 " + docGroups.length + " 个文档 · " + analyzed.length + " 个片段 · " +
+      usedChunks + " 个片段被答案直接引用)"
+    : "";
+  var listEl = document.getElementById("sourceList");
+  if (!docGroups.length) {
+    listEl.innerHTML = '<p class="empty-tip">本次检索未返回引用文档</p>';
+  } else {
+    listEl.innerHTML = docGroups.map(function (g, gi) {
+      var chunksHtml = g.chunks.map(function (c, ci) {
+        var head =
+          '<div class="chunk-head">' +
+            '<span class="chunk-no">片段 ' + (ci + 1) + '</span>' +
+            (c.used
+              ? '<span class="badge used">✓ 已支撑答案</span>'
+              : '<span class="badge unused">未直接引用</span>') +
+          '</div>';
+
+        // snippet 是整篇文档:关键片段置顶,全文折叠在下方并可展开对照
+        var bodyHtml;
+        var shortDoc = c.snippet.length <= MAX_KF_CHARS;
+        if (c.kf && !shortDoc) {
+          var kfText = c.snippet.slice(c.kf.start, c.kf.end);
+          var kfBox =
+            '<div class="key-fragment' + (c.kf.fallback ? ' plain' : '') + '">' +
+              '<div class="kf-label">' + (c.kf.fallback
+                ? '📄 全文开头摘要(未在全文中定位到直接回答的片段)'
+                : '⭐ 全文中最能回答用户问题的片段') + '</div>' +
+              '<div class="kf-text">' + renderTwoColor(
+                kfText,
+                clipRanges(c.ranges, c.kf.start, c.kf.end),
+                findQuestionMatches(kfText).ranges) + '</div>' +
+              '<div class="kf-meta">摘自《' + esc(g.title) + '》第 ' +
+                (c.kf.start + 1) + '–' + c.kf.end + ' 字 · 全文共 ' +
+                c.snippet.length + ' 字</div>' +
+            '</div>';
+          var fullDoc =
+            '<details class="full-doc">' +
+              '<summary>查看整篇文档(全文 ' + c.snippet.length + ' 字)</summary>' +
+              '<div class="source-snippet"><span class="label">整篇原文</span>' +
+                renderTwoColor(c.snippet, c.ranges,
+                               findQuestionMatches(c.snippet).ranges) +
+              '</div>' +
+            '</details>';
+          bodyHtml = kfBox + fullDoc;
+        } else {
+          // 全文本来就短:整篇即关键内容,直接展示
+          bodyHtml =
+            '<div class="source-snippet"><span class="label">原文(全文较短,直接展示)</span>' +
+              renderTwoColor(c.snippet, c.ranges,
+                             findQuestionMatches(c.snippet).ranges) +
+            '</div>';
+        }
+        return '<div class="chunk">' + head + bodyHtml +
+          '<div class="source-chunk">chunkId: ' + esc(c.chunkId) + '</div>' +
+        '</div>';
+      }).join("");
+
+      return '<div class="doc-group' + (g.usedCount ? ' used' : '') + '">' +
+        '<div class="doc-head">' +
+          '<span class="source-idx">' + (gi + 1) + '</span>' +
+          '<span class="doc-title">' + esc(g.title) + '</span>' +
+          (g.usedCount
+            ? '<span class="badge used">' + g.usedCount + ' / ' +
+              g.chunks.length + ' 个片段支撑答案</span>'
+            : '<span class="badge unused">未直接引用</span>') +
+          '<span class="tag">更新于 ' + esc(g.updatedAt || "未知") + '</span>' +
+          (g.stale ? '<span class="tag stale">⚠ 知识可能过旧,请核实</span>' : "") +
+        '</div>' +
+        '<div class="doc-body">' + chunksHtml + '</div>' +
+      '</div>';
+    }).join("");
+  }
+
+  // ── Agent 执行过程时间线 ──
+  renderTrace(obj.processTrace);
+
+  // 元信息
+  document.getElementById("metaInfo").innerHTML =
+    "<span>requestId: <b>" + esc(obj.requestId) + "</b></span>" +
+    "<span>traceId: <b>" + esc(obj.traceId) + "</b></span>" +
+    "<span>耗时: <b>" + esc(obj.elapsedMs) + " ms</b></span>" +
+    "<span>到达时间: <b>" + esc(obj.requestArrivedTime) + "</b></span>";
+
+  document.getElementById("results").scrollIntoView({ behavior: "smooth" });
+}
+
+function showBanner(type, text, sub) {
+  document.getElementById("results").style.display = "block";
+  document.getElementById("bannerBox").innerHTML =
+    '<div class="banner ' + type + '">' + text +
+    (sub ? "<small>" + sub + "</small>" : "") + "</div>";
+}
+
+function setCardsVisible(visible) {
+  var cards = document.querySelectorAll("#results .card");
+  for (var i = 0; i < cards.length; i++)
+    cards[i].style.display = visible ? "" : "none";
+}
+
+function hideSections() { setCardsVisible(false); }
+
+// ── 复制话术(内网 HTTP 非安全上下文时 clipboard API 不可用,execCommand 兜底)──
+function copyScript(btn) {
+  var text = document.getElementById("scriptText").textContent;
+  function flash(label) {
+    btn.textContent = label;
+    setTimeout(function () { btn.textContent = "复制话术"; }, 1600);
+  }
+  function legacyCopy() {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var okFlag = false;
+    try { okFlag = document.execCommand("copy"); } catch (e) { /* 忽略 */ }
+    document.body.removeChild(ta);
+    return okFlag;
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text)
+      .then(function () { flash("已复制 ✓"); })
+      .catch(function () { flash(legacyCopy() ? "已复制 ✓" : "复制失败,请手动选择"); });
+  } else {
+    flash(legacyCopy() ? "已复制 ✓" : "复制失败,请手动选择");
+  }
+}
+
+// Ctrl+Enter 快捷提交
+document.getElementById("question").addEventListener("keydown", function (e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") doQuery();
+});
+</script>
+</body>
+</html>

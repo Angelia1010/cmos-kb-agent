@@ -128,6 +128,51 @@ class SourceRef:
     stale: bool = False              # 知识版本过旧提示
 
 
+# 坐席视角的话术可用性三态(前端据此渲染绿/黄/红横幅)
+USABILITY_DIRECT = "directly_usable"    # 可直接使用
+USABILITY_VERIFY = "verify_first"       # 核实后使用
+USABILITY_NOT = "not_usable"            # 不可用,转人工
+
+_USABILITY_SEVERITY = {USABILITY_DIRECT: 0, USABILITY_VERIFY: 1, USABILITY_NOT: 2}
+
+
+@dataclass
+class Usability:
+    """话术可用性判定 — LLM 生成时自评 + 确定性规则纠偏(规则只收紧、不放宽)。"""
+    level: str = USABILITY_VERIFY
+    reasons: List[str] = field(default_factory=list)      # 判定依据(给坐席看)
+    uncovered: List[str] = field(default_factory=list)    # 问题中知识未覆盖的方面
+
+    def tighten(self, level: str, reason: str = "") -> None:
+        """规则纠偏:仅当 level 比当前更严格时收紧,并追加依据。"""
+        if _USABILITY_SEVERITY.get(level, 2) > _USABILITY_SEVERITY.get(self.level, 1):
+            self.level = level
+        if reason and reason not in self.reasons:
+            self.reasons.append(reason)
+
+
+# ---------------------------------------------------------------------------
+# 文档内证据片段定位(对每篇输入文档,摘出能回答问题的原文逐字片段)
+# ---------------------------------------------------------------------------
+@dataclass
+class LocatedFragment:
+    """文档内一段能回答用户问题的原文片段(逐字、可溯源)。"""
+    text: str                        # 原文逐字片段(== 所属文档 content[start:end])
+    start: int = -1                  # 在文档 content 中的起始偏移;-1 表示未精确定位
+    end: int = -1                    # 结束偏移(不含)
+    reason: str = ""                 # 该片段为何能回答问题(模型简述)
+
+
+@dataclass
+class DocFragments:
+    """单篇文档的片段定位结果。"""
+    chunk_id: str
+    doc_id: str
+    doc_title: str
+    answerable: bool                                       # 该文档能否回答用户问题
+    fragments: List[LocatedFragment] = field(default_factory=list)
+
+
 @dataclass
 class FinalAnswer:
     trace_id: str
@@ -139,6 +184,14 @@ class FinalAnswer:
     degraded: bool = False           # 是否降级结果
     from_cache: bool = False
     elapsed_ms: int = 0
+    # ---- 坐席向内容组织(内容重组;老字段保留,灵犀老调用方不受影响) ----
+    direct_conclusion: str = ""      # 一句话直接结论(能不能/多少钱/怎么办)
+    key_elements: Dict[str, str] = field(default_factory=dict)   # 办理要素(渠道/材料/条件/时限/资费...)
+    script: str = ""                 # 可直接念给用户的口语化话术
+    caveats: List[str] = field(default_factory=list)             # 答复注意事项
+    usability: Usability = field(default_factory=Usability)      # 可用性判定
+    # ---- 文档内证据片段定位(每篇输入文档一项;新增能力,不影响以上字段) ----
+    matched_fragments: List[DocFragments] = field(default_factory=list)
 
     def render(self) -> str:
         """渲染为坐席可读文本。"""

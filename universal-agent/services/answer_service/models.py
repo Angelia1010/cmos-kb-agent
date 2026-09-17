@@ -66,6 +66,24 @@ class SourceItem(BaseModel):
     stale: bool = Field(description="是否疑似过旧(超溯源天数或日期非法)")
 
 
+class LocatedFragmentItem(BaseModel):
+    """文档内一段能回答问题的原文逐字片段(可溯源)。"""
+    text: str = Field(description="原文逐字片段(等于所属文档 content[start:end])")
+    start: int = Field(description="在文档 content 中的起始偏移;-1 表示未精确定位")
+    end: int = Field(description="结束偏移(不含)")
+    reason: str = Field(description="该片段为何能回答问题")
+
+
+class DocFragmentsItem(BaseModel):
+    """单篇输入文档的证据片段定位结果。"""
+    chunkId: str = Field(description="知识片段ID")
+    docId: str = Field(description="所属文档ID")
+    docTitle: str = Field(description="文档标题")
+    answerable: bool = Field(description="该文档能否回答用户问题(以可验证原文片段为准)")
+    fragments: List[LocatedFragmentItem] = Field(
+        description="定位到的原文逐字片段;非原文/改写片段已被丢弃")
+
+
 class AnswerObject(BaseModel):
     """object 层 — 答案生成业务载荷。"""
     requestId: str = Field(description="回传请求ID")
@@ -78,6 +96,9 @@ class AnswerObject(BaseModel):
     renderedText: str = Field(description="完整答案文本(含知识来源),可直接展示")
     sentences: List[SentenceItem] = Field(description="保留的答案句子及锚定明细")
     sources: List[SourceItem] = Field(description="知识来源列表")
+    matchedFragments: List[DocFragmentsItem] = Field(
+        default_factory=list,
+        description="每篇输入文档的证据片段定位结果(原文逐字、可溯源)")
     trace: Optional[Dict[str, Any]] = Field(
         default=None, description="全链路 trace(badcase 回放);测试服务默认携带")
 
