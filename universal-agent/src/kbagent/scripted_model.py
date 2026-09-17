@@ -154,52 +154,35 @@ class ScriptedChatModel(BaseChatModel):
     def _scripted_answer(self, text: str) -> str:
         chunks = re.findall(r'<chunk id="(.+?)">(.+?)</chunk>', text, re.S)
         if not chunks:
-            return json.dumps({"business_explanation": "", "handling_suggestion": "",
-                               "sentences": [],
+            return json.dumps({"script": "", "handling_suggestion": "",
                                "usability": {"level": "not_usable",
                                              "reasons": ["无可用知识素材"],
                                              "uncovered": []}},
                               ensure_ascii=False)
-        expl, sentences = [], []
-        for cid, content in chunks[:3]:
+        expl = []
+        for _cid, content in chunks[:3]:
             content = self._clean_demo_text(content)
-            first = content.split("。")[0][:60] + "。"
-            expl.append(first)
-            sentences.append({"text": first, "citations": [cid],
-                              "hard_fact": any(w in first for w in
-                                               ("元", "资费", "条件", "生效"))})
-        sugg = "可为客户办理上述业务,办理前请与客户确认需求与资费。"
-        sentences.append({"text": sugg, "citations": [chunks[0][0]], "hard_fact": False})
-        # 坐席向结构化内容(离线演示用,规则化拼装)
-        conclusion = expl[0] if expl else ""
+            expl.append(content.split("。")[0][:60] + "。")
+        sugg = "办理前请与客户确认需求与资费,离线演示话术,生产以真实模型输出为准。"
         script = "您好," + "".join(expl) + sugg
-        elements = {}
-        joined = " ".join(expl)
-        if "元" in joined:
-            elements["资费"] = next((e for e in expl if "元" in e), "")
-        if any(w in joined for w in ("APP", "渠道", "营业厅")):
-            elements["渠道"] = next((e for e in expl
-                                     if any(w in e for w in ("APP", "渠道", "营业厅"))), "")
-        if "条件" in joined:
-            elements["条件"] = next((e for e in expl if "条件" in e), "")
-        return json.dumps({"business_explanation": " ".join(expl),
-                           "handling_suggestion": sugg, "sentences": sentences,
-                           "direct_conclusion": conclusion,
-                           "key_elements": elements,
-                           "script": script,
-                           "caveats": ["离线演示话术,生产以真实模型输出为准"],
+        return json.dumps({"script": script,
+                           "handling_suggestion": sugg,
                            "usability": {"level": "verify_first",
                                          "reasons": ["离线脚本模型生成,仅演示"],
                                          "uncovered": []}},
                           ensure_ascii=False)
 
-    # ---- 锚定校验脚本 ----
+    # ---- 批量话术一致性校验脚本 ----
     def _scripted_anchor(self, text: str) -> str:
-        sent = text.split("句子:")[-1].split("\n")[0]
-        chunk = text.split("片段:")[-1]
-        overlap = sum(1 for ch in set(sent) if ch in chunk and not ch.isspace())
-        consistent = overlap >= max(3, int(len(set(sent)) * 0.3))
-        return json.dumps({"consistent": consistent}, ensure_ascii=False)
+        """离线模拟批量校验:话术与素材字符重叠度过低则判不一致。"""
+        script = text.split("坐席话术:")[-1].split("\n")[0]
+        material = text.split("知识片段:")[-1]
+        schars = {ch for ch in script if not ch.isspace()}
+        overlap = sum(1 for ch in schars if ch in material)
+        consistent = overlap >= max(3, int(len(schars) * 0.5))
+        issues = [] if consistent else ["话术含素材中未出现的表述(离线脚本判定)"]
+        return json.dumps({"consistent": consistent, "issues": issues},
+                          ensure_ascii=False)
 
     # ---- 文档内证据片段定位脚本 ----
     def _scripted_locate(self, text: str) -> str:
@@ -209,24 +192,30 @@ class ScriptedChatModel(BaseChatModel):
         """
         m = re.search(r"用户问题[:：]\s*(.*?)\s*文档内容[:：]\s*(.*)$", text, re.S)
         if not m:
-            return json.dumps({"answerable": False, "fragments": []},
+            return json.dumps({"answerable": False, "relevance": 0, "fragments": []},
                               ensure_ascii=False)
         query, content = m.group(1), m.group(2)
         qchars = {c for c in query if not c.isspace()}
         if not qchars or not content.strip():
-            return json.dumps({"answerable": False, "fragments": []},
+            return json.dumps({"answerable": False, "relevance": 0, "fragments": []},
                               ensure_ascii=False)
         sentences = [s.strip() for s in
                      re.split(r"(?<=[。;!?；！?\n])", content) if s.strip()]
         threshold = max(2, int(len(qchars) * 0.3))
-        fragments = []
+        fragments, best = [], 0.0
         for s in sentences:
             schars = {c for c in s if not c.isspace()}
-            if len(qchars & schars) >= threshold:
+            hit = len(qchars & schars)
+            if hit >= threshold:
                 fragments.append({"text": s, "reason": "离线脚本:与问题字符重叠"})
+                best = max(best, hit / len(qchars))
             if len(fragments) >= 3:
                 break
-        return json.dumps({"answerable": bool(fragments), "fragments": fragments},
+        # 相关度:命中覆盖率映射到 40-95(有片段);无片段给 0
+        relevance = int(round(40 + best * 55)) if fragments else 0
+        return json.dumps({"answerable": bool(fragments),
+                           "relevance": min(95, relevance),
+                           "fragments": fragments},
                           ensure_ascii=False)
 
     # ---- 知识候选重排脚本 ----

@@ -3,7 +3,7 @@
 
 与 kbagent_service 的区别:
     - 不做检索/处理:请求直接携带 query + chunks(检索/处理阶段的输出)
-    - 只运行 kbagent.answer:select_fragments 精选 → LLM 组织答案 → 逐句锚定校验
+    - 只运行 kbagent.answer:片段定位+精选 → LLM 组织话术 → 批量一致性校验
     - 模型固定走真实网关:按 config.yaml 的 models[].use 解析
       (生产路径: kbagent.shared.lingxi_provider:LingxiSSLChatOpenAI),
       配置缺失/解析失败时**启动即报错**,不静默回退离线 ScriptedChatModel,
@@ -51,16 +51,14 @@ from .models import (
     AnswerParams,
     AnswerRequest,
     AnswerResponse,
-    DocFragmentsItem,
-    LocatedFragmentItem,
-    SentenceItem,
     SourceItem,
+    UsabilityInfo,
     error_body,
 )
 
 logger = logging.getLogger("answer_service")
 
-# 端到端超时(秒):答案生成 1 次 + 每句锚定校验各 1 次真实大模型调用,
+# 端到端超时(秒):每篇文档片段定位 + 答案生成 + 批量一致性校验各 1 次真实大模型调用,
 # 内网网关单次调用可达分钟级,故默认给足 300s
 DEFAULT_TIMEOUT_S = 300.0
 # appId 白名单环境变量:逗号分隔;为空则全部放行
@@ -249,11 +247,10 @@ def _register_routes(app: FastAPI, base: str) -> None:
 
         ans.elapsed_ms = tracer.elapsed_ms()
         tracer.log("finalize", "done", elapsed_ms=ans.elapsed_ms,
-                   sentence_count=len(ans.sentences),
                    source_count=len(ans.sources))
-        logger.info("requestId=%s traceId=%s elapsedMs=%s sentences=%d sources=%d",
+        logger.info("requestId=%s traceId=%s elapsedMs=%s sources=%d",
                     p.requestId, ans.trace_id, ans.elapsed_ms,
-                    len(ans.sentences), len(ans.sources))
+                    len(ans.sources))
         return AnswerResponse(rtnCode=RTN_OK, rtnMsg="success",
                               object=_to_object(ans, p, arrived, tracer))
 
@@ -276,31 +273,17 @@ def _to_object(ans: Any, p: AnswerParams, arrived: str,
         traceId=ans.trace_id,
         requestArrivedTime=arrived,
         elapsedMs=ans.elapsed_ms,
-        businessExplanation=ans.business_explanation or "",
+        script=ans.script,
         handlingSuggestion=ans.handling_suggestion or "",
-        renderedText=ans.render(),
-        sentences=[
-            SentenceItem(text=s.text, citations=s.citations,
-                         hardFact=s.hard_fact, anchored=s.anchored,
-                         note=s.note)
-            for s in ans.sentences
-        ],
+        usability=UsabilityInfo(level=ans.usability.level,
+                                reasons=ans.usability.reasons,
+                                uncovered=ans.usability.uncovered),
         sources=[
-            SourceItem(chunkId=s.chunk_id, docTitle=s.doc_title,
-                       snippet=s.snippet, updatedAt=s.updated_at,
+            SourceItem(chunkId=s.chunk_id, docId=s.doc_id, docTitle=s.doc_title,
+                       relevance=s.relevance, keyFragment=s.key_fragment,
+                       content=s.content, updatedAt=s.updated_at,
                        stale=s.stale)
             for s in ans.sources
-        ],
-        matchedFragments=[
-            DocFragmentsItem(
-                chunkId=d.chunk_id, docId=d.doc_id, docTitle=d.doc_title,
-                answerable=d.answerable,
-                fragments=[
-                    LocatedFragmentItem(text=f.text, start=f.start,
-                                        end=f.end, reason=f.reason)
-                    for f in d.fragments
-                ])
-            for d in ans.matched_fragments
         ],
         trace=json.loads(tracer.export()),
     )

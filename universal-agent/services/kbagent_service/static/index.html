@@ -31,10 +31,28 @@
     background: var(--bg); color: var(--text);
     min-height: 100vh; padding: 24px 16px 48px;
   }
-  .container { max-width: 920px; margin: 0 auto; }
+  .container { max-width: 1360px; margin: 0 auto; }
   header { text-align: center; margin-bottom: 24px; }
   header h1 { font-size: 22px; font-weight: 600; }
   header p { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+  /* ── 两栏布局:主区(检索内容) + 右侧栏(检索框/检索链路/时间线,附属信息) ── */
+  .layout { display: flex; gap: 16px; align-items: flex-start; }
+  .main-col { flex: 1; min-width: 0; }
+  .side-col {
+    width: 400px; flex: none;
+    position: sticky; top: 16px;
+    max-height: calc(100vh - 40px); overflow-y: auto;
+  }
+  .side-col .card { padding: 16px; }
+  /* 侧栏较窄:chips 允许换行,避免关键信息被省略号截断 */
+  .side-col .chip { white-space: normal; }
+  .empty-state { text-align: center; color: var(--muted); padding: 56px 24px; line-height: 1.9; font-size: 13px; }
+  .empty-state b { display: block; font-size: 15px; color: var(--text); margin-bottom: 8px; }
+  @media (max-width: 1100px) {
+    .layout { flex-direction: column-reverse; }   /* 窄屏:检索框在上、结果在下 */
+    .side-col { width: 100%; position: static; max-height: none; }
+  }
 
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -115,22 +133,6 @@
     border-radius: 5px; cursor: pointer;
   }
   .copy-btn:hover { background: var(--primary); color: #fff; }
-  .caveats {
-    margin-bottom: 12px; padding: 10px 14px; font-size: 13px;
-    background: var(--warn-bg); border-radius: 6px; color: var(--warn-text);
-  }
-  .caveats ul { margin: 4px 0 0 18px; }
-
-  table.elements { width: 100%; border-collapse: collapse; font-size: 14px; }
-  table.elements th, table.elements td {
-    text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border);
-    vertical-align: top; line-height: 1.6;
-  }
-  table.elements th {
-    width: 90px; color: var(--muted); font-weight: 500;
-    background: #f8fafc; white-space: nowrap;
-  }
-  table.elements tr:last-child th, table.elements tr:last-child td { border-bottom: none; }
 
   .answer-block { margin-bottom: 14px; }
   .answer-block h3 { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
@@ -182,6 +184,13 @@
   }
   .badge.used { background: var(--ok-bg); border: 1px solid var(--ok-border); color: var(--ok-text); }
   .badge.unused { background: #f1f5f9; border: 1px solid var(--border); color: var(--muted); }
+  .rel-badge {
+    font-size: 11px; font-weight: 700; padding: 2px 10px; border-radius: 10px;
+    white-space: nowrap; border: 1px solid transparent;
+  }
+  .rel-high { background: var(--ok-bg); border-color: var(--ok-border); color: var(--ok-text); }
+  .rel-mid  { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+  .rel-low  { background: #f1f5f9; border-color: var(--border); color: var(--muted); }
   .doc-body { padding: 4px 16px 14px; }
 
   .chunk { padding-top: 12px; }
@@ -237,6 +246,58 @@
   .legend mark.q { background: #dbeafe; border-bottom-color: #60a5fa; }
   .source-chunk { margin-top: 8px; font-size: 11px; color: #94a3b8; font-family: Consolas, monospace; }
 
+  /* ── 检索链路 · 核心流程(阶段流程图,数据来自全链路 trace) ── */
+  .pipeline { position: relative; margin-top: 6px; }
+  .pipe-stage { display: flex; gap: 12px; position: relative; padding-bottom: 18px; }
+  .pipe-stage:last-child { padding-bottom: 2px; }
+  .pipe-stage::before {
+    content: ""; position: absolute; left: 13px; top: 30px; bottom: 0;
+    width: 2px; background: var(--border);
+  }
+  .pipe-stage:last-child::before { display: none; }
+  .pipe-node {
+    flex: none; width: 28px; height: 28px; border-radius: 50%;
+    color: #fff; font-size: 13px; font-weight: 700; z-index: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pipe-main { flex: 1; min-width: 0; }
+  .pipe-name { font-size: 14px; font-weight: 600; line-height: 28px; }
+  .pipe-state { font-size: 11px; font-weight: 500; margin-left: 8px; }
+  .pipe-desc { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: 2px; }
+  .pipe-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    font-size: 11px; padding: 3px 10px; border-radius: 12px;
+    background: #f1f5f9; border: 1px solid var(--border); color: #334155;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chip b { font-weight: 700; }
+  .chip.ok   { background: var(--ok-bg);   border-color: #a7f3d0; color: var(--ok-text); }
+  .chip.warn { background: var(--warn-bg); border-color: #fde68a; color: var(--warn-text); }
+  .chip.bad  { background: var(--bad-bg);  border-color: #fecaca; color: var(--bad-text); }
+  .chip.info { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
+  .pipe-stage.skipped .pipe-node { background: #cbd5e1 !important; }
+  .pipe-stage.skipped .pipe-name,
+  .pipe-stage.skipped .pipe-desc { color: #94a3b8; }
+  /* 流式检索时"当前进行到的阶段":节点脉冲呼吸 */
+  .pipe-stage.running .pipe-node { animation: pipe-pulse 1.1s ease-in-out infinite; }
+  @keyframes pipe-pulse {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(37, 99, 235, .35); }
+    50%      { box-shadow: 0 0 0 9px rgba(37, 99, 235, .08); }
+  }
+  .pipe-state.run { color: var(--primary); font-weight: 600; }
+  details.pipe-detail { margin-top: 8px; }
+  details.pipe-detail summary { font-size: 12px; color: var(--primary); cursor: pointer; user-select: none; }
+  .pipe-detail-body {
+    margin-top: 6px; background: #f8fafc; border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 12px; font-size: 12px; line-height: 1.8;
+    color: #334155; max-height: 280px; overflow-y: auto;
+  }
+  .pipe-detail-body .row-line { border-bottom: 1px dashed var(--border); padding: 3px 0; word-break: break-all; }
+  .pipe-detail-body .row-line:last-child { border-bottom: none; }
+  .pipe-detail-body .sub-title { font-weight: 600; color: var(--muted); margin-top: 6px; }
+  .anchor-ok { color: var(--ok-text); font-weight: 600; }
+  .anchor-bad { color: var(--bad-text); font-weight: 600; }
+
   /* ── Agent 执行过程时间线 ── */
   .trace-timeline { padding: 2px 0; }
   .trace-event {
@@ -291,103 +352,100 @@
     <p>kbagent-service · 输入用户问题与归属地,查看检索话术与知识溯源</p>
   </header>
 
-  <!-- 输入区 -->
-  <div class="card">
-    <h2>查询条件</h2>
-    <label for="question">用户问题 *</label>
-    <textarea id="question" placeholder="例如:异地能不能补办手机卡?需要什么材料?"></textarea>
-    <div class="row">
-      <div>
-        <label for="province">用户省份 *</label>
-        <select id="province"></select>
+  <div class="layout">
+    <!-- 主区:检索内容(重要信息靠前:概览 → 结论 → 话术 → 要素 → 溯源) -->
+    <div class="main-col">
+      <div class="card empty-state" id="welcomeCard">
+        <b>知识库检索演示</b>
+        在右侧输入用户问题与归属地,点击「查 询」开始检索。<br>
+        检索过程中,右侧「检索链路」面板会实时展示当前进行到哪一步。
       </div>
-      <div>
-        <label for="city">用户地市</label>
-        <input type="text" id="city" placeholder="例如:福州(选填)">
+      <div class="card" id="searchingCard" style="display:none">
+        <div class="empty-tip">检索中,链路实时进度见右侧「检索链路 · 核心流程」面板…</div>
       </div>
-    </div>
-    <div class="actions">
-      <button id="submitBtn" onclick="doQuery()">查 询</button>
-      <span class="loading" id="loading"><span class="spinner"></span>检索中,请耐心等待(最长约 2 分钟)...</span>
-    </div>
-  </div>
 
-  <!-- 结果区(重要信息靠前:概览 → 结论 → 话术 → 要素 → 溯源) -->
-  <div id="results">
+      <!-- 结果区 -->
+      <div id="results">
     <div id="bannerBox"></div>
     <div id="uncoveredBox"></div>
 
     <div class="card" id="statsCard">
       <div class="stats">
-        <div class="stat"><b id="statDocs">-</b><span>检索到文档</span></div>
-        <div class="stat"><b id="statChunks">-</b><span>引用片段</span></div>
-        <div class="stat"><b id="statUsed" class="accent">-</b><span>片段直接支撑答案</span></div>
+        <div class="stat"><b id="statDocs">-</b><span>引用文档</span></div>
+        <div class="stat"><b id="statTopRel" class="accent">-</b><span>最高相关度</span></div>
         <div class="stat"><b id="statElapsed">-</b><span>端到端耗时</span></div>
       </div>
     </div>
 
-    <div class="card" id="conclusionCard">
-      <h2>一句话结论</h2>
-      <div class="conclusion" id="directConclusion"></div>
-    </div>
-
     <div class="card" id="scriptCard">
-      <h2>坐席话术(可直接念给用户)
+      <h2>坐席应答
         <button class="copy-btn" id="copyScriptBtn" onclick="copyScript(this)">复制话术</button>
       </h2>
-      <div class="caveats" id="caveatsBox" style="display:none"></div>
       <div class="script-text" id="scriptText"></div>
-    </div>
-
-    <div class="card" id="elementsCard">
-      <h2>办理要素</h2>
-      <table class="elements" id="keyElements"></table>
+      <div class="answer-block" id="suggBox" style="display:none">
+        <h3>办理建议</h3>
+        <div class="content" id="handlingSuggestion"></div>
+      </div>
     </div>
 
     <div class="card" id="sourcesCard">
-      <h2>知识来源 <span class="hint" id="sourceCount"></span></h2>
+      <h2>引用文档 <span class="hint" id="sourceCount"></span></h2>
       <div class="legend">
-        <span>每篇文档将 <b>⭐ 最能回答问题的片段</b> 置顶,点击「查看整篇文档」可展开全文对照。</span>
-        <mark>黄色</mark><span>= 被答案 / 话术直接引用</span>
+        <span>文档按 <b>相关度降序</b> 排列(最相关 = 100%),每篇将 <b>⭐ 最能回答问题的关键片段</b> 置顶,点击「查看整篇文档」可展开全文对照。</span>
+        <mark>黄色</mark><span>= 被话术直接引用</span>
         <mark class="q">蓝色</mark><span>= 命中用户问题关键词</span>
       </div>
       <div id="sourceList"></div>
     </div>
 
-    <div class="card" id="traceCard">
-      <details id="traceDetails" open>
-        <summary style="font-size:15px;font-weight:600;color:var(--text);">
-          Agent 检索处理过程 <span class="hint" id="traceCount"></span>
-        </summary>
-        <div class="legend" style="margin:10px 0 6px;">
-          <span>智能体内部执行时间线:主流程 → 缓存判定 → 检索 → 知识处理 → 答案生成/锚定校验;点击事件可展开完整 payload</span>
-        </div>
-        <div class="trace-timeline" id="traceTimeline"></div>
-      </details>
-    </div>
-
-    <div class="card">
-      <details>
-        <summary>业务说明 / 办理建议 / 完整答案文本(兼容视图)</summary>
-        <div class="answer-block" style="margin-top:12px">
-          <h3>业务说明</h3>
-          <div class="content" id="bizExplanation"></div>
-        </div>
-        <div class="answer-block">
-          <h3>办理建议</h3>
-          <div class="content" id="handlingSuggestion"></div>
-        </div>
-        <div class="answer-block">
-          <h3>完整答案文本</h3>
-          <div class="content" id="renderedText"></div>
-        </div>
-      </details>
-    </div>
-
     <div class="card">
       <div class="meta" id="metaInfo"></div>
     </div>
-  </div>
+      </div><!-- /#results -->
+    </div><!-- /.main-col -->
+
+    <!-- 右侧栏(附属信息):检索框 + 检索链路实时进度 + 原始事件时间线 -->
+    <aside class="side-col">
+      <div class="card">
+        <h2>查询条件</h2>
+        <label for="question">用户问题 *</label>
+        <textarea id="question" placeholder="例如:异地能不能补办手机卡?需要什么材料?"></textarea>
+        <div class="row">
+          <div>
+            <label for="province">用户省份 *</label>
+            <select id="province"></select>
+          </div>
+          <div>
+            <label for="city">用户地市</label>
+            <input type="text" id="city" placeholder="例如:福州(选填)">
+          </div>
+        </div>
+        <div class="actions">
+          <button id="submitBtn" onclick="doQuery()">查 询</button>
+          <span class="loading" id="loading"><span class="spinner"></span><span id="loadingText">检索中,请耐心等待(最长约 2 分钟)...</span></span>
+        </div>
+      </div>
+
+      <div class="card" id="pipelineCard" style="display:none">
+        <h2>检索链路 · 核心流程
+          <span class="hint">(本次是怎么检索的 — 数据来自全链路 trace,执行时实时点亮)</span>
+        </h2>
+        <div class="pipeline" id="pipelineFlow"></div>
+      </div>
+
+      <div class="card" id="traceCard" style="display:none">
+        <details id="traceDetails" open>
+          <summary style="font-size:15px;font-weight:600;color:var(--text);">
+            Agent 检索处理过程 <span class="hint" id="traceCount"></span>
+          </summary>
+          <div class="legend" style="margin:10px 0 6px;">
+            <span>智能体内部执行时间线:主流程 → 缓存判定 → 检索 → 知识处理 → 答案生成/锚定校验;点击事件可展开完整 payload</span>
+          </div>
+          <div class="trace-timeline" id="traceTimeline"></div>
+        </details>
+      </div>
+    </aside>
+  </div><!-- /.layout -->
 </div>
 
 <script>
@@ -409,6 +467,8 @@ var MAX_KF_CHARS = 280;
 
 // 最近一次查询的用户问题(渲染时用于关键词命中分析)
 var lastQuestion = "";
+// 最近一次查询选择的省份编码(流式渲染链路图时 trace 尚未带 region 用)
+var lastRegion = "";
 
 var PROVINCES = [
   "000(全国)", "北京", "天津", "河北", "山西", "内蒙古",
@@ -449,41 +509,45 @@ function uid(prefix) {
     .catch(function () { /* 保持默认 */ });
 })();
 
-// ── 查询 ──────────────────────────────────────────────────────────────
-function doQuery() {
-  var question = document.getElementById("question").value.trim();
-  var province = document.getElementById("province").value;
-  var city = document.getElementById("city").value.trim();
+// ── 查询(流式:链路图实时点亮,最终帧到达后渲染完整结果) ─────────────
+var liveEvents = [];   // 流式期间已收到的 trace 事件(与后端帧同构)
+var gotFinal = false;  // 是否已收到 {"type":"final"} 结果帧
 
-  if (!question) {
-    showBanner("err", "请输入用户问题");
-    hideSections();
-    return;
+function resetLoadingText() {
+  var el = document.getElementById("loadingText");
+  if (el) el.textContent = "检索中,请耐心等待(最长约 2 分钟)...";
+}
+
+// 加载文案跟随流式进度:当前进行到哪个阶段
+function setLoadingStage(stage) {
+  var el = document.getElementById("loadingText");
+  if (!el) return;
+  var norm = String(stage || "")
+    .replace(/^retrieval\..*/, "retrieval")
+    .replace(/^processing\..*/, "processing");
+  var meta = STAGE_META[norm];
+  el.textContent = meta
+    ? "检索中 · 当前进行到:" + meta.label + "(最长约 2 分钟)..."
+    : "检索中,请耐心等待(最长约 2 分钟)...";
+}
+
+function handleStreamMsg(msg) {
+  if (!msg) return;
+  if (msg.type === "trace") {
+    liveEvents.push({ ts_ms: msg.ts_ms, stage: msg.stage,
+                      event: msg.event, payload: msg.payload });
+    renderPipeline(liveEvents, null, { live: true });
+    renderTrace(liveEvents);
+    setLoadingStage(msg.stage);
+  } else if (msg.type === "final") {
+    gotFinal = true;
+    render(msg.response);
   }
-  lastQuestion = question;   // 渲染时据此定位"最能回答问题的片段"
+}
 
-  var btn = document.getElementById("submitBtn");
-  btn.disabled = true;
-  document.getElementById("loading").classList.add("show");
-  document.getElementById("results").style.display = "none";
-
-  var body = {
-    params: {
-      appId: "kb-frontend-demo",
-      requestId: uid("req"),
-      sessionId: uid("sess"),
-      userInfo: {
-        phone: "frontend-demo",       // 契约必填,演示页固定占位
-        province: province,
-        location: city || null        // 地市透传
-      },
-      extInfo: {},
-      conversations: [{ role: 1, content: question }]
-    }
-  };
-
-  var startAt = Date.now();
-  fetch(basePath + "/retrieve", {
+// 普通(非流式)/retrieve 请求:老后端兜底通道
+function plainRetrieve(body, startAt) {
+  return fetch(basePath + "/retrieve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
@@ -500,41 +564,141 @@ function doQuery() {
       }
       return resp.json();
     })
-    .then(render)
+    .then(render);
+}
+
+// 流式 /retrieve/stream:SSE 帧 {"type":"trace",...}* + {"type":"final",...}
+function streamRetrieve(body, btn, startAt) {
+  return fetch(basePath + "/retrieve/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  })
+    .then(function (resp) {
+      var ct = (resp.headers.get && resp.headers.get("Content-Type")) || "";
+      if (!resp.ok || ct.indexOf("event-stream") < 0 ||
+          !resp.body || !resp.body.getReader) {
+        // 非 SSE:老服务把 JSON 信封直接返回,或网关报错
+        return resp.text().then(function (t) {
+          if (resp.ok && ct.indexOf("json") >= 0) {
+            gotFinal = true;
+            render(JSON.parse(t));
+            return;
+          }
+          var waited = ((Date.now() - startAt) / 1000).toFixed(1);
+          throw new Error("HTTP " + resp.status +
+                          "(等待 " + waited + "s) 响应体: " +
+                          (t || "(空)").slice(0, 300));
+        });
+      }
+      var reader = resp.body.getReader();
+      var decoder = new TextDecoder("utf-8");
+      var buf = "";
+      function pump() {
+        return reader.read().then(function (r) {
+          if (r.done) return;
+          buf += decoder.decode(r.value, { stream: true });
+          var frames = buf.split("\n\n");   // SSE 帧以空行分隔
+          buf = frames.pop();               // 末尾可能是不完整帧,留到下轮
+          frames.forEach(function (f) {
+            f.split("\n").forEach(function (line) {
+              if (line.indexOf("data:") !== 0) return;
+              var msg = null;
+              try { msg = JSON.parse(line.slice(5).trim()); }
+              catch (e) { return; }         // 坏帧跳过,不中断流
+              handleStreamMsg(msg);
+            });
+          });
+          return pump();
+        });
+      }
+      return pump();
+    })
     .catch(function (e) {
-      showBanner("err", "请求失败:" + esc(e.message),
-                 "请确认服务已启动、网络可达;检索端到端超时为 120 秒。");
-      hideSections();
+      if (gotFinal) return;                 // 结果已渲染,仅是流关闭异常
+      // 流式通道不可用(未部署/网关不支持/中途断开)→ 回退普通接口
+      return plainRetrieve(body, startAt).catch(function (e2) {
+        var detail = liveEvents.length
+          ? "已收到 " + liveEvents.length + " 条链路事件但未等到最终结果;" +
+            "回退普通接口也失败:" + esc(e2.message)
+          : "请确认服务已启动、网络可达;检索端到端超时为 120 秒。" +
+            (String(e.message).indexOf("HTTP 404") >= 0
+              ? "(流式接口 404,普通接口亦不可用)" : "");
+        showBanner("err", "请求失败:" + esc(e2.message || e.message), detail);
+        hideSections();
+      });
     })
     .finally(function () {
       btn.disabled = false;
       document.getElementById("loading").classList.remove("show");
+      resetLoadingText();
     });
+}
+
+function doQuery() {
+  var question = document.getElementById("question").value.trim();
+  var province = document.getElementById("province").value;
+  var city = document.getElementById("city").value.trim();
+
+  if (!question) {
+    showBanner("err", "请输入用户问题");
+    hideSections();
+    return;
+  }
+  lastQuestion = question;   // 渲染时据此定位"最能回答问题的片段"
+  lastRegion = province;     // 链路图阶段①在 run.start 帧到达前先显示
+
+  var btn = document.getElementById("submitBtn");
+  btn.disabled = true;
+  document.getElementById("loading").classList.add("show");
+  resetLoadingText();
+
+  var body = {
+    params: {
+      appId: "kb-frontend-demo",
+      requestId: uid("req"),
+      sessionId: uid("sess"),
+      userInfo: {
+        phone: "frontend-demo",       // 契约必填,演示页固定占位
+        province: province,
+        location: city || null        // 地市透传
+      },
+      extInfo: {},
+      conversations: [{ role: 1, content: question }]
+    }
+  };
+
+  // 流式期间:主区显示"检索中"占位,检索内容等 final 帧到达后由 render()
+  // 一次性渲染;右侧栏链路图/时间线随 trace 帧实时点亮(自行管理显隐)
+  liveEvents = [];
+  gotFinal = false;
+  document.getElementById("welcomeCard").style.display = "none";
+  document.getElementById("searchingCard").style.display = "";
+  document.getElementById("results").style.display = "none";
+  setCardsVisible(false);
+  document.getElementById("bannerBox").innerHTML = "";
+  document.getElementById("uncoveredBox").innerHTML = "";
+  renderPipeline([], null, { live: true });
+  renderTrace(null);
+
+  return streamRetrieve(body, btn, Date.now());
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // 片段 ↔ 答案 比对(纯前端,无需后端改动)
 //
-// 思路:后端返回的 sources[].snippet 是整篇文档原文,没有"哪几句
-// 被引用/最能回答问题"的标注。这里把答案全文(directConclusion/
-// script/keyElements/...)拼成语料,对文档逐句求"最长公共子串"
-// (忽略标点/空白),达到阈值即认为该句被答案引用;再结合用户问题
-// 的关键词命中,由 pickKeyFragment() 从整篇文档中挑出"最能直接
+// 思路:后端 sources[].content 是整篇文档原文,并已给出 relevance(相关度)
+// 与 keyFragment(模型逐字定位的关键片段)。前端优先直接采用 keyFragment;
+// 缺失时兜底:把话术(script/handlingSuggestion)拼成语料,对文档逐句求
+// "最长公共子串"(忽略标点/空白),达到阈值即认为该句被话术引用;再结合
+// 用户问题的关键词命中,由 pickKeyFragment() 从整篇文档中挑出"最能直接
 // 回答用户问题"的连续片段置顶展示,整篇原文折叠在下方可展开对照。
 // ══════════════════════════════════════════════════════════════════════
 
-// 答案语料:所有会呈现给坐席的答案侧文本
+// 答案语料:所有会呈现给坐席的答案侧文本(话术 + 办理建议)
 function buildAnswerCorpus(obj) {
   var parts = [];
-  if (obj.directConclusion) parts.push(obj.directConclusion);
   if (obj.script) parts.push(obj.script);
-  if (obj.keyElements) {
-    Object.keys(obj.keyElements).forEach(function (k) {
-      if (obj.keyElements[k]) parts.push(String(obj.keyElements[k]));
-    });
-  }
-  if (obj.caveats && obj.caveats.length) parts.push(obj.caveats.join(" "));
-  if (obj.businessExplanation) parts.push(obj.businessExplanation);
   if (obj.handlingSuggestion) parts.push(obj.handlingSuggestion);
   return parts.join("\n");
 }
@@ -750,14 +914,14 @@ function analyzeSnippet(snippet, corpusText) {
   return { ranges: mergeRanges(ranges), quotes: dedupeQuotes(quotes) };
 }
 
-// 按 docTitle 分组;最能回答问题的文档排前面(重要信息靠前)
+// 按 docTitle 分组;后端相关度(relevance)最高的文档排前面(重要信息靠前)
 function groupByDoc(analyzed) {
   var order = [], map = {};
   analyzed.forEach(function (a) {
     var key = a.docTitle || "(无标题文档)";
     if (!map[key]) {
       map[key] = {
-        title: key, chunks: [], usedCount: 0, bestScore: 0,
+        title: key, chunks: [], usedCount: 0, bestScore: 0, bestRel: 0,
         updatedAt: a.updatedAt, stale: !!a.stale, _order: order.length
       };
       order.push(map[key]);
@@ -766,6 +930,7 @@ function groupByDoc(analyzed) {
     g.chunks.push(a);
     if (a.used) g.usedCount++;
     if ((a.kfScore || 0) > g.bestScore) g.bestScore = a.kfScore || 0;
+    if ((a.relevance || 0) > g.bestRel) g.bestRel = a.relevance || 0;
     if (a.updatedAt && (!g.updatedAt || a.updatedAt > g.updatedAt)) g.updatedAt = a.updatedAt;
     if (a.stale) g.stale = true;
   });
@@ -779,11 +944,20 @@ function groupByDoc(analyzed) {
     });
   });
   order.sort(function (x, y) {
+    if (y.bestRel !== x.bestRel) return y.bestRel - x.bestRel;   // 后端相关度优先
     if (y.usedCount !== x.usedCount) return y.usedCount - x.usedCount;
     if (y.bestScore !== x.bestScore) return y.bestScore - x.bestScore;
     return x._order - y._order;
   });
   return order;
+}
+
+// 相关度徽章:≥80 绿 / 40-79 黄 / <40 灰;0(未知)不渲染
+function relBadge(rel) {
+  rel = rel || 0;
+  if (rel <= 0) return "";
+  var cls = rel >= 80 ? "rel-high" : (rel >= 40 ? "rel-mid" : "rel-low");
+  return '<span class="rel-badge ' + cls + '">相关度 ' + rel + '%</span>';
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -854,8 +1028,349 @@ function renderTrace(events) {
   }).join("");
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// 检索链路 · 核心流程(object.processTrace → 阶段流程图)
+// 把全链路 trace 事件归纳成 6 个阶段:问题 → 缓存 → 检索召回 →
+// 知识处理 → 答案生成/锚定校验 → 完成/降级。每个阶段展示"怎么做的"
+// 静态说明 + 本次执行的实时数据 chips + 可展开明细(召回标题/得分、
+// 逐句锚定结果等);未执行的阶段灰显。
+// ══════════════════════════════════════════════════════════════════════
+
+var PIPE_STAGES = [
+  { key: "query", no: "1", color: "#64748b", name: "用户问题",
+    desc: "接收用户问题与归属地(省份/地市),问题归一化后进入链路" },
+  { key: "cache", no: "2", color: "#8b5cf6", name: "缓存快速通道",
+    desc: "查高频问题缓存:命中则直接返回已校验的缓存答案,不再走检索与生成" },
+  { key: "retrieval", no: "3", color: "#2563eb", name: "检索子智能体 · 混合召回",
+    desc: "生产一体化流水线:槽位提取 → 知识主索引召回 → 原子表拼接;混合检索模式:BM25 关键词 + 向量双路召回 → RRF 融合排序去重" },
+  { key: "processing", no: "4", color: "#d97706", name: "知识处理子智能体 · 固定流水线",
+    desc: "规范化 → 适用性过滤 → 结构化清洗(Markdown)→ 两阶段重排,从全部候选中精选 Top3 知识" },
+  { key: "answer", no: "5", color: "#059669", name: "答案子智能体 · 生成与锚定校验",
+    desc: "逐篇文档定位证据片段 → 素材精选 → LLM 组织坐席话术 → 逐句锚定校验(每句必须有原文依据,硬事实校验不过直接删除)" },
+  { key: "finalize", no: "6", color: "#0f766e", name: "完成 / 降级兜底",
+    desc: "正常完成:统计端到端耗时并返回;任一环节异常/超时:降级为原始问题单轮关键词召回,返回原文供人工核实" }
+];
+
+// 把 trace 事件流解析成阶段模型
+function buildPipelineModel(events) {
+  var m = {
+    query: "", region: "",
+    cache: "",                       // "hit" | "miss" | ""(未记录)
+    rounds: [],                      // 每轮召回:{round, channel, region, titles, scores, dsl}
+    retrievalFallback: "",           // 一体化流水线失败原因(触发关键词兜底)
+    retrievalDone: null,             // 检索完成输出条数
+    proc: {},                        // analyze / filter / build_markdown / rerank 的 payload
+    procSteps: [],                   // 已完成的编排步骤名
+    adapted: null,                   // Top3 适配输出条数
+    locate: [],                      // 逐篇证据片段定位结果(含相关度)
+    materials: null,                 // 答案素材 chunk_ids
+    consistency: null,               // 批量话术一致性校验结果 {consistent, issues}
+    finalizeMs: null,
+    degrade: null                    // {error, reason, hit_count}
+  };
+  (events || []).forEach(function (e) {
+    var st = e.stage || "", ev = e.event || "", p = e.payload || {};
+    var rm = st.match(/^retrieval\.round(\d+)$/);
+    if (st === "run" && ev === "start") {
+      m.query = p.query || ""; m.region = p.region_code || "";
+    } else if (st === "cache") {
+      m.cache = ev;
+    } else if (rm && ev === "recall") {
+      m.rounds.push({
+        round: rm[1],
+        channel: p.channel || (p.dsl ? "hybrid" : "intergrate_all"),
+        region: p.region_code || "",
+        titles: p.titles || [], scores: p.scores || [], dsl: p.dsl || null
+      });
+    } else if (st === "retrieval" && ev === "intergrate_all_fallback") {
+      m.retrievalFallback = p.reason || "";
+    } else if (st === "retrieval" && ev === "done") {
+      m.retrievalDone = p.count;
+    } else if (st === "processing.knowledge" || st === "processing") {
+      if (ev === "orchestrator_step") m.procSteps.push(p.step || "");
+      else if (ev === "processed_chunks_adapted") m.adapted = p.count;
+      else if (!m.proc[ev]) m.proc[ev] = p;
+    } else if (st === "answer" && ev === "locate_fragments") {
+      m.locate.push(p);
+    } else if (st === "answer" && ev === "materials") {
+      m.materials = p.chunk_ids || [];
+    } else if (st === "answer" && ev === "consistency_check") {
+      m.consistency = p;
+    } else if (st === "finalize" && ev === "done") {
+      m.finalizeMs = p.elapsed_ms;
+    } else if (st === "degrade") {
+      m.degrade = m.degrade || {};
+      if (ev === "triggered") m.degrade.error = p.error || "";
+      if (ev === "done") { m.degrade.reason = p.reason || ""; m.degrade.hit_count = p.hit_count; }
+    }
+  });
+  return m;
+}
+
+function chip(cls, html) { return '<span class="chip ' + cls + '">' + html + "</span>"; }
+
+function fmtScore(s) {
+  var n = Number(s);
+  return isFinite(n) ? (Math.abs(n) >= 100 ? n.toFixed(0) : n.toFixed(2)) : String(s);
+}
+
+// 单个阶段节点 HTML;opt = {state, note, chips[], detail}
+// state: done 已执行 | running ◐进行中(流式) | pending ○等待中 |
+//        skipped ○未执行 | bad ●降级兜底
+function pipeStageHtml(cfg, opt) {
+  var st = opt.state || "done";
+  var stateHtml;
+  if (st === "bad")
+    stateHtml = '<span class="pipe-state" style="color:var(--bad-text)">● 降级兜底</span>';
+  else if (st === "running")
+    stateHtml = '<span class="pipe-state run">◐ 进行中…</span>';
+  else if (st === "pending")
+    stateHtml = '<span class="pipe-state" style="color:#94a3b8">○ 等待中</span>';
+  else if (st === "skipped")
+    stateHtml = '<span class="pipe-state" style="color:#94a3b8">○ ' +
+                esc(opt.note || "未执行") + "</span>";
+  else
+    stateHtml = '<span class="pipe-state" style="color:var(--ok-text)">● 已执行</span>';
+  var dim = (st === "skipped" || st === "pending") ? " skipped" : "";
+  var detail = opt.detail
+    ? '<details class="pipe-detail"><summary>展开明细</summary>' +
+      '<div class="pipe-detail-body">' + opt.detail + "</div></details>"
+    : "";
+  return '<div class="pipe-stage' + dim + (st === "running" ? " running" : "") + '">' +
+    '<span class="pipe-node" style="background:' +
+      (st === "bad" ? "#dc2626" : cfg.color) + '">' + cfg.no + "</span>" +
+    '<div class="pipe-main">' +
+      '<div class="pipe-name">' + esc(cfg.name) + stateHtml + "</div>" +
+      '<div class="pipe-desc">' + esc(cfg.desc) + "</div>" +
+      (opt.chips && opt.chips.length
+        ? '<div class="pipe-chips">' + opt.chips.join("") + "</div>" : "") +
+      detail +
+    "</div>" +
+  "</div>";
+}
+
+var PIPE_ORDER = {};
+PIPE_STAGES.forEach(function (s, i) { PIPE_ORDER[s.key] = i; });
+
+// trace 事件 stage → 链路图阶段 key(retrieval.roundN → retrieval 等)
+function stageKeyOf(e) {
+  var st = (e && e.stage) || "";
+  if (st === "run") return "query";
+  if (st === "cache") return "cache";
+  if (st.indexOf("retrieval") === 0) return "retrieval";
+  if (st.indexOf("processing") === 0) return "processing";
+  if (st === "answer") return "answer";
+  if (st === "finalize" || st === "degrade") return "finalize";
+  return "";
+}
+
+// 流式模式下"当前进行到哪个阶段":取末条事件的 stage,并对"阶段完成类
+// 事件"前推一步(如 cache.miss 后实际已在检索),让进行中指示更贴近真实
+function computeLiveKey(events, m) {
+  if (!events || !events.length) return "query";
+  var k = stageKeyOf(events[events.length - 1]);
+  if (k === "cache" && m.cache === "miss") return "retrieval";
+  if (k === "cache" && m.cache === "hit") return "finalize";
+  if (k === "retrieval" && m.retrievalDone != null) return "processing";
+  if (k === "processing" && m.adapted != null) return "answer";
+  return k;
+}
+
+// 链路图渲染。opts={live:true} 为流式进行中:末条事件所在阶段显示
+// "◐ 进行中",其前阶段"● 已执行/○ 未执行",其后阶段"○ 等待中";
+// live=false(最终帧到达)退回完整静态视图。
+function renderPipeline(events, obj, opts) {
+  var live = !!(opts && opts.live);
+  var card = document.getElementById("pipelineCard");
+  if ((!events || !events.length) && !live) { card.style.display = "none"; return; }
+  card.style.display = "";
+  var m = buildPipelineModel(events || []);
+  var byKey = {};
+  PIPE_STAGES.forEach(function (s) { byKey[s.key] = s; });
+  var cacheHit = m.cache === "hit";
+  var degraded = !!m.degrade;
+  var liveKey = live ? computeLiveKey(events, m) : "";
+  var li = liveKey !== "" ? PIPE_ORDER[liveKey] : -1;
+  var skipNote = cacheHit ? "缓存命中,已跳过"
+               : (degraded ? "链路降级,未执行" : "未执行");
+  var content = {};   // key → {hasData, chips[], detail}
+
+  // ── ① 用户问题 ──
+  content.query = {
+    hasData: !!(m.query || lastQuestion),
+    chips: [
+      chip("info", "问题:<b>" + esc(m.query || lastQuestion || "(未知)") + "</b>"),
+      chip("info", "归属地:<b>" + esc(m.region || lastRegion || "000(全国)") + "</b>")
+    ],
+    detail: ""
+  };
+
+  // ── ② 缓存快速通道 ──
+  var cacheChips = [];
+  if (cacheHit) cacheChips.push(chip("ok", "✓ 命中高频缓存 → 直接返回缓存答案"));
+  else if (m.cache === "miss") cacheChips.push(chip("", "未命中 → 进入完整检索链路"));
+  content.cache = { hasData: !!m.cache, chips: cacheChips, detail: "" };
+
+  // ── ③ 检索子智能体 ──
+  var rChips = [], rDetail = "";
+  m.rounds.forEach(function (r) {
+    rChips.push(chip("info", "第 " + esc(r.round) + " 轮召回:" +
+      (r.channel === "intergrate_all"
+        ? "一体化流水线 intergrate_all"
+        : "混合召回(BM25 关键词 + 向量 + RRF 融合)")));
+    rChips.push(chip("", "召回候选 <b>" + r.titles.length + "</b> 条" +
+      (r.region ? " · 区域 " + esc(r.region) : "")));
+    rDetail += '<div class="sub-title">第 ' + esc(r.round) + " 轮 · 召回 " +
+      r.titles.length + ' 条(标题 / 得分):</div>';
+    rDetail += r.titles.slice(0, 10).map(function (t, i) {
+      return '<div class="row-line">' + (i + 1) + ". 《" + esc(t) + "》" +
+        (r.scores[i] != null ? " · 得分 " + esc(fmtScore(r.scores[i])) : "") + "</div>";
+    }).join("");
+    if (r.titles.length > 10)
+      rDetail += '<div class="row-line">… 其余 ' + (r.titles.length - 10) + " 条见原始事件</div>";
+    if (r.dsl)
+      rDetail += '<div class="sub-title">召回 DSL(第 ' + esc(r.round) + ' 轮):</div>' +
+        '<div class="row-line">' + esc(JSON.stringify(r.dsl)).slice(0, 500) + "</div>";
+  });
+  if (m.retrievalFallback)
+    rChips.push(chip("warn", "⚠ 一体化流水线失败 → 关键词召回兜底"));
+  if (m.retrievalDone != null)
+    rChips.push(chip("ok", "✓ 检索完成,输出 <b>" + esc(m.retrievalDone) + "</b> 条候选"));
+  if (m.retrievalFallback)
+    rDetail += '<div class="sub-title">兜底原因:</div><div class="row-line">' +
+      esc(m.retrievalFallback) + "</div>";
+  content.retrieval = {
+    hasData: m.rounds.length > 0 || m.retrievalDone != null ||
+             !!m.retrievalFallback,
+    chips: rChips, detail: rDetail
+  };
+
+  // ── ④ 知识处理子智能体 ──
+  var pChips = [], pDetail = "";
+  if (m.proc.analyze)
+    pChips.push(chip("", "① 规范化+分析 <b>" + esc(m.proc.analyze.candidate_count) +
+      "</b> 条候选" +
+      (m.proc.analyze.warning_count
+        ? '(告警 ' + esc(m.proc.analyze.warning_count) + " 条)" : "")));
+  if (m.proc.filter)
+    pChips.push(chip("", "② 适用性过滤 <b>" + esc(m.proc.filter.before) + " → " +
+      esc(m.proc.filter.after) + "</b> 条"));
+  if (m.proc.build_markdown)
+    pChips.push(chip("", "③ 结构化清洗 <b>" + esc(m.proc.build_markdown.before) + " → " +
+      esc(m.proc.build_markdown.after) + "</b> 条"));
+  if (m.proc.rerank) {
+    pChips.push(chip("", "④ 两阶段重排 <b>" + esc(m.proc.rerank.input_count) + " → Top" +
+      esc(m.proc.rerank.top_count) + "</b>"));
+    if (m.proc.rerank.degraded) pChips.push(chip("warn", "⚠ 重排降级(规则序兜底)"));
+  }
+  if (m.adapted != null)
+    pChips.push(chip("ok", "✓ 精选输出 <b>" + esc(m.adapted) + "</b> 条知识"));
+  if (m.procSteps.length)
+    pDetail += '<div class="sub-title">编排步骤(依序完成):</div>' +
+      m.procSteps.map(function (s, i) {
+        return '<div class="row-line">' + (i + 1) + ". " + esc(s) + "</div>"; }).join("");
+  content.processing = {
+    hasData: Object.keys(m.proc).length > 0 || m.procSteps.length > 0 ||
+             m.adapted != null,
+    chips: pChips, detail: pDetail
+  };
+
+  // ── ⑤ 答案子智能体 ──
+  var aChips = [], aDetail = "";
+  if (m.locate.length) {
+    var answerable = m.locate.filter(function (x) { return x.answerable; }).length;
+    var fragTotal = m.locate.reduce(function (s, x) {
+      return s + (x.fragment_count || 0); }, 0);
+    aChips.push(chip("info", "证据片段定位 + 相关度:<b>" + m.locate.length +
+      "</b> 篇文档(可回答 <b>" + answerable + "</b> 篇 · 定位片段 <b>" +
+      fragTotal + "</b> 段)"));
+    aDetail += '<div class="sub-title">逐篇定位结果(相关度为模型自评,归一化后展示):</div>' +
+      m.locate.map(function (x) {
+      return '<div class="row-line">' + (x.answerable ? "✓" : "✗") + " " +
+        esc(x.chunk_id) + " · 相关度 " + esc(x.relevance || 0) +
+        " · 定位片段 " + esc(x.fragment_count || 0) + " 段</div>";
+    }).join("");
+  }
+  if (m.materials != null)
+    aChips.push(chip("", "素材精选 <b>" + m.materials.length + "</b> 条"));
+  if (m.consistency) {
+    var cs = m.consistency;
+    if (cs.consistent) {
+      aChips.push(chip("ok", "✓ 话术一致性校验通过(与原文一致)"));
+    } else {
+      var n = cs.issue_count != null ? cs.issue_count : (cs.issues || []).length;
+      aChips.push(chip("warn", "⚠ 话术一致性校验:<b>" + n +
+        "</b> 处表述需核实(已收紧为核实后使用)"));
+    }
+    if (cs.issues && cs.issues.length) {
+      aDetail += '<div class="sub-title">待核实表述:</div>' + cs.issues.map(function (s) {
+        return '<div class="row-line"><span class="anchor-bad">⚠</span> ' +
+               esc(s) + "</div>";
+      }).join("");
+    }
+  }
+  content.answer = {
+    hasData: m.locate.length > 0 || m.materials != null || m.consistency != null,
+    chips: aChips, detail: aDetail
+  };
+
+  // ── ⑥ 完成 / 降级兜底 ──
+  var fChips = [];
+  if (degraded) {
+    fChips.push(chip("bad", "✗ 链路降级:" +
+      esc(m.degrade.reason || m.degrade.error || "未知原因")));
+    if (m.degrade.hit_count != null)
+      fChips.push(chip("warn", "兜底单轮关键词召回 <b>" + esc(m.degrade.hit_count) +
+        "</b> 条原始片段,请人工核实"));
+  } else if (m.finalizeMs != null) {
+    fChips.push(chip("ok", "✓ 检索问答完成 · 端到端耗时 <b>" +
+      (m.finalizeMs / 1000).toFixed(1) + " s</b>"));
+  } else if (cacheHit && !live) {
+    fChips.push(chip("ok", "✓ 缓存命中直接返回" +
+      (obj && obj.elapsedMs != null
+        ? " · 本次耗时 <b>" + (obj.elapsedMs / 1000).toFixed(1) + " s</b>" : "")));
+  }
+  content.finalize = {
+    hasData: degraded || m.finalizeMs != null || cacheHit,
+    chips: fChips, detail: ""
+  };
+
+  // ── 组装:按 live 进度解析每个阶段的状态 ──
+  var html = PIPE_STAGES.map(function (cfg) {
+    var c = content[cfg.key] || { hasData: false, chips: [], detail: "" };
+    var idx = PIPE_ORDER[cfg.key];
+    var state, note = "";
+    if (cfg.key === "finalize" && degraded) {
+      state = "bad";
+    } else if (!live) {
+      if (c.hasData) state = "done";
+      else {
+        state = "skipped";
+        note = cfg.key === "finalize" ? "未收到完成事件" : skipNote;
+      }
+    } else if (cacheHit && idx >= PIPE_ORDER.retrieval &&
+               idx <= PIPE_ORDER.answer) {
+      state = "skipped"; note = "缓存命中,已跳过";
+    } else if (idx === li) {
+      state = "running";
+    } else if (idx < li) {
+      if (c.hasData) state = "done";
+      else { state = "skipped"; note = degraded ? "链路降级,未执行" : "未执行"; }
+    } else {
+      state = c.hasData ? "done" : "pending";
+    }
+    return pipeStageHtml(cfg, { state: state, note: note,
+                                chips: c.chips, detail: c.detail });
+  }).join("");
+
+  document.getElementById("pipelineFlow").innerHTML = html;
+}
+
 // ── 渲染 ──────────────────────────────────────────────────────────────
 function render(data) {
+  // 主区切换到检索内容(final 帧到达,占位/欢迎卡退场)
+  document.getElementById("welcomeCard").style.display = "none";
+  document.getElementById("searchingCard").style.display = "none";
   document.getElementById("results").style.display = "block";
 
   // 错误信封:rtnCode 非 0
@@ -865,6 +1380,8 @@ function render(data) {
     showBanner("err", "服务返回错误(rtnCode=" + esc(code) + "):" + esc(msg));
     hideSections();
     // 超时/内部错误的响应体也会携带 processTrace:展示"执行到哪一步了"
+    renderPipeline(data && data.object ? data.object.processTrace : null,
+                   data && data.object);
     renderTrace(data && data.object ? data.object.processTrace : null);
     return;
   }
@@ -903,83 +1420,64 @@ function render(data) {
                "话术基于以下引用文档生成,可结合片段核对。");
   }
 
-  // ── 片段 ↔ 答案比对 + 关键片段提取 + 按文档分组 ──
+  // ── 话术 ↔ 文档比对 + 关键片段(后端优先,前端兜底)+ 按文档分组 ──
   var sources = obj.sources || [];
   var corpus = normalizeWithMap(buildAnswerCorpus(obj)).text
                  .slice(0, MAX_CORPUS_CHARS);
   var analyzed = sources.map(function (s) {
-    var snippet = s.snippet || "";
-    var r = analyzeSnippet(snippet, corpus);
-    var kf = pickKeyFragment(snippet, r.ranges);
+    var content = s.content || s.snippet || "";   // 兼容旧字段名
+    var r = analyzeSnippet(content, corpus);
+    // 关键片段:优先用后端逐字定位的 keyFragment,缺失/定位失败时前端兜底
+    var kf = null;
+    var backendKf = s.keyFragment || "";
+    var kfIdx = backendKf ? content.indexOf(backendKf) : -1;
+    if (kfIdx >= 0) {
+      kf = { start: kfIdx, end: kfIdx + backendKf.length,
+             score: 1e6, fallback: false, backend: true };
+    } else {
+      kf = pickKeyFragment(content, r.ranges);
+    }
     return {
-      chunkId: s.chunkId, docTitle: s.docTitle, snippet: snippet,
+      chunkId: s.chunkId, docTitle: s.docTitle, snippet: content,
+      relevance: s.relevance || 0,
       updatedAt: s.updatedAt, stale: s.stale,
       ranges: r.ranges, quotes: r.quotes, used: r.ranges.length > 0,
       kf: kf, kfScore: kf ? kf.score : 0
     };
   });
   var docGroups = groupByDoc(analyzed);
-  var usedChunks = analyzed.filter(function (a) { return a.used; }).length;
+  var topRel = analyzed.reduce(function (mx, a) {
+    return Math.max(mx, a.relevance || 0); }, 0);
 
   // ── 结果概览统计(重要信息放最前) ──
   document.getElementById("statDocs").textContent = docGroups.length;
-  document.getElementById("statChunks").textContent = analyzed.length;
-  document.getElementById("statUsed").textContent = usedChunks;
+  document.getElementById("statTopRel").textContent =
+    topRel > 0 ? topRel + "%" : "-";
   document.getElementById("statElapsed").textContent =
     (obj.elapsedMs != null ? (obj.elapsedMs / 1000).toFixed(1) + " s" : "-");
 
-  // ── 一句话结论 ──
-  var conclCard = document.getElementById("conclusionCard");
-  if (obj.directConclusion) {
-    conclCard.style.display = "";
-    document.getElementById("directConclusion").textContent = obj.directConclusion;
-  } else {
-    conclCard.style.display = "none";
-  }
-
-  // ── 坐席话术 + 注意事项 ──
+  // ── 坐席应答:话术 + 办理建议 ──
   var scriptCard = document.getElementById("scriptCard");
-  if (obj.script) {
+  if (obj.script || obj.handlingSuggestion) {
     scriptCard.style.display = "";
-    document.getElementById("scriptText").textContent = obj.script;
-    var cav = obj.caveats || [];
-    var cavBox = document.getElementById("caveatsBox");
-    if (cav.length) {
-      cavBox.style.display = "";
-      cavBox.innerHTML = "⚠ 答复时注意:<ul>" + cav.map(function (c) {
-        return "<li>" + esc(c) + "</li>"; }).join("") + "</ul>";
+    document.getElementById("scriptText").textContent =
+      obj.script || "(话术为空,请参考下方引用文档答复)";
+    var suggBox = document.getElementById("suggBox");
+    if (obj.handlingSuggestion) {
+      suggBox.style.display = "";
+      document.getElementById("handlingSuggestion").textContent =
+        obj.handlingSuggestion;
     } else {
-      cavBox.style.display = "none";
+      suggBox.style.display = "none";
     }
   } else {
     scriptCard.style.display = "none";
   }
 
-  // ── 办理要素表 ──
-  var elCard = document.getElementById("elementsCard");
-  var elKeys = obj.keyElements ? Object.keys(obj.keyElements) : [];
-  if (elKeys.length) {
-    elCard.style.display = "";
-    document.getElementById("keyElements").innerHTML = elKeys.map(function (k) {
-      return "<tr><th>" + esc(k) + "</th><td>" +
-             esc(obj.keyElements[k]) + "</td></tr>";
-    }).join("");
-  } else {
-    elCard.style.display = "none";
-  }
-
-  // ── 兼容视图(老字段) ──
-  document.getElementById("bizExplanation").textContent =
-    obj.businessExplanation || "(无)";
-  document.getElementById("handlingSuggestion").textContent =
-    obj.handlingSuggestion || "(无)";
-  document.getElementById("renderedText").textContent =
-    obj.renderedText || "(无)";
-
-  // ── 引用文档与片段(按文档分组 + 引用高亮) ──
+  // ── 引用文档(按相关度降序 + 关键片段 + 全文折叠) ──
   document.getElementById("sourceCount").textContent = analyzed.length
-    ? "(共 " + docGroups.length + " 个文档 · " + analyzed.length + " 个片段 · " +
-      usedChunks + " 个片段被答案直接引用)"
+    ? "(共 " + analyzed.length + " 个片段 · " + docGroups.length +
+      " 个文档 · 最相关 " + topRel + "%)"
     : "";
   var listEl = document.getElementById("sourceList");
   if (!docGroups.length) {
@@ -990,12 +1488,13 @@ function render(data) {
         var head =
           '<div class="chunk-head">' +
             '<span class="chunk-no">片段 ' + (ci + 1) + '</span>' +
+            relBadge(c.relevance) +
             (c.used
-              ? '<span class="badge used">✓ 已支撑答案</span>'
+              ? '<span class="badge used">✓ 已支撑话术</span>'
               : '<span class="badge unused">未直接引用</span>') +
           '</div>';
 
-        // snippet 是整篇文档:关键片段置顶,全文折叠在下方并可展开对照
+        // content 是整篇文档:关键片段置顶,全文折叠在下方并可展开对照
         var bodyHtml;
         var shortDoc = c.snippet.length <= MAX_KF_CHARS;
         if (c.kf && !shortDoc) {
@@ -1004,7 +1503,9 @@ function render(data) {
             '<div class="key-fragment' + (c.kf.fallback ? ' plain' : '') + '">' +
               '<div class="kf-label">' + (c.kf.fallback
                 ? '📄 全文开头摘要(未在全文中定位到直接回答的片段)'
-                : '⭐ 全文中最能回答用户问题的片段') + '</div>' +
+                : (c.kf.backend
+                  ? '⭐ 最能回答用户问题的关键片段(模型从原文逐字定位)'
+                  : '⭐ 全文中最能回答用户问题的片段')) + '</div>' +
               '<div class="kf-text">' + renderTwoColor(
                 kfText,
                 clipRanges(c.ranges, c.kf.start, c.kf.end),
@@ -1039,9 +1540,10 @@ function render(data) {
         '<div class="doc-head">' +
           '<span class="source-idx">' + (gi + 1) + '</span>' +
           '<span class="doc-title">' + esc(g.title) + '</span>' +
+          relBadge(g.bestRel) +
           (g.usedCount
             ? '<span class="badge used">' + g.usedCount + ' / ' +
-              g.chunks.length + ' 个片段支撑答案</span>'
+              g.chunks.length + ' 个片段支撑话术</span>'
             : '<span class="badge unused">未直接引用</span>') +
           '<span class="tag">更新于 ' + esc(g.updatedAt || "未知") + '</span>' +
           (g.stale ? '<span class="tag stale">⚠ 知识可能过旧,请核实</span>' : "") +
@@ -1051,7 +1553,8 @@ function render(data) {
     }).join("");
   }
 
-  // ── Agent 执行过程时间线 ──
+  // ── 检索链路 · 核心流程 + Agent 执行过程时间线 ──
+  renderPipeline(obj.processTrace, obj);
   renderTrace(obj.processTrace);
 
   // 元信息
@@ -1065,6 +1568,8 @@ function render(data) {
 }
 
 function showBanner(type, text, sub) {
+  document.getElementById("welcomeCard").style.display = "none";
+  document.getElementById("searchingCard").style.display = "none";
   document.getElementById("results").style.display = "block";
   document.getElementById("bannerBox").innerHTML =
     '<div class="banner ' + type + '">' + text +

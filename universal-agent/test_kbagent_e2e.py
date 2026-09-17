@@ -66,9 +66,9 @@ class TC01_NormalFlow(KbagentE2EBase):
         self.assertFalse(self.ans.degraded,
                          "正常链路不应触发降级")
 
-    def test_has_business_explanation(self):
-        self.assertTrue(self.ans.business_explanation.strip(),
-                        "业务说明不应为空")
+    def test_has_script(self):
+        self.assertTrue(self.ans.script.strip(),
+                        "坐席话术不应为空")
 
     def test_has_handling_suggestion(self):
         self.assertTrue(self.ans.handling_suggestion.strip(),
@@ -98,9 +98,13 @@ class TC01_NormalFlow(KbagentE2EBase):
         for s in self.ans.sources:
             self.assertTrue(s.doc_title, f"source 缺少 doc_title: {s}")
 
-    def test_sources_have_snippet(self):
+    def test_sources_have_content_and_relevance(self):
         for s in self.ans.sources:
-            self.assertTrue(s.snippet, f"source 缺少 snippet: {s}")
+            self.assertTrue(s.content, f"source 缺少 content(原文): {s}")
+        rels = [s.relevance for s in self.ans.sources]
+        self.assertEqual(100, max(rels), "最相关一篇 relevance 应归一化为 100")
+        self.assertEqual(rels, sorted(rels, reverse=True),
+                         "sources 应按相关度降序")
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -168,6 +172,13 @@ class TC03_LLMFailureDegrades(KbagentE2EBase):
         """降级兜底应通过保守关键词检索返回至少 1 条原始片段。"""
         self.assertGreater(len(self.ans.sources), 0,
                            "降级兜底应从 ES 召回至少 1 条片段")
+        for s in self.ans.sources:
+            self.assertTrue(s.content, "降级 sources 应携带文档原文 content")
+
+    def test_degraded_script_is_empty(self):
+        """降级路径不经过答案生成,话术应为空(坐席只看原文)。"""
+        self.assertEqual("", self.ans.script)
+        self.assertEqual("not_usable", self.ans.usability.level)
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -196,16 +207,13 @@ class TC04_ChunkIdTransparency(KbagentE2EBase):
         self.assertEqual(len(ids), len(set(ids)),
                          f"sources 中有重复 chunk_id: {ids}")
 
-    def test_sentences_cite_valid_chunk_ids(self):
-        """非 dropped 句子的引用 chunk_id 必须在 sources 中存在。"""
+    def test_key_fragment_is_verbatim_substring(self):
+        """keyFragment 必须是该文档原文的逐字子串(可空,有则必真)。"""
         ans = self._run("套餐推荐")
-        source_ids = {s.chunk_id for s in ans.sources}
-        for sent in ans.sentences:
-            if sent.dropped:
-                continue
-            for cid in sent.citations:
-                self.assertIn(cid, source_ids,
-                              f"句子引用了不在 sources 中的 chunk_id: {cid}")
+        for s in ans.sources:
+            if s.key_fragment:
+                self.assertIn(s.key_fragment, s.content,
+                              f"keyFragment 不在原文中: {s.chunk_id}")
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -267,9 +275,9 @@ class TC05_TraceEvents(KbagentE2EBase):
 
 class TC06_AnswerFieldContract(KbagentE2EBase):
 
-    def test_business_explanation_is_str(self):
+    def test_script_is_str(self):
         ans = self._run("套餐推荐")
-        self.assertIsInstance(ans.business_explanation, str)
+        self.assertIsInstance(ans.script, str)
 
     def test_handling_suggestion_is_str(self):
         ans = self._run("套餐推荐")
@@ -279,9 +287,10 @@ class TC06_AnswerFieldContract(KbagentE2EBase):
         ans = self._run("套餐推荐")
         self.assertIsInstance(ans.sources, list)
 
-    def test_sentences_is_list(self):
+    def test_usability_level_valid(self):
         ans = self._run("套餐推荐")
-        self.assertIsInstance(ans.sentences, list)
+        self.assertIn(ans.usability.level,
+                      {"directly_usable", "verify_first", "not_usable"})
 
     def test_degraded_is_bool(self):
         ans = self._run("套餐推荐")

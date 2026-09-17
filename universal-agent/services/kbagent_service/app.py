@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -33,7 +34,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from kbagent import MainAgent, MockESClient, ProduceESClient, ScriptedChatModel
@@ -163,6 +164,15 @@ def _trace_events(agent: Optional[MainAgent]) -> list:
          "payload": _jsonable(e.payload)}
         for e in agent.tracer.events
     ]
+
+
+def _sse(msg: dict) -> str:
+    """SSE 帧:data: <json>\\n\\n(前端按空行分帧解析)。"""
+    return "data: " + json.dumps(msg, ensure_ascii=False, default=str) + "\n\n"
+
+
+# 流式接口轮询 tracer 新事件的间隔(秒);越小前端进度越细腻,CPU 略增
+STREAM_POLL_INTERVAL_S = 0.15
 
 
 def _default_model() -> Any:
@@ -380,6 +390,114 @@ def _register_routes(app: FastAPI, base: str) -> None:
                            object=_to_object(ans, p, arrived,
                                              _trace_events(agent)))
 
+    @app.post(f"{base}/retrieve/stream")
+    async def ask_stream(req: AskRequest, request: Request):
+        """SSE 流式版检索:边执行边推送 trace 事件,前端实时展示进行到哪一步。
+
+        帧格式(每条 data: 一个 JSON,空行分帧):
+            {"type": "trace", "ts_ms":…, "stage":…, "event":…, "payload":…}
+                — 执行过程中逐条推送(KB_SERVICE_EXPOSE_TRACE=0 时不推)
+            {"type": "final", "response": <与 /retrieve 完全相同的响应信封>}
+                — 结束帧(成功/超时/内部错误都有,前端据此收尾渲染)
+
+        与 /retrieve 相同的契约校验与响应组装;仅传输方式不同。
+        """
+        arrived = _now_str()
+        p = req.params
+
+        allowed = {s.strip()
+                   for s in os.environ.get(ENV_APP_IDS, "").split(",")
+                   if s.strip()}
+        if allowed and p.appId not in allowed:
+            return JSONResponse(error_body(RTN_BAD_REQUEST, "appId 不允许"))
+        query = _extract_query(p)
+        if query is None:
+            return JSONResponse(error_body(
+                RTN_BAD_REQUEST, "conversations 中无有效用户消息(role=1)"))
+        logger.info("requestId=%s 收到流式请求 query=%r province=%r",
+                    p.requestId, query, p.userInfo.province)
+
+        timeout_s = request.app.state.timeout_s
+        expose = _expose_trace()
+
+        async def event_gen():
+            # 每请求新建 MainAgent(实例持有 tracer,不可并发复用)
+            agent = MainAgent(model=request.app.state.model,
+                              es=request.app.state.es,
+                              skill_dirs=[_SKILLS_DIR])
+            task = asyncio.ensure_future(
+                agent.arun(query, region_code=p.userInfo.province))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_s
+            current_tracer = None
+            sent = 0
+            timed_out = False
+
+            def new_frames() -> list:
+                """自上次推送以来 tracer 新增的事件帧。"""
+                nonlocal current_tracer, sent
+                tracer = agent.tracer
+                if tracer is not current_tracer:   # arun 启动时会重建 Tracer
+                    current_tracer, sent = tracer, 0
+                frames = []
+                events = current_tracer.events if current_tracer else []
+                while sent < len(events):
+                    e = events[sent]
+                    sent += 1
+                    frames.append(_sse({
+                        "type": "trace", "ts_ms": e.ts_ms, "stage": e.stage,
+                        "event": e.event, "payload": _jsonable(e.payload)}))
+                return frames
+
+            while True:
+                if expose:
+                    for frame in new_frames():
+                        yield frame
+                if task.done():
+                    break
+                if loop.time() > deadline:
+                    timed_out = True
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                    break
+                await asyncio.sleep(STREAM_POLL_INTERVAL_S)
+            if expose:
+                for frame in new_frames():     # 收尾:推完剩余事件
+                    yield frame
+
+            if timed_out:
+                logger.error("requestId=%s 流式端到端超时,已执行链路:\n%s",
+                             p.requestId, _trace_dump(agent))
+                yield _sse({"type": "final", "response": error_body(
+                    RTN_TIMEOUT, "服务处理超时", _trace_events(agent))})
+                return
+            try:
+                ans = task.result()
+            except Exception:  # noqa: BLE001
+                logger.exception("requestId=%s 流式未预期异常,已执行链路:\n%s",
+                                 p.requestId, _trace_dump(agent))
+                yield _sse({"type": "final", "response": error_body(
+                    RTN_INTERNAL, "服务内部错误", _trace_events(agent))})
+                return
+            logger.info("requestId=%s traceId=%s degraded=%s elapsedMs=%s "
+                        "sources=%d (流式)",
+                        p.requestId, ans.trace_id, ans.degraded,
+                        ans.elapsed_ms, len(ans.sources))
+            logger.info("requestId=%s 链路追踪:\n%s",
+                        p.requestId, _trace_dump(agent))
+            resp = AskResponse(rtnCode=RTN_OK, rtnMsg="success",
+                               object=_to_object(ans, p, arrived,
+                                                 _trace_events(agent)))
+            yield _sse({"type": "final", "response": resp.model_dump(mode="json")})
+
+        return StreamingResponse(
+            event_gen(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-store",
+                     "X-Accel-Buffering": "no"})   # 反向代理不缓冲,逐帧透传
+
 
 def _extract_query(p: AskParams) -> Optional[str]:
     """多轮对话 → 单轮 query:取最后一条用户消息(不拼接历史)。"""
@@ -399,23 +517,18 @@ def _to_object(ans: FinalAnswer, p: AskParams, arrived: str,
         requestArrivedTime=arrived,
         degraded=ans.degraded,
         elapsedMs=ans.elapsed_ms,
-        businessExplanation=ans.business_explanation or "",
+        script=ans.script,
         handlingSuggestion=ans.handling_suggestion or "",
-        renderedText=ans.render(),
-        sources=[
-            SourceItem(chunkId=s.chunk_id, docTitle=s.doc_title,
-                       snippet=s.snippet, updatedAt=s.updated_at,
-                       stale=s.stale)
-            for s in ans.sources
-        ],
-        # 坐席向增量字段(可用性判定 + 结构化内容)
         usability=UsabilityInfo(level=ans.usability.level,
                                 reasons=ans.usability.reasons,
                                 uncovered=ans.usability.uncovered),
-        directConclusion=ans.direct_conclusion,
-        keyElements=ans.key_elements,
-        script=ans.script,
-        caveats=ans.caveats,
+        sources=[
+            SourceItem(chunkId=s.chunk_id, docId=s.doc_id, docTitle=s.doc_title,
+                       relevance=s.relevance, keyFragment=s.key_fragment,
+                       content=s.content, updatedAt=s.updated_at,
+                       stale=s.stale)
+            for s in ans.sources
+        ],
         processTrace=trace_events or [],
     )
 

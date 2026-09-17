@@ -2,11 +2,11 @@
 """answer 测试服务契约 — 请求/响应 Pydantic 模型。
 
 请求:直接携带 query + 知识片段 chunks(即检索/处理阶段的输出),
-     只跑 kbagent.answer 子智能体(片段精选 → LLM 组织答案 → 逐句锚定校验)。
+     只跑 kbagent.answer 子智能体(片段定位+精选 → LLM 组织话术 → 批量一致性校验)。
 
 响应:与 kbagent_service 一致的返回信封
   rtnCode / rtnMsg / object
-  object 面向答案生成环节(业务说明 + 办理建议 + 逐句锚定明细 + 知识溯源 + 全链路 trace)。
+  object 面向答案生成环节(话术 + 办理建议 + 可用性 + 引用文档相关度/关键片段/原文 + 全链路 trace)。
 """
 from __future__ import annotations
 
@@ -48,40 +48,24 @@ class AnswerRequest(BaseModel):
 
 # ── 响应 ────────────────────────────────────────────────────────────────────
 
-class SentenceItem(BaseModel):
-    """答案句子(锚定校验后保留的句子)。"""
-    text: str = Field(description="句子文本")
-    citations: List[str] = Field(description="引用的知识片段ID")
-    hardFact: bool = Field(description="是否硬事实(资费/办理条件等)")
-    anchored: bool = Field(description="锚定校验是否通过;false 且未被删除时带 note")
-    note: str = Field(description="备注;软性表述锚定失败时为『建议核实』")
-
-
 class SourceItem(BaseModel):
-    """知识来源。chunkId 全链路可溯源。"""
+    """引用文档。chunkId 全链路可溯源。"""
     chunkId: str = Field(description="知识片段ID")
+    docId: str = Field(default="", description="所属文档ID")
     docTitle: str = Field(description="文档标题")
-    snippet: str = Field(description="原文摘录")
+    relevance: int = Field(default=0, description="相关度 0-100,最相关一篇=100")
+    keyFragment: str = Field(
+        default="", description="该文档最能回答用户问题的原文逐字片段(可能为空)")
+    content: str = Field(default="", description="整篇文档原文")
     updatedAt: str = Field(description="知识更新日期")
     stale: bool = Field(description="是否疑似过旧(超溯源天数或日期非法)")
 
 
-class LocatedFragmentItem(BaseModel):
-    """文档内一段能回答问题的原文逐字片段(可溯源)。"""
-    text: str = Field(description="原文逐字片段(等于所属文档 content[start:end])")
-    start: int = Field(description="在文档 content 中的起始偏移;-1 表示未精确定位")
-    end: int = Field(description="结束偏移(不含)")
-    reason: str = Field(description="该片段为何能回答问题")
-
-
-class DocFragmentsItem(BaseModel):
-    """单篇输入文档的证据片段定位结果。"""
-    chunkId: str = Field(description="知识片段ID")
-    docId: str = Field(description="所属文档ID")
-    docTitle: str = Field(description="文档标题")
-    answerable: bool = Field(description="该文档能否回答用户问题(以可验证原文片段为准)")
-    fragments: List[LocatedFragmentItem] = Field(
-        description="定位到的原文逐字片段;非原文/改写片段已被丢弃")
+class UsabilityInfo(BaseModel):
+    """坐席视角的话术可用性判定(LLM 自评 + 确定性规则纠偏)。"""
+    level: str = Field(default="", description="directly_usable / verify_first / not_usable")
+    reasons: List[str] = Field(default_factory=list, description="判定依据")
+    uncovered: List[str] = Field(default_factory=list, description="未覆盖方面")
 
 
 class AnswerObject(BaseModel):
@@ -90,15 +74,11 @@ class AnswerObject(BaseModel):
     sessionId: str = Field(description="回传对话ID")
     traceId: str = Field(description="答案子智能体内部 trace ID")
     requestArrivedTime: str = Field(description="收到请求时间,格式 yyyy-MM-dd HH:mm:ss.SSS")
-    elapsedMs: int = Field(description="答案生成耗时(毫秒,含全部锚定校验)")
-    businessExplanation: str = Field(description="业务说明")
-    handlingSuggestion: str = Field(description="办理建议")
-    renderedText: str = Field(description="完整答案文本(含知识来源),可直接展示")
-    sentences: List[SentenceItem] = Field(description="保留的答案句子及锚定明细")
-    sources: List[SourceItem] = Field(description="知识来源列表")
-    matchedFragments: List[DocFragmentsItem] = Field(
-        default_factory=list,
-        description="每篇输入文档的证据片段定位结果(原文逐字、可溯源)")
+    elapsedMs: int = Field(description="答案生成耗时(毫秒,含一致性校验)")
+    script: str = Field(default="", description="可直接念给用户的口语化话术")
+    handlingSuggestion: str = Field(default="", description="办理建议")
+    usability: Optional[UsabilityInfo] = Field(default=None, description="话术可用性判定")
+    sources: List[SourceItem] = Field(description="引用文档列表(按相关度降序)")
     trace: Optional[Dict[str, Any]] = Field(
         default=None, description="全链路 trace(badcase 回放);测试服务默认携带")
 

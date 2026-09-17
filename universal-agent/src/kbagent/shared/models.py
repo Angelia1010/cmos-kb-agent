@@ -110,21 +110,15 @@ class RetrievalRound:
 # 答案生成产物
 # ---------------------------------------------------------------------------
 @dataclass
-class AnswerSentence:
-    text: str
-    citations: List[str]             # 引用的 chunk_id 列表
-    hard_fact: bool = False          # 是否硬事实(资费/办理条件/生效规则)
-    anchored: bool = True            # 锚定校验是否通过
-    dropped: bool = False            # 锚定失败被删除
-    note: str = ""                   # 例如 "建议核实"
-
-
-@dataclass
 class SourceRef:
+    """引用文档 — 相关度 + 最能回答问题的原文片段 + 整篇原文。"""
     chunk_id: str
+    doc_id: str
     doc_title: str
-    snippet: str
-    updated_at: str
+    relevance: int = 0               # 相关度 0-100,最相关一篇 = 100
+    key_fragment: str = ""           # 该文档最能回答用户问题的原文逐字片段
+    content: str = ""                # 整篇文档原文
+    updated_at: str = ""
     stale: bool = False              # 知识版本过旧提示
 
 
@@ -170,6 +164,7 @@ class DocFragments:
     doc_id: str
     doc_title: str
     answerable: bool                                       # 该文档能否回答用户问题
+    relevance: int = 0                                     # 模型自评相关度 0-100(未归一化)
     fragments: List[LocatedFragment] = field(default_factory=list)
 
 
@@ -177,21 +172,13 @@ class DocFragments:
 class FinalAnswer:
     trace_id: str
     query: str
-    business_explanation: str        # 业务说明
-    handling_suggestion: str         # 办理建议
-    sentences: List[AnswerSentence] = field(default_factory=list)
+    script: str = ""                 # 可直接念给用户的口语化话术(注意事项已并入)
+    handling_suggestion: str = ""    # 办理建议
     sources: List[SourceRef] = field(default_factory=list)
     degraded: bool = False           # 是否降级结果
     from_cache: bool = False
     elapsed_ms: int = 0
-    # ---- 坐席向内容组织(内容重组;老字段保留,灵犀老调用方不受影响) ----
-    direct_conclusion: str = ""      # 一句话直接结论(能不能/多少钱/怎么办)
-    key_elements: Dict[str, str] = field(default_factory=dict)   # 办理要素(渠道/材料/条件/时限/资费...)
-    script: str = ""                 # 可直接念给用户的口语化话术
-    caveats: List[str] = field(default_factory=list)             # 答复注意事项
     usability: Usability = field(default_factory=Usability)      # 可用性判定
-    # ---- 文档内证据片段定位(每篇输入文档一项;新增能力,不影响以上字段) ----
-    matched_fragments: List[DocFragments] = field(default_factory=list)
 
     def render(self) -> str:
         """渲染为坐席可读文本。"""
@@ -200,16 +187,18 @@ class FinalAnswer:
             lines.append("[降级结果,未经加工,请核实原文]")
         if self.from_cache:
             lines.append("[缓存命中]")
-        lines.append("【业务说明】")
-        lines.append(self.business_explanation or "(无)")
+        lines.append("【坐席话术】")
+        lines.append(self.script or "(无)")
         lines.append("")
         lines.append("【办理建议】")
         lines.append(self.handling_suggestion or "(无)")
         if self.sources:
             lines.append("")
-            lines.append("【知识来源】")
+            lines.append("【引用文档】")
             for i, s in enumerate(self.sources, 1):
                 stale = " (知识可能过旧,请核实)" if s.stale else ""
-                lines.append(f"  {i}. {s.doc_title} [{s.chunk_id}] 更新于 {s.updated_at}{stale}")
-                lines.append(f"     摘录: {s.snippet[:80]}")
+                lines.append(f"  {i}. {s.doc_title} [{s.chunk_id}] "
+                             f"相关度 {s.relevance}% 更新于 {s.updated_at}{stale}")
+                if s.key_fragment:
+                    lines.append(f"     关键片段: {s.key_fragment[:80]}")
         return "\n".join(lines)

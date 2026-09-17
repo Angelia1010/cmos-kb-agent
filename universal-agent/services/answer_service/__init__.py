@@ -12,15 +12,12 @@ from .models import (
     AnswerRequest,
     AnswerResponse,
     ChunkIn,
-    DocFragmentsItem,
-    LocatedFragmentItem,
-    SentenceItem,
     SourceItem,
+    UsabilityInfo,
 )
 
 __all__ = [
     "app", "create_app",
     "AnswerRequest", "AnswerParams", "AnswerResponse", "AnswerObject",
-    "ChunkIn", "SentenceItem", "SourceItem",
-    "DocFragmentsItem", "LocatedFragmentItem",
+    "ChunkIn", "SourceItem", "UsabilityInfo",
 ]

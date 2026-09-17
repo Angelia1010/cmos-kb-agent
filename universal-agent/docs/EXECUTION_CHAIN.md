@@ -37,7 +37,7 @@
 │   MainAgent ── 固定三阶段编排 + 降级兜底 + 全链路 trace            │
 │     ├─ RetrievalSubAgent   检索（GoalLoop 自主循环）              │
 │     ├─ ProcessingSubAgent  处理（裸 ReAct + SkillMiddleware）    │
-│     └─ AnswerSubAgent      答案（直调 LLM + 逐句锚定校验）        │
+│     └─ AnswerSubAgent      答案（直调 LLM + 批量一致性校验）      │
 │   shared/：Workspace(请求隔离) / Tracer / Config / search / lexicon│
 │   scripted_model.py：离线 Mock LLM（规则模拟工具决策）             │
 ├─────────────────────────────────────────────────────────────────┤
@@ -76,11 +76,13 @@ MainAgent.run(query) ── asyncio.run ──▶ MainAgent.arun(query)
    │      ◀── List[Chunk]（清洗/去噪/去重/结构化/排序后）
    │
    ├─③ AnswerSubAgent(model, cfg, tracer).run(query, processed, trace_id)  同步
-   │      └─ select_fragments（top4，同文档≤2）
-   │         → generate：model.invoke([TASK:answer]) 组织答案
-   │         → 逐句 model.invoke([TASK:anchor_check]) 锚定校验
-   │         → 硬事实锚定失败直接删句；软表述标注"建议核实"
-   │      ◀── FinalAnswer（业务说明/办理建议/句子/知识来源）
+   │      └─ 逐篇 locate_fragments（片段定位+相关度 0-100）
+   │         → select_fragments（top4，同文档≤2）
+   │         → generate：model.invoke([TASK:answer]) 组织话术+办理建议
+   │         → 一次 model.invoke([TASK:anchor_check]) 批量话术一致性校验
+   │         → 校验不过不删句，收紧 usability 为 verify_first（规则只收紧不放宽）
+   │      ◀── FinalAnswer（话术/办理建议/可用性/来源=相关度+关键片段+原文）
+   │      LLM 调用总数 = N(locate) + 1(answer) + 1(consistency)
    │
    └─ 任一环节抛异常 ──▶ _degrade(query)：原始query关键词单轮检索，
                           返回原始片段（degraded=True），坐席永远有东西可看
@@ -93,7 +95,7 @@ MainAgent.run(query) ── asyncio.run ──▶ MainAgent.arun(query)
 | MainAgent | `kbagent/main_agent.py:30` | 无（固定编排） | 异常捕获 + 降级兜底 |
 | RetrievalSubAgent | `kbagent/retrieval/agent.py:28` | 工具顺序/参数由 LLM 定 | GoalLoop 轮次时间预算 + 充分性规则 + DSL 白名单 |
 | ProcessingSubAgent | `kbagent/processing/agent.py:28` | 清洗工具取舍由 LLM 定 | 空产出保底流水线 + “不裁剪片段”写入提示词 |
-| AnswerSubAgent | `kbagent/answer/agent.py:17` | 素材取舍/答案组织由 LLM 定 | 逐句锚定校验为纯代码，硬事实零容忍 |
+| AnswerSubAgent | `kbagent/answer/agent.py:17` | 素材取舍/答案组织由 LLM 定 | 关键片段逐字校验 + 批量一致性校验，不过则收紧 usability |
 | ScriptedChatModel | `kbagent/scripted_model.py:45` | —（离线替身） | 让 ReAct/反馈注入机制真实跑通 |
 
 ---
@@ -454,15 +456,20 @@ LLM（含离线脚本模型）看到 `SKILL:` 标记与 SKILL.md 第 6 条规则
 
 ---
 
-## 6. 阶段③：答案子智能体（直调 LLM + 确定性锚定）
+## 6. 阶段③：答案子智能体（直调 LLM + 批量一致性校验）
 
-本阶段**不走 ReAct**：`AnswerSubAgent.run` 内是两次（类）同步 `model.invoke` 直调。
+本阶段**不走 ReAct**：`AnswerSubAgent.run` 内是同步 `model.invoke` 直调，
+LLM 调用总数 = **N + 2**（每篇文档 locate 1 次 + 组织话术 1 次 + 批量一致性校验 1 次）。
 
 ```
-AnswerSubAgent.run(query, chunks, trace_id)        answer/agent.py:25
-  ├─ materials = select_fragments(query, chunks)   generate.py:49
+AnswerSubAgent.run(query, chunks, trace_id)        answer/agent.py
+  ├─ 逐篇 locate_fragments(model, query, chunk)    answer/locate.py
+  │     [TASK:locate_fragments] 输出 {answerable, relevance(0-100), fragments}
+  │     fragment 必须在原文中逐字定位（_locate_span 偏移校验），定位失败即丢弃
+  │     不可回答的文档 relevance 压到 ≤39
+  ├─ materials = select_fragments(query, chunks)   answer/generate.py
   │     取前 4 条，同一 doc_id 最多 2 条（依赖上游已排序）
-  └─ generate(model, query, materials, cfg, tracer, trace_id)   generate.py:61
+  └─ generate(model, query, materials, cfg, tracer, trace_id, matched)
 ```
 
 ### 6.1 generate 内部流程
@@ -470,34 +477,28 @@ AnswerSubAgent.run(query, chunks, trace_id)        answer/agent.py:25
 ```
 ① tracer.log("answer","materials", chunk_ids)
 ② material_text = 每片段一行 <chunk id="kb_0001#p1">内容</chunk>
-③ 组织答案：_invoke_json(model, _ANSWER_SYSTEM, "用户问题:...\n知识片段:\n...")
+③ 组织话术：_invoke_json(model, _ANSWER_SYSTEM, "用户问题:...\n知识片段:\n...")
      _ANSWER_SYSTEM 以 "[TASK:answer]" 开头，要求输出严格 JSON：
-       {business_explanation, handling_suggestion,
-        sentences:[{text, citations:[chunk_id], hard_fact}]}
+       {script(以"您好"开头、注意事项自然融入), handling_suggestion,
+        usability:{level, reasons, uncovered}}
      _invoke_json = model.invoke([SystemMessage, HumanMessage]) + JSON 容错解析
-④ 逐句锚定校验（确定性代码，不交给 LLM 裁量）：
-     for sent in sentences:
-       real_cites = sent.citations ∩ materials 的 chunk_id 集合
-       ├─ 无有效引用 → anchored=False
-       └─ 有 → 拼接被引片段原文，再次直调：
-              _invoke_json(model, _ANCHOR_SYSTEM "[TASK:anchor_check]",
-                           "句子:{text}\n片段:{chunk_text}")
-              → anchored = consistent
-       if not anchored:
-           hard_fact=True  → sent.dropped = True        ← 硬事实零容忍，直接删句
-           hard_fact=False → sent.note = "建议核实"
-       tracer.log("answer","anchor_check", ...)
-⑤ 善后：
-     kept = 未删句子；被删句子的文本从 business_explanation/handling_suggestion 中剔除
-     cited_ids = kept 句子引用按出现顺序去重
-     sources = 对每个被引 chunk 生成 SourceRef，
-               updated_at 早于 now-365天 → stale=True（展示时提示"知识可能过旧"）
-⑥ 返回 FinalAnswer(trace_id, query, business_explanation, handling_suggestion,
-                   sentences=kept, sources)
+④ 批量话术一致性校验（一次调用，替代旧的逐句锚定）：
+     _invoke_json(model, _CONSISTENCY_SYSTEM "[TASK:anchor_check]",
+                  "话术全文 + 全部素材片段")
+     → {consistent: bool, issues: [str]}
+     consistent=False → usability 收紧为至少 verify_first，issues 写入 reasons
+     tracer.log("answer","consistency_check", consistent, issue_count, issues)
+⑤ 组装 sources（全部精选素材，按相关度降序）：
+     relevance = matched 里 LLM 自评相关度，代码侧归一化（最大值缩放到 100）
+     key_fragment = 该文档第一个逐字校验通过的 located fragment
+     content = 整篇文档原文
+     updated_at 早于 now-溯源天数 或非法 → stale=True（提示"知识可能过旧"）
+⑥ 返回 FinalAnswer(trace_id, query, script, handling_suggestion,
+                   usability, sources)
 ```
 
-> **硬事实判定**由 LLM 在 [TASK:answer] 输出中声明（`hard_fact` 字段），但**删除动作**
-> 是确定性代码执行的——生成与校验严格分离（生成器/评估器分离原则）。
+> 校验失败**不再删句**（无句粒度），而是收紧 usability 让坐席知晓需核实——
+> 沿用"规则只收紧不放宽"原则；关键片段的**逐字定位**仍是确定性代码保证的。
 
 ---
 
@@ -514,9 +515,9 @@ MainAgent.arun 的 except Exception
         │                            retrieval_mode="keyword")
         ├─ hits = es.keyword_search(build_dsl(params, size=5))
         │     （ES 也挂 → hits=[]，仍然返回答案壳）
-        ├─ FinalAnswer(business_explanation="(系统降级,以下为原始知识片段,请人工核实)",
-        │               handling_suggestion="",
-        │               sources=[SourceRef(原始片段)...],
+        ├─ FinalAnswer(script="", handling_suggestion="",
+        │               sources=[SourceRef(content=原文, relevance 按位次)...],
+        │               usability=not_usable("系统降级兜底结果...不可直接答复用户"),
         │               degraded=True)
         └─ tracer.log("degrade","done", reason, hit_count)
 ```
@@ -642,10 +643,12 @@ ReAct/反馈注入/技能机制**不接真实 LLM 也能真实跑通**。它根�
 ```
 _generate(messages)
   ├─ 含 "[TASK:answer]"      → _scripted_answer：
-  │      取前 3 个 <chunk>，各取第一句（≤60字）作事实句并引用对应 chunk；
-  │      含 元/资费/条件/生效 → hard_fact=True；另附一句软性办理建议
-  ├─ 含 "[TASK:anchor_check]" → _scripted_anchor：
-  │      句子与片段字符重合 ≥ max(3, 30%) → consistent=true
+  │      取前 3 个 <chunk> 的首句拼成离线演示话术（"您好,…"）+ 固定办理建议
+  │      + usability=verify_first（"离线脚本模型生成,仅演示"）
+  ├─ 含 "[TASK:anchor_check]" → _scripted_anchor（批量一致性）：
+  │      话术与素材字符重合 ≥ max(3, 50%) → consistent=true，否则给出 issues
+  ├─ 含 "[TASK:locate_fragments]" → _scripted_locate：
+  │      规则化选取片段 + relevance=40+重叠度×55（上限 95）
   └─ 否则（ReAct 模式，按绑定工具名+文本区分阶段）：
        检索阶段（绑定含 coarse_recall）:
          非重试轮: query_understanding → keyword_extraction → coarse_recall
@@ -682,9 +685,10 @@ User    MainAgent      Retrieval/GlLp   Scripted   检索Tools   Verifier   Proc
  │         │──② run(q,chunks)──────────────────────────────────────▶ Skill注入 │          │
  │         │                │               │  analyze→…→sort → apply_business_skill      │
  │         │◀─processed（空则保底流水线）────────────────────────────│          │          │
- │         │──③ run(q,proc,trace_id)──────────────────────────────────────────▶ select(4) │
- │         │                │               │◀─[TASK:answer] 直调──│          │ 组答案    │
- │         │                │               │◀─[TASK:anchor_check]×N 逐句锚定 │          │
+ │         │──③ run(q,proc,trace_id)──────────────────────────────────────────▶ locate×N  │
+ │         │                │               │◀─[TASK:locate_fragments]×N 定位+相关度      │
+ │         │                │               │◀─[TASK:answer] 直调──│  select(4) 组话术   │
+ │         │                │               │◀─[TASK:anchor_check]×1 批量一致性校验       │
  │         │◀─FinalAnswer（degraded=False, elapsed_ms）────────────│          │          │
  │◀─render()│               │               │           │          │           │          │
 ```
@@ -722,16 +726,20 @@ Chunk{score := RRF 融合分}                      ← coarse_recall 写入 ws.d
 Chunk{content 清洗, extra + fees_yuan/status 过滤}   ← 处理阶段原地改写
    │ ProcessingSubAgent 返回
    ▼
+locate_fragments → DocFragments{answerable, relevance, fragments}（逐字定位）
+   │
+   ▼
 select_fragments → materials（top4，同文档≤2）
    │ [TASK:answer] 中作为 <chunk id="..."> 上下文
    ▼
-AnswerSentence{citations=[chunk_id]}            ← LLM 生成引用
-   │ 锚定校验过滤
+script / handling_suggestion / usability        ← LLM 生成
+   │ 批量一致性校验（不过则收紧 usability）+ relevance 归一化(max→100)
    ▼
-SourceRef{chunk_id, doc_title, snippet, updated_at, stale}  ← FinalAnswer.sources
+SourceRef{chunk_id, doc_id, doc_title, relevance, key_fragment, content,
+          updated_at, stale}                    ← FinalAnswer.sources
    │ render()
    ▼
-坐席可见文本："1. 5G畅享套餐资费说明 [kb_0001#p1] 更新于 2026-06-10 ..."
+坐席可见文本："1. 5G畅享套餐资费说明 [kb_0001#p1] 相关度 100% 更新于 2026-06-10 ..."
 ```
 
 核心数据结构一览（`shared/models.py`）：
@@ -741,8 +749,9 @@ SourceRef{chunk_id, doc_title, snippet, updated_at, stale}  ← FinalAnswer.sour
 | `Chunk` | 知识片段（内容+元数据+分数+溯源） |
 | `RetrievalParams` | LLM 与 DSL 之间的结构化契约（`from_llm_output` 清洗） |
 | `SufficiencyResult` / `RetrievalRound` | 验证判据与轮次记录 |
-| `AnswerSentence` | 答案句（引用/硬事实/锚定/删除标记） |
-| `SourceRef` | 最终展示的知识来源（含过旧标记） |
+| `DocFragments` | 单篇文档的定位结果（answerable/relevance/逐字片段） |
+| `SourceRef` | 最终展示的知识来源（相关度/关键片段/原文/过旧标记） |
+| `Usability` | 话术可用性（level/reasons/uncovered，规则只收紧不放宽） |
 | `FinalAnswer` | 顶层返回（含 `render()` 坐席视图与 `degraded` 标志） |
 
 ---
@@ -759,8 +768,9 @@ SourceRef{chunk_id, doc_title, snippet, updated_at, stale}  ← FinalAnswer.sour
 | processing | agent_error | ReAct 调用异常（被吞） |
 | processing | fallback_pipeline | 产出为空触发保底 |
 | processing | snapshot | 处理前后 chunk_id 对比 |
+| answer | locate_fragments | 每篇文档定位结果（answerable/relevance/fragment_count） |
 | answer | materials | 进入答案阶段的片段清单 |
-| answer | anchor_check | 每句锚定结果（含 dropped） |
+| answer | consistency_check | 批量话术一致性校验结果（consistent/issue_count/issues） |
 | finalize | done | 正常结束（含总耗时） |
 | degrade | triggered / done | 降级进入/完成 |
 
@@ -818,12 +828,14 @@ MainAgent.run                                            kbagent/main_agent.py:4
    │  ├─ mw.before_agent × N（手工，SkillMiddleware 注入技能）
    │  ├─ CompiledGraph.ainvoke（7+2 个工具，LLM 自主编排）
    │  └─ 空产出 → run_fallback_pipeline                   kbagent/processing/tools.py:106
-   ├─ ③ AnswerSubAgent.run                               kbagent/answer/agent.py:25
-   │  ├─ select_fragments                                 kbagent/answer/generate.py:49
-   │  └─ generate                                         kbagent/answer/generate.py:61
-   │     ├─ model.invoke([TASK:answer])
-   │     ├─ model.invoke([TASK:anchor_check]) × 句数
-   │     └─ FinalAnswer（含 SourceRef 过旧判定）
+   ├─ ③ AnswerSubAgent.run                               kbagent/answer/agent.py
+   │  ├─ locate_fragments × 篇数                          kbagent/answer/locate.py
+   │  │  └─ model.invoke([TASK:locate_fragments])（片段逐字定位 + relevance）
+   │  ├─ select_fragments                                 kbagent/answer/generate.py
+   │  └─ generate                                         kbagent/answer/generate.py
+   │     ├─ model.invoke([TASK:answer])（话术+建议+usability）
+   │     ├─ model.invoke([TASK:anchor_check]) × 1（批量一致性）
+   │     └─ FinalAnswer（sources=relevance 归一化 + keyFragment + 原文 + 过旧判定）
    └─ except → _degrade                                  kbagent/main_agent.py:80
       └─ lexicon.extract_keywords → build_dsl → keyword_search → FinalAnswer(degraded)
 ```

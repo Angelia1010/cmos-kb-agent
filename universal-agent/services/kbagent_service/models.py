@@ -71,10 +71,14 @@ class AskRequest(BaseModel):
 # ── 响应 ────────────────────────────────────────────────────────────────────
 
 class SourceItem(BaseModel):
-    """知识来源。chunkId 全链路可溯源。"""
+    """引用文档。chunkId 全链路可溯源。"""
     chunkId: str = Field(description="知识片段ID")
+    docId: str = Field(default="", description="所属文档ID")
     docTitle: str = Field(description="文档标题")
-    snippet: str = Field(description="原文摘录")
+    relevance: int = Field(default=0, description="相关度 0-100,最相关一篇=100")
+    keyFragment: str = Field(
+        default="", description="该文档最能回答用户问题的原文逐字片段(可能为空)")
+    content: str = Field(default="", description="整篇文档原文")
     updatedAt: str = Field(description="知识更新日期")
     stale: bool = Field(description="是否疑似过旧(超溯源天数)")
 
@@ -97,19 +101,12 @@ class AnswerObject(BaseModel):
     requestArrivedTime: str = Field(description="收到请求时间,格式 yyyy-MM-dd HH:mm:ss.SSS")
     degraded: bool = Field(description="是否降级兜底结果;true 时未经加工,请人工核实")
     elapsedMs: int = Field(description="端到端耗时(毫秒)")
-    businessExplanation: str = Field(description="业务说明")
-    handlingSuggestion: str = Field(description="办理建议")
-    renderedText: str = Field(description="完整答案文本(含知识来源),可直接展示")
-    sources: List[SourceItem] = Field(description="知识来源列表")
-    # ---- 坐席向增量字段(全部带默认值,灵犀老调用方不受影响) ----
+    # ---- 坐席直接可用的两段内容 ----
+    script: str = Field(default="", description="可直接念给用户的口语化话术")
+    handlingSuggestion: str = Field(default="", description="办理建议")
     usability: Optional[UsabilityInfo] = Field(
         default=None, description="话术可用性判定")
-    directConclusion: str = Field(
-        default="", description="一句话直接结论(能不能办/多少钱/怎么办)")
-    keyElements: Dict[str, str] = Field(
-        default_factory=dict, description="办理要素(渠道/材料/条件/时限/资费)")
-    script: str = Field(default="", description="可直接念给用户的口语化话术")
-    caveats: List[str] = Field(default_factory=list, description="答复注意事项")
+    sources: List[SourceItem] = Field(description="引用文档列表(按相关度降序)")
     # 智能体内部执行 trace 事件列表(ts_ms/stage/event/payload),
     # 供前端演示页渲染"检索处理过程"时间线;
     # KB_SERVICE_EXPOSE_TRACE=0 时为空列表,灵犀老调用方不受影响

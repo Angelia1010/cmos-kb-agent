@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """答案生成(方案 五,答案子智能体内部实现)。
 
-四步:识别目标片段 → 组织答案(内联引用) → 逐句锚定校验 → 渲染输出。
+流程:识别目标片段 → 组织话术+办理建议 → 一次批量话术一致性校验 → 组装来源。
 使用标准 model.invoke([SystemMessage, HumanMessage]) 调用 LLM,无需特殊接口,
 任意 BaseChatModel(如灵犀网关的 LingxiSSLChatOpenAI)可直接接入。
-锚定失败策略:硬事实(资费/办理条件/生效规则)直接删除;软性表述标注"建议核实"。
+
+LLM 调用次数 = 1(答案组织)+ 1(批量一致性校验);相关度与关键片段由
+locate_fragments 阶段顺带产出(见 .locate),此处零额外调用。
+一致性校验失败不删话术,改为收紧 usability(至少 verify_first)并列出问题,
+由坐席对照原文核实 —— 保证坐席永远有话术可看。
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -22,8 +26,8 @@ from ..shared.models import (
     USABILITY_DIRECT,
     USABILITY_NOT,
     USABILITY_VERIFY,
-    AnswerSentence,
     Chunk,
+    DocFragments,
     FinalAnswer,
     SourceRef,
     Usability,
@@ -36,16 +40,14 @@ _VALID_LEVELS = (USABILITY_DIRECT, USABILITY_VERIFY, USABILITY_NOT)
 
 _ANSWER_SYSTEM = (
     "[TASK:answer] 你是10086坐席辅助助手。基于给定知识片段生成坐席答复内容,输出 JSON:"
-    '{"business_explanation": str(业务说明), "handling_suggestion": str(办理建议), '
-    '"sentences": [{"text": str, "citations": [chunk_id], "hard_fact": bool}], '
-    '"direct_conclusion": str(一句话直接结论:能不能办/多少钱/怎么办), '
-    '"key_elements": {"渠道": str, "材料": str, "条件": str, "时限": str, "资费": str}'
-    "(办理要素,仅保留片段中有依据的键,无信息的键整个省略), "
-    '"script": str(可直接念给用户的口语化完整话术,以“您好”开头,自然流畅), '
-    '"caveats": [str](坐席答复前需注意/主动说明的事项), '
+    '{"script": str(可直接念给用户的口语化完整话术,以“您好”开头,自然流畅,'
+    "把必要的注意事项/前提条件自然融入话术,不要遗漏资费、时限等关键数字), "
+    '"handling_suggestion": str(给坐席的办理建议:怎么办、需要什么材料、'
+    '需与客户确认什么、有什么限制条件), '
     '"usability": {"level": "directly_usable|verify_first|not_usable", '
     '"reasons": [str](判定依据), "uncovered": [str](用户问题中知识片段未覆盖的方面)}}。'
-    "每个事实性陈述必须携带其依据的 chunk_id。禁止使用片段之外的信息。只输出 JSON。"
+    "话术与建议中的每个事实必须能在知识片段中找到依据,禁止使用片段之外的信息。"
+    "只输出 JSON,不要输出 sentences/citations 等其他字段。"
     "usability 必须诚实自评:片段足以完整回答且信息明确→directly_usable;"
     "片段只覆盖部分问题、信息含糊或相互矛盾→verify_first 并在 uncovered 列出未覆盖方面;"
     "片段与问题基本无关→not_usable。禁止为了好看而拔高 level。"
@@ -53,9 +55,13 @@ _ANSWER_SYSTEM = (
     '或写成 \\" ;值内禁止换行。'
 )
 
-_ANCHOR_SYSTEM = (
-    '[TASK:anchor_check] 判断句子与知识片段是否语义一致,'
-    '输出 JSON: {"consistent": bool}。只输出 JSON。'
+# 批量话术一致性校验:整段话术 vs 全部素材,一次调用替代逐句锚定。
+# 标记仍用 [TASK:anchor_check](离线 ScriptedChatModel 按此标记分发)。
+_CONSISTENCY_SYSTEM = (
+    '[TASK:anchor_check] 判断坐席话术与知识片段是否一致:话术中每个事实性表述'
+    '(资费数字、办理条件、渠道、时限等)都能在片段中找到依据且不与片段矛盾。'
+    '输出 JSON: {"consistent": bool, "issues": [str](话术中缺乏依据或与片段矛盾的'
+    '表述,逐条简述,每条不超过40字;完全一致时为空数组)}。只输出 JSON。'
 )
 
 
@@ -190,8 +196,13 @@ def select_fragments(query: str, chunks: List[Chunk], top_n: int = 4) -> List[Ch
 
 
 def generate(model: Any, query: str, materials: List[Chunk],
-             cfg: Config, tracer: Tracer, trace_id: str) -> FinalAnswer:
-    """组织答案并执行逐句锚定校验;model 为任意标准 BaseChatModel。"""
+             cfg: Config, tracer: Tracer, trace_id: str,
+             matched: Optional[List[DocFragments]] = None) -> FinalAnswer:
+    """组织话术+办理建议,并做一次批量话术一致性校验。
+
+    model 为任意标准 BaseChatModel;matched 为 locate 阶段对每篇文档的
+    证据片段定位结果(相关度与关键片段的来源,此处零额外 LLM 调用)。
+    """
     t_start = time.time()
     logger.info("answer 开始 query=%r 素材=%d条 ids=%s",
                 query, len(materials), [c.chunk_id for c in materials])
@@ -204,129 +215,112 @@ def generate(model: Any, query: str, materials: List[Chunk],
         logger.warning("answer LLM 未产出有效 JSON → 最终答案将为空 "
                        "(耗时%.1fs, 原始输出见上一条日志)",
                        time.time() - t_start)
-    else:
-        logger.info("answer LLM JSON 解析成功: sentences=%d "
-                    "business_explanation长度=%d handling_suggestion长度=%d",
-                    len(data.get("sentences", [])),
-                    len(str(data.get("business_explanation", ""))),
-                    len(str(data.get("handling_suggestion", ""))))
+    script = str(data.get("script", "") or "").strip()
+    suggestion = str(data.get("handling_suggestion", "") or "").strip()
+    if data:
+        logger.info("answer LLM JSON 解析成功: 话术长度=%d 办理建议长度=%d",
+                    len(script), len(suggestion))
 
-    valid_ids = {c.chunk_id for c in materials}
-    by_id = {c.chunk_id: c for c in materials}
-    sentences: List[AnswerSentence] = []
-    for s in data.get("sentences", []):
-        sentences.append(AnswerSentence(
-            text=str(s.get("text", "")),
-            citations=[str(c) for c in s.get("citations", [])],
-            hard_fact=bool(s.get("hard_fact", False)),
-        ))
+    # ---- 批量话术一致性校验(一次调用替代逐句锚定)----
+    consistent: Optional[bool] = None
+    issues: List[str] = []
+    if script and materials:
+        check = _invoke_json(
+            model, _CONSISTENCY_SYSTEM,
+            f"坐席话术:{script}\n知识片段:\n{material_text}")
+        consistent = bool(check.get("consistent", False)) if check else False
+        raw_issues = check.get("issues") if check else None
+        if isinstance(raw_issues, list):
+            issues = [str(x).strip()[:80] for x in raw_issues
+                      if str(x).strip()][:5]
+        tracer.log("answer", "consistency_check", consistent=consistent,
+                   issue_count=len(issues), issues=issues)
+        logger.info("answer 一致性校验: consistent=%s issues=%s",
+                    consistent, issues)
 
-    # ---- 第三步:逐句锚定校验 ----
-    for sent in sentences:
-        # 3a. 引用必须指向真实存在的片段;无效引用一律清除,
-        #     防止幻觉 chunk_id 流入下游 sources 构建(by_id KeyError)
-        real_cites = [c for c in sent.citations if c in valid_ids]
-        if not real_cites:
-            sent.anchored = False
-            logger.info("answer 锚定: 引用无效(不在素材内) text=%r citations=%s",
-                        sent.text[:40], sent.citations)
-            sent.citations = []
-        else:
-            sent.citations = real_cites
-            # 3b. 语义一致性(小模型判句-片段一致性)
-            chunk_text = " ".join(by_id[c].content for c in real_cites)
-            check = _invoke_json(model, _ANCHOR_SYSTEM,
-                                 f"句子:{sent.text}\n片段:{chunk_text}")
-            sent.anchored = bool(check.get("consistent", False))
-        if not sent.anchored:
-            if sent.hard_fact:
-                sent.dropped = True            # 硬事实零容忍:直接删除
-            else:
-                sent.note = "建议核实"          # 软性表述降级标注
-        logger.info("answer 锚定结果: anchored=%s dropped=%s hard_fact=%s text=%r",
-                    sent.anchored, sent.dropped, sent.hard_fact, sent.text[:40])
-        tracer.log("answer", "anchor_check", text=sent.text[:40],
-                   citations=sent.citations, hard_fact=sent.hard_fact,
-                   anchored=sent.anchored, dropped=sent.dropped)
+    # ---- 来源列表:相关度(最相关=100)+ 关键片段 + 全文 + 过旧提示 ----
+    # sources = 全部精选素材:LLM 输出解析失败时坐席仍有原文可核对。
+    sources = _build_sources(materials, matched, cfg)
 
-    kept = [s for s in sentences if not s.dropped]
-
-    # 重组两段式输出:删句后按剩余句子重建,保证与逐句结果一致
-    expl = str(data.get("business_explanation", ""))
-    sugg = str(data.get("handling_suggestion", ""))
-    conclusion = str(data.get("direct_conclusion", "") or "")
-    script = str(data.get("script", "") or "")
-    for s in sentences:
-        if s.dropped:
-            expl = expl.replace(s.text, "").strip()
-            sugg = sugg.replace(s.text, "").strip()
-            conclusion = conclusion.replace(s.text, "").strip()
-            script = script.replace(s.text, "").strip()
-
-    # ---- 坐席向结构化内容(容忍模型缺字段:旧格式输出走默认值) ----
-    raw_elements = data.get("key_elements")
-    key_elements = ({str(k): str(v).strip() for k, v in raw_elements.items()
-                     if str(v).strip()}
-                    if isinstance(raw_elements, dict) else {})
-    raw_caveats = data.get("caveats")
-    caveats = ([str(x).strip() for x in raw_caveats if str(x).strip()]
-               if isinstance(raw_caveats, list) else [])
-
-    # ---- 第四步:来源列表 + 过旧提示 ----
-    cited_ids: List[str] = []
-    for s in kept:
-        for c in s.citations:
-            if c not in cited_ids:
-                cited_ids.append(c)
-    stale_before = datetime.now() - timedelta(days=cfg.stale_days)
-    sources: List[SourceRef] = []
-    for cid in cited_ids:
-        c = by_id.get(cid)
-        if c is None:          # 双保险:引用不在素材内直接跳过
-            continue
-        try:
-            stale = datetime.strptime(c.updated_at, "%Y-%m-%d") < stale_before
-        except ValueError:
-            stale = True
-        sources.append(SourceRef(cid, c.doc_title, c.content, c.updated_at, stale))
-
-    # ---- 第五步:可用性判定(LLM 自评 + 确定性规则纠偏,规则只收紧) ----
+    # ---- 可用性判定(LLM 自评 + 确定性规则纠偏,规则只收紧) ----
     usability = _assess_usability(
-        data, sentences, sources, materials,
-        has_content=bool(expl or sugg or script or conclusion))
+        data, sources, materials,
+        has_content=bool(script or suggestion),
+        consistent=consistent, issues=issues)
 
-    logger.info("answer 完成: 总耗时%.1fs 句子=%d(保留%d) 来源=%d "
-                "业务说明长度=%d 办理建议长度=%d 话术长度=%d 可用性=%s",
-                time.time() - t_start, len(sentences), len(kept),
-                len(sources), len(expl), len(sugg), len(script),
-                usability.level)
+    logger.info("answer 完成: 总耗时%.1fs 话术长度=%d 办理建议长度=%d 来源=%d "
+                "可用性=%s 一致性=%s",
+                time.time() - t_start, len(script), len(suggestion),
+                len(sources), usability.level, consistent)
     if usability.reasons:
         logger.info("answer 可用性依据: %s", usability.reasons)
     if usability.uncovered:
         logger.info("answer 未覆盖方面: %s", usability.uncovered)
-    if not expl and not sugg:
-        logger.warning("answer 最终业务说明/办理建议均为空! 总耗时%.1fs "
+    if not script and not suggestion:
+        logger.warning("answer 最终话术/办理建议均为空! 总耗时%.1fs "
                        "——按序回看上面日志:素材是否为0 / LLM是否空返回 / "
-                       "JSON是否解析失败 / 句子是否全被锚定删除",
+                       "JSON是否解析失败",
                        time.time() - t_start)
     return FinalAnswer(
         trace_id=trace_id, query=query,
-        business_explanation=expl, handling_suggestion=sugg,
-        sentences=kept, sources=sources,
-        direct_conclusion=conclusion, key_elements=key_elements,
-        script=script, caveats=caveats, usability=usability,
+        script=script, handling_suggestion=suggestion,
+        sources=sources, usability=usability,
     )
 
 
-def _assess_usability(data: Dict[str, Any], sentences: List[AnswerSentence],
-                      sources: List[SourceRef], materials: List[Chunk],
-                      has_content: bool) -> Usability:
+def _build_sources(materials: List[Chunk],
+                   matched: Optional[List[DocFragments]],
+                   cfg: Config) -> List[SourceRef]:
+    """组装来源:相关度归一化(最相关一篇=100)+ 关键片段 + 整篇原文。
+
+    相关度优先取 locate 阶段模型自评(DocFragments.relevance);
+    缺失时兜底:有可验证片段的文档给中位分,其余按 0;
+    全部无信号时按素材顺序兜底(处理阶段已按重排得分排序),
+    保证"最相关 = 100%"不变式恒成立。
+    """
+    matched_by_id = {d.chunk_id: d for d in (matched or [])}
+    stale_before = datetime.now() - timedelta(days=cfg.stale_days)
+
+    raws: List[float] = []
+    for c in materials:
+        df = matched_by_id.get(c.chunk_id)
+        if df is not None and df.relevance > 0:
+            raws.append(float(df.relevance))
+        elif df is not None and df.answerable:
+            raws.append(40.0)     # 有可验证片段但模型未给相关度
+        else:
+            raws.append(0.0)
+    if materials and max(raws) <= 0:
+        raws = [float(len(materials) - i) for i in range(len(materials))]
+    peak = max(raws) if raws else 0.0
+
+    rows: List[SourceRef] = []
+    for i, c in enumerate(materials):
+        df = matched_by_id.get(c.chunk_id)
+        key_fragment = df.fragments[0].text if df and df.fragments else ""
+        relevance = int(round(raws[i] / peak * 100)) if peak > 0 else 0
+        try:
+            stale = datetime.strptime(c.updated_at, "%Y-%m-%d") < stale_before
+        except ValueError:
+            stale = True
+        rows.append(SourceRef(chunk_id=c.chunk_id, doc_id=c.doc_id,
+                              doc_title=c.doc_title, relevance=relevance,
+                              key_fragment=key_fragment, content=c.content,
+                              updated_at=c.updated_at, stale=stale))
+    # 按相关度降序(稳定排序,同分保持重排原序)
+    rows.sort(key=lambda s: -s.relevance)
+    return rows
+
+
+def _assess_usability(data: Dict[str, Any], sources: List[SourceRef],
+                      materials: List[Chunk], has_content: bool,
+                      consistent: Optional[bool] = None,
+                      issues: Optional[List[str]] = None) -> Usability:
     """可用性判定:以 LLM 自评为基线,用确定性规则收紧(只降不升)。
 
     规则层覆盖 LLM 自评不可信/缺失的场景:
-      素材为空、JSON 解析失败、内容为空          → not_usable
-      硬事实句被锚定删除、全部句子未锚定、
-      引用知识过旧、存在未覆盖方面                → verify_first
+      素材为空、JSON 解析失败、内容为空      → not_usable
+      一致性校验不过、知识过旧、存在未覆盖    → verify_first
     """
     raw = data.get("usability") if isinstance(data.get("usability"), dict) else {}
     level = raw.get("level")
@@ -347,12 +341,12 @@ def _assess_usability(data: Dict[str, Any], sentences: List[AnswerSentence],
         u.tighten(USABILITY_NOT, "答案生成失败(模型输出无法解析)")
     if data and not has_content:
         u.tighten(USABILITY_NOT, "答案内容为空")
-    dropped_hard = sum(1 for s in sentences if s.dropped)
-    if dropped_hard:
+    if consistent is False:
         u.tighten(USABILITY_VERIFY,
-                  f"{dropped_hard} 条硬事实句未通过锚定校验已删除,相关内容缺失")
-    if sentences and all(not s.anchored for s in sentences):
-        u.tighten(USABILITY_VERIFY, "所有句子均未通过锚定校验")
+                  f"话术一致性校验未通过({len(issues or [])} 处表述需核实),"
+                  "请对照原文后再答复")
+        for it in (issues or [])[:3]:
+            u.tighten(USABILITY_VERIFY, f"待核实:{it}")
     stale_n = sum(1 for s in sources if s.stale)
     if stale_n:
         u.tighten(USABILITY_VERIFY,

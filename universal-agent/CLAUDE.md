@@ -38,7 +38,7 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
 用户Query → 缓存快速通道(命中直接返回)
   → ① RetrievalSubAgent (自主规划, GoalLoop护栏, max 2轮)
   → ② ProcessingSubAgent (自主规划, SkillMiddleware注入业务技能包)
-  → ③ AnswerSubAgent (LLM组织答案, 确定性逐句锚定校验)
+  → ③ AnswerSubAgent (逐篇locate定位片段+相关度 → LLM组织话术 → 一次批量一致性校验; LLM调用=N+2)
   → 任一异常/超时 → 降级：原始query单轮检索返回原文
 ```
 
@@ -55,7 +55,7 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
   - `config/` — AppConfig YAML 热重载、ModelConfig、SkillConfig 等子配置
 - `src/kbagent/` — 业务层实现（每个子智能体独立目录）
   - `main_agent.py` — 主智能体，三阶段固定编排入口（缓存快速通道 / 降级兜底 / 全链路trace / judge接口桥接）
-  - `scripted_model.py` — 离线Mock模型，处理 ReAct / [TASK:answer] / [TASK:anchor_check] / [TASK:rerank_*]
+  - `scripted_model.py` — 离线Mock模型，处理 ReAct / [TASK:answer] / [TASK:locate_fragments] / [TASK:anchor_check](批量一致性) / [TASK:rerank_*]
   - `shared/` — 跨子智能体共享的基础设施（不放子智能体实现）
     - `models.py` — 核心数据结构（Chunk、RetrievalParams、FinalAnswer）
     - `search.py` — ES检索层抽象（build_dsl / rrf_fuse / MockESClient / ProduceESClient / merged_to_chunks）
@@ -77,17 +77,18 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
     - `tools.py` — 7个Chunk处理工具（analyze/clean/denoise/dedupe/structure/sort/apply_business_skill）+ 知识级工具工厂
     - `rerank.py` / `output.py` / `prompts.py` — 两阶段重排、Top3→Chunk适配、重排Prompt
   - `answer/` — 答案子智能体
-    - `agent.py` — AnswerSubAgent（select_fragments + generate）
-    - `generate.py` — 答案生成 + 逐句锚定校验（model.invoke 标准调用，任意BaseChatModel可直连）
+    - `agent.py` — AnswerSubAgent（locate循环 + select_fragments + generate）
+    - `locate.py` — 逐篇文档片段定位（[TASK:locate_fragments]，逐字校验 + relevance 0-100）
+    - `generate.py` — 话术/办理建议/usability 生成 + 一次批量话术一致性校验 + sources 组装（relevance 归一化 max→100 / keyFragment / 原文 content / stale）
 - `skills/` — 业务技能包（当前：taocan-skill），零代码可扩展
-- `tests/` — kbagent 子智能体/服务单元测试（共202项）
+- `tests/` — kbagent 子智能体/服务单元测试（共228项）
   - `test_retrieval.py` — DSL白名单 / 检索工具 / 充分性验证 / RetrievalSubAgent
   - `test_processing.py` — 7个处理工具 / 保底流水线 / ProcessingSubAgent
-  - `test_answer.py` — 片段精选 / JSON解析 / 锚定校验 / AnswerSubAgent / 渲染
+  - `test_answer.py` — 片段精选 / JSON解析 / locate相关度 / 批量一致性校验 / AnswerSubAgent / 渲染
   - `test_knowledge_processing.py` / `test_processing_chunk_output.py` / `test_shared_knowledge_tools.py` — 知识级处理链路
   - `test_processing_service.py` / `test_processing_demo.py` — processing 服务与演示
   - `test_state_redis.py` — Redis 状态后端（需安装 redis 包）
-- `test_kbagent_e2e.py` — kbagent 整体集成测试（40项）
+- `test_kbagent_e2e.py` — kbagent 整体集成测试（41项）
 - `test_uniagent_e2e.py` — uniagent 框架端到端演示（7个场景，含 Skill 系统全链路）
 - `main.py` — kbagent 离线演示入口（4个场景）
 - `scripts/run_e2e_real_model.py` — 真实大模型端到端验证（生产网络内执行）
@@ -96,7 +97,7 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
 
 1. **DSL字段白名单**：LLM永不接触原始ES DSL，只输出结构化RetrievalParams，code侧在build_dsl()中强制ALLOWED_FILTER_FIELDS白名单
 2. **GoalLoop护栏**：Budget(max_iterations=2, max_time_seconds=2.0)，验证失败→注入负例反馈→自主改写重召→轮次耗尽携最优退出
-3. **硬事实零容忍**：资费/办理条件等hard_fact=True的句子若锚定失败直接删除，不让不准确信息流出
+3. **话术一致性收紧**：批量一致性校验（一次 [TASK:anchor_check]）不通过时不删句，而是把 usability 收紧为至少 verify_first 并把 issues 写入 reasons；确定性规则只收紧不放宽。keyFragment 必须是原文逐字子串（locate 偏移校验保证）
 4. **降级兜底**：任一环节异常/超时→坐席永远有东西可看
 5. **chunk_id全链路透传**：从召回到最终答案的知识溯源
 

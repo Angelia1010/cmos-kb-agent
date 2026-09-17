@@ -121,15 +121,22 @@ class MainAgent:
             hits = self.es.keyword_search(build_dsl(params, size=5))
         except Exception:                               # noqa: BLE001
             hits = []
+        # 降级来源:相关度按召回名次归一化(最相关一篇 = 100),无关键片段
+        # (未经定位),content 直接给整篇原文供坐席人工核实。
+        n = len(hits)
+        sources = [
+            SourceRef(chunk_id=c.chunk_id, doc_id=c.doc_id, doc_title=c.doc_title,
+                      relevance=int(round((n - i) / n * 100)) if n else 0,
+                      key_fragment="", content=c.content,
+                      updated_at=c.updated_at, stale=False)
+            for i, c in enumerate(hits)]
         ans = FinalAnswer(
             trace_id=self.tracer.trace_id, query=query,
-            business_explanation="(系统降级,以下为原始知识片段,请人工核实)",
-            handling_suggestion="",
-            sources=[SourceRef(c.chunk_id, c.doc_title, c.content, c.updated_at)
-                     for c in hits],
+            script="", handling_suggestion="",
+            sources=sources,
             degraded=True, elapsed_ms=self.tracer.elapsed_ms(),
             usability=Usability(
                 level=USABILITY_NOT,
-                reasons=["系统降级兜底结果,未经答案生成与锚定校验,不可直接答复用户"]))
+                reasons=["系统降级兜底结果,未经答案生成与一致性校验,不可直接答复用户"]))
         self.tracer.log("degrade", "done", reason=reason, hit_count=len(hits))
         return ans
