@@ -1,30 +1,29 @@
 # -*- coding: utf-8 -*-
-"""检索子智能体 — 检索→处理→验证 Agent Loop。
+"""检索子智能体 — GoalLoop 驱动的检索→处理→验证闭环。
 
 架构(参考 docs/0917/top3_verifier_integration_guide_20260917.md):
-    RetrievalSubAgent (检索模块内部 loop)
-      └─ 每轮迭代:
-           ① retrieve: intergrate_all (主路径) / keyword_extraction+coarse_recall (降级)
-           ② process: retrieval_to_candidates → ProcessingSubAgent.run
-                       (analyze → filter → build_markdown → rerank)
-           ③ verify: Top3AnswerabilityVerifier.verify(query, top3_candidates)
-              ├─ passed  → 结束 loop,返回 verified chunks
-              ├─ failed  → 提取 retrieval_feedback,调整策略进入下一轮检索
-              └─ unknown → 内部重试 Verifier (最多1次),仍 unknown 则降级处理
+    RetrievalSubAgent 使用 uniagent GoalLoop:
+      └─ 每轮 GoalLoop 迭代:
+           ① ReAct Agent 自主决定调用检索工具(intergrate_all / coarse_recall 等)
+           ② 迭代结束后,ProcessingVerifier 自动运行:
+              - ProcessingSubAgent.run (analyze → filter → markdown → rerank)
+              - Top3AnswerabilityVerifier.verify
+              ├─ passed  → GoalLoop 返回成功,结束
+              └─ failed  → GoalLoop 注入反馈 HumanMessage → 下一轮 ReAct
 
 向后兼容:
     - ``DirectRetrievalSubAgent`` 保留原有直调 intergrate_all 形态(零 LLM),
-      供 processing_service 等不需要 agent loop 的场景使用。
-    - ``RetrievalSubAgent`` 现在统一为新 Agent Loop 形态。
+      供 processing_service 等场景使用。
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
+
+from uniagent import AgentFeatures, Budget, BudgetConfig, create_agent
+from uniagent.verification.verifier import VerificationResult
 
 from ..processing import Top3AnswerabilityVerifier
 from ..processing.agent import ProcessingSubAgent
@@ -33,13 +32,13 @@ from ..shared.knowledge_processing.adapter import normalize_processing_context
 from ..shared.knowledge_processing.bridge import retrieval_to_candidates
 from ..shared.knowledge_processing.models import (
     ProcessedKnowledge,
-    RetrievalFeedback,
     Top3VerificationResult,
 )
 from ..shared.models import Chunk
 from ..shared.tracing import Tracer
 from ..shared.workspace import get_workspace
 from .tools import (
+    RETRIEVAL_TOOLS,
     coarse_recall,
     intergrate_all,
     keyword_extraction,
@@ -47,40 +46,195 @@ from .tools import (
 
 logger = logging.getLogger("kbagent.retrieval")
 
+RETRIEVAL_GOAL = (
+    "为用户问题召回足量、高相关的候选知识片段。"
+    "可用工具:intergrate_all(生产一体化流水线) / coarse_recall(关键词+向量混合召回) / "
+    "keyword_extraction / query_understanding / question_rewrite,由你自主决定调用顺序;"
+    "若收到验证失败反馈,请换策略(改写问题/放宽过滤/调整关键词)重新召回。"
+    "注意:intergrate_all 是生产一体化流水线(槽位提取→知识检索→原子表拼接),"
+    "仅接入生产 ngkm 检索时可用;离线/调试环境请用 coarse_recall。"
+)
+
+RETRIEVAL_SYSTEM_PROMPT = (
+    "你是候选知识检索子智能体,自主规划检索步骤。"
+    "每一轮迭代结束后,系统会自动对召回结果做处理与验证;"
+    "若收到 [验证失败] 反馈,请根据其中的建议调整检索策略并重新召回。"
+)
+
+
 # ---------------------------------------------------------------------------
-# Agent Loop 配置
+# ProcessingVerifier — 整合 Processing + Top3 验证,挂载到 GoalLoop
 # ---------------------------------------------------------------------------
 
-@dataclass
-class RetrievalLoopConfig:
-    """检索 Agent Loop 的可调参数。
+class ProcessingVerifier:
+    """GoalLoop 验证器:每轮迭代后自动执行 Processing + Top3 验证。
 
-    参考 docs/0917/top3_verifier_integration_guide_20260917.md:
-    - max_rounds:         最大检索轮次,2轮对齐现有 max_retrieval_rounds
-    - verifier_retry:     unknown 时 Verifier 内部重试次数
-    - verifier_timeout:   Verifier 模型调用超时(秒)
-    - dup_query_threshold: 连续相同 query 的检测阈值,达到后强制退出
+    实现 uniagent 的 Verifier 协议,在 GoalLoop 的 verify 步骤被调用。
+    passed 时 GoalLoop 返回成功;failed 时 GoalLoop 自动注入反馈消息,
+    驱动下一轮 ReAct 迭代。
+
+    生成器/评估器分离:验证器拿 goal+state 独立判断,不依赖检索 Agent 的自述。
     """
-    max_rounds: int = 2
-    verifier_retry: int = 1
-    verifier_timeout: float = 15.0
-    dup_query_threshold: int = 2
+
+    def __init__(
+        self,
+        model: Any,
+        tracer: Tracer,
+        *,
+        verifier_timeout: float = 15.0,
+    ) -> None:
+        self._processing = ProcessingSubAgent(model)
+        self._verifier = Top3AnswerabilityVerifier(
+            model, timeout_seconds=verifier_timeout,
+        )
+        self._tracer = tracer
+
+    async def verify(
+        self, goal: str, state: Dict[str, Any]
+    ) -> VerificationResult:
+        """GoalLoop 每轮迭代结束后调用。
+
+        1. 从 workspace 取 chunks
+        2. 跑 Processing 流水线
+        3. 跑 Top3 验证
+        4. 返回 uniagent VerificationResult
+        """
+        ws = get_workspace()
+        chunks: List[Chunk] = ws.data.get("chunks", [])
+
+        # ── 零召回 → 直接 failed ──
+        if not chunks:
+            self._tracer.log("retrieval.verify", "zero_chunks")
+            return VerificationResult(
+                passed=False,
+                evidence="本轮未召回任何候选知识。请尝试改写问题、使用不同关键词、或放宽过滤条件(relax_filters=true)。",
+                layer="processing",
+                confidence=1.0,
+            )
+
+        # ── ① Processing ──
+        try:
+            ws.data["knowledge_candidates"] = retrieval_to_candidates(
+                chunks=chunks)
+            await self._processing.run()
+            top3: List[ProcessedKnowledge] = ws.data.get(
+                "top3_candidates", [])
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Processing 流水线异常")
+            self._tracer.log("retrieval.verify", "processing_error",
+                             error=str(exc))
+            return VerificationResult(
+                passed=False,
+                evidence=f"知识处理流水线异常: {exc}。请尝试不同检索策略。",
+                layer="processing",
+                confidence=1.0,
+            )
+
+        if not top3:
+            self._tracer.log("retrieval.verify", "empty_top3")
+            return VerificationResult(
+                passed=False,
+                evidence="处理后无有效 Top3 候选。请扩大检索范围或使用不同检索词。",
+                layer="processing",
+                confidence=1.0,
+            )
+
+        # ── ② Verification ──
+        retrieval_query = ws.data.get(
+            "rewritten_query") or ws.data.get("original_query") or ws.query
+        context = normalize_processing_context(
+            ws.data.get("processing_context")
+        )
+
+        try:
+            result: Top3VerificationResult = await self._verifier.verify(
+                query=ws.query,
+                candidates=top3,
+                retrieval_query=retrieval_query,
+                context=context,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Top3 Verifier 调用异常")
+            self._tracer.log("retrieval.verify", "verifier_exception",
+                             error=str(exc))
+            return VerificationResult(
+                passed=False,
+                evidence=f"验证器调用异常: {exc}。请尝试不同检索策略。",
+                layer="verifier",
+                confidence=1.0,
+            )
+
+        self._tracer.log(
+            "retrieval.verify", "done",
+            status=result.status,
+            reason_codes=result.reason_codes,
+            evidence_count=len(result.evidence_chunk_ids),
+        )
+
+        # ── ③ 映射到 VerificationResult ──
+        if result.status == "passed":
+            return VerificationResult(
+                passed=True,
+                evidence=result.summary,
+                layer="top3_answerability",
+                confidence=1.0,
+                details={"evidence_chunk_ids": result.evidence_chunk_ids},
+            )
+
+        # failed: 把 structured feedback 写入 workspace,
+        #         把 human-readable 建议写入 evidence 供 GoalLoop 注入
+        if result.status == "failed" and result.retrieval_feedback is not None:
+            fb = result.retrieval_feedback
+            ws.data["retrieval_feedback"] = {
+                "suggested_query": fb.suggested_query,
+                "suggested_keywords": fb.suggested_keywords,
+                "missing_aspects": fb.missing_aspects,
+                "retry_strategy": fb.retry_strategy,
+            }
+            evidence_lines = [
+                f"验证未通过: {result.summary}",
+                f"建议检索语句: {fb.suggested_query}",
+                f"缺失方面: {', '.join(fb.missing_aspects)}",
+                f"建议关键词: {', '.join(fb.suggested_keywords)}",
+                f"调整策略: {fb.retry_strategy}",
+                "请根据以上建议调整检索策略后重新召回。",
+            ]
+            return VerificationResult(
+                passed=False,
+                evidence="\n".join(evidence_lines),
+                layer="top3_answerability",
+                confidence=1.0,
+                details={"reason_codes": result.reason_codes},
+            )
+
+        # unknown: 记录告警,不消耗普通检索重试,携现有结果结束
+        self._tracer.log(
+            "retrieval.verify", "unknown_degrade",
+            reason_codes=result.reason_codes,
+        )
+        return VerificationResult(
+            passed=False,
+            evidence=(
+                f"验证器技术异常({result.reason_codes}): {result.summary}。"
+                "不再重试验证,使用当前检索结果。"
+            ),
+            layer="top3_answerability",
+            confidence=0.0,
+            details={"reason_codes": result.reason_codes},
+        )
 
 
 # ---------------------------------------------------------------------------
-# Agent Loop 实现
+# RetrievalSubAgent — GoalLoop 驱动的检索→处理→验证
 # ---------------------------------------------------------------------------
 
 class RetrievalSubAgent:
-    """检索→处理→验证 闭环 Agent。
+    """检索候选知识子智能体:GoalLoop 驱动 ReAct 自主规划 + ProcessingVerifier。
 
-    由 MainAgent 创建(每请求一实例),内部循环:
-    retrieve → process → verify → (passed: exit / failed: retry / unknown: degrade)。
-
-    与 MainAgent 的契约:
-    - 输入: 原始 query + region_code
-    - 输出: List[Chunk] (经过检索、处理重排、验证的 top chunks)
-    - 异常: 全部路径失败时 raise RuntimeError,触发 MainAgent 降级兜底
+    每轮 GoalLoop 迭代:
+      1. ReAct Agent 自主决定调用哪些检索工具
+      2. ProcessingVerifier 自动运行 Processing + Top3 验证
+      3. passed → 结束; failed → GoalLoop 注入反馈 → 下一轮
     """
 
     def __init__(
@@ -90,309 +244,73 @@ class RetrievalSubAgent:
         tracer: Tracer,
         *,
         judge_model: Any = None,
-        loop_cfg: RetrievalLoopConfig | None = None,
+        verifier_timeout: float = 15.0,
     ) -> None:
         self.model = model
         self.cfg = cfg
         self.tracer = tracer
-        self.loop_cfg = loop_cfg or RetrievalLoopConfig()
+        self._verifier_timeout = verifier_timeout
 
-        # Verifier: 独立模型调用,使用注入的 model
-        self._verifier = Top3AnswerabilityVerifier(
-            model,
-            timeout_seconds=self.loop_cfg.verifier_timeout,
-        )
-        # Processing: 可复用(固定流水线,无请求级可变状态)
-        self._processing = ProcessingSubAgent(model)
+    async def run(
+        self, query: str, region_code: str = "000"
+    ) -> List[Chunk]:
+        """GoalLoop 驱动的检索→处理→验证。
 
-    # ------------------------------------------------------------------
-    async def run(self, query: str, region_code: str = "000") -> List[Chunk]:
-        """执行检索→处理→验证闭环。
-
-        返回经过 processing+rerank 且通过 verifier 的 top chunks;
-        若全部轮次耗尽仍验证失败,返回当前最优 top3 并标记 degraded。
-        若零召回且全部路径失败,raise RuntimeError 触发 MainAgent 降级。
+        region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。
         """
         ws = get_workspace()
         ws.stage = "retrieval"
-
-        # 记录初始 query 到 workspace,供本轮与后续组件使用
         ws.data["original_query"] = query
         ws.data["region_code"] = region_code
 
-        current_query = query
-        current_keywords: List[str] = []
-        history_queries: List[str] = []
-        best_chunks: List[Chunk] = []
-
-        for round_num in range(1, self.loop_cfg.max_rounds + 1):
-            self.tracer.log(
-                "retrieval.loop", f"round_{round_num}_start",
-                query=current_query, region_code=region_code,
-                keywords=current_keywords,
-            )
-
-            # ── ① Retrieve ──────────────────────────────────────────
-            chunks = await self._do_retrieve(
-                query=current_query,
-                region_code=region_code,
-                round_num=round_num,
-                is_retry=(round_num > 1),
-            )
-            if not chunks:
-                self.tracer.log("retrieval.loop", f"round_{round_num}_zero_recall")
-                if best_chunks:
-                    # 本轮零召回但有历史最优 → 退出
-                    break
-                continue
-
-            # 更新历史最优
-            best_chunks = list(chunks)
-
-            # ── ② Process ──────────────────────────────────────────
-            top3 = await self._do_process(chunks)
-            if not top3:
-                self.tracer.log("retrieval.loop", f"round_{round_num}_empty_top3")
-                continue
-
-            # ── ③ Verify ───────────────────────────────────────────
-            context = normalize_processing_context(
-                ws.data.get("processing_context")
-            )
-            result = await self._do_verify(
-                query=query,              # 始终用原始 query
-                candidates=top3,
-                retrieval_query=current_query,
-                context=context,
-            )
-
-            self.tracer.log(
-                "retrieval.loop", f"round_{round_num}_verify",
-                status=result.status,
-                reason_codes=result.reason_codes,
-            )
-
-            if result.status == "passed":
-                self.tracer.log("retrieval.loop", "passed",
-                                round=round_num,
-                                evidence=result.evidence_chunk_ids)
-                return self._final_chunks(chunks, result)
-
-            if result.status == "failed":
-                feedback = result.retrieval_feedback
-                if feedback is None:
-                    # 防御: no_valid_candidates 等场景 feedback 非 None
-                    break
-
-                # 重复检测
-                dup_count = sum(
-                    1 for hq in history_queries
-                    if hq.strip() == (feedback.suggested_query or "").strip()
-                )
-                if dup_count >= self.loop_cfg.dup_query_threshold:
-                    self.tracer.log(
-                        "retrieval.loop", "dup_query_break",
-                        query=feedback.suggested_query,
-                    )
-                    break
-
-                # 准备下一轮
-                history_queries.append(current_query)
-                current_query = feedback.suggested_query or current_query
-                current_keywords = list(feedback.suggested_keywords)
-                self.tracer.log(
-                    "retrieval.loop", f"round_{round_num}_feedback",
-                    next_query=current_query,
-                    keywords=current_keywords,
-                    strategy=feedback.retry_strategy,
-                    missing=feedback.missing_aspects,
-                )
-                continue
-
-            # status == "unknown": 技术异常,内部重试后仍异常则降级
-            if result.status == "unknown":
-                retry_ok = await self._retry_verifier(
-                    query=query,
-                    candidates=top3,
-                    retrieval_query=current_query,
-                    context=context,
-                )
-                if retry_ok:
-                    # 重试通过
-                    return self._final_chunks(chunks, retry_ok)
-                # 仍 unknown → 记录告警,携当前最优退出
-                self.tracer.log(
-                    "retrieval.loop", f"round_{round_num}_unknown_degrade",
-                    reason_codes=result.reason_codes,
-                )
-                break
-
-        # ── Loop 结束: 轮次耗尽 / 异常退出 ─────────────────────────
-        if best_chunks:
-            self.tracer.log(
-                "retrieval.loop", "exhausted_best_effort",
-                rounds=round_num,
-                chunk_count=len(best_chunks),
-            )
-            return best_chunks
-
-        raise RuntimeError(
-            f"检索 Agent Loop 全部 {self.loop_cfg.max_rounds} 轮未产生有效候选"
+        verifier = ProcessingVerifier(
+            model=self.model,
+            tracer=self.tracer,
+            verifier_timeout=self._verifier_timeout,
         )
 
-    # ------------------------------------------------------------------
-    # 内部步骤
-    # ------------------------------------------------------------------
-
-    async def _do_retrieve(
-        self,
-        query: str,
-        region_code: str,
-        round_num: int,
-        is_retry: bool,
-    ) -> List[Chunk]:
-        """执行一轮检索: intergrate_all 主路径,失败则 keyword_extraction + coarse_recall 兜底。
-
-        重试轮(is_retry=True)会在 coarse_recall 中开启 relax_filters。
-        """
-        ws = get_workspace()
-
-        # 主路径: 生产一体化流水线
-        obs = json.loads(
-            intergrate_all.func(query=query, region_code=region_code)
+        loop = create_agent(
+            model=self.model,
+            tools=RETRIEVAL_TOOLS,
+            features=AgentFeatures(skill=False),
+            system_prompt=RETRIEVAL_SYSTEM_PROMPT,
+            goal=RETRIEVAL_GOAL,
+            verifier=verifier,
+            budget=Budget(config=BudgetConfig(
+                max_iterations=self.cfg.max_retrieval_rounds,
+                max_time_seconds=(
+                    self.cfg.budget["retrieval_total"] / 1000.0
+                ),
+            )),
+            name="retrieval_subagent",
         )
-        if "error" not in obs:
-            chunks: List[Chunk] = ws.data.get("chunks", [])
-            if chunks:
-                self.tracer.log(
-                    "retrieval.loop", f"round_{round_num}_intergrate_all",
-                    count=len(chunks),
-                )
-                return chunks
 
-        # 降级路径: keyword_extraction + coarse_recall
+        result = await loop.run(
+            input_messages=[{"role": "user",
+                             "content": f"用户问题:{query}\n省份:{region_code}"}],
+            thread_id=self.tracer.trace_id,
+        )
+
         self.tracer.log(
-            "retrieval.loop", f"round_{round_num}_fallback",
-            reason=obs.get("error", "zero_recall"),
+            "retrieval", "loop_result",
+            success=result.success,
+            iterations=result.iterations,
+            reason=result.reason,
         )
-        keyword_extraction.func()
-        fallback_obs = json.loads(
-            coarse_recall.func(
-                relax_filters=is_retry,
-                retrieval_mode="hybrid",
-            )
-        )
-        if "error" in fallback_obs:
-            ws_chunks: List[Chunk] = ws.data.get("chunks", [])
-            if not ws_chunks:
-                self.tracer.log(
-                    "retrieval.loop", f"round_{round_num}_fallback_error",
-                    error=fallback_obs["error"],
-                )
-                return []
-        return list(ws.data.get("chunks", []))
 
-    async def _do_process(
-        self, chunks: List[Chunk]
-    ) -> List[ProcessedKnowledge]:
-        """执行固定处理流水线: retrieval_to_candidates → ProcessingSubAgent.run。
+        chunks: List[Chunk] = ws.data.get("processed_chunks") or ws.data.get(
+            "chunks") or []
 
-        ProcessingSubAgent 内部: analyze → filter → build_markdown → rerank,
-        产出 ws.data["top3_candidates"] (List[ProcessedKnowledge])。
-        """
-        ws = get_workspace()
-
-        # 将 Chunk 映射为 KnowledgeCandidate
-        ws.data["knowledge_candidates"] = retrieval_to_candidates(chunks=chunks)
-
-        # 执行固定流水线
-        await self._processing.run()
-
-        top3: List[ProcessedKnowledge] = ws.data.get("top3_candidates", [])
-        if not top3:
-            logger.warning("Processing 后 top3_candidates 为空")
-        return top3
-
-    async def _do_verify(
-        self,
-        query: str,
-        candidates: Sequence[ProcessedKnowledge],
-        retrieval_query: str | None = None,
-        context: Any = None,
-    ) -> Top3VerificationResult:
-        """调用 Verifier,将可能的异常收敛为 unknown 结果。"""
-        try:
-            return await self._verifier.verify(
-                query=query,
-                candidates=candidates,
-                retrieval_query=retrieval_query,
-                context=context,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Verifier 调用异常: %s", exc)
-            from ..shared.knowledge_processing.models import (
-                RetrievalFeedback,
-            )
-            # 防御: 构造 unknown 结果
-            return Top3VerificationResult(
-                status="unknown",
-                reason_codes=["verifier_model_error"],
-                summary=f"Verifier 调用异常: {exc}",
-                evidence_chunk_ids=[],
-                retrieval_feedback=None,
-            )
-
-    async def _retry_verifier(
-        self,
-        query: str,
-        candidates: Sequence[ProcessedKnowledge],
-        retrieval_query: str | None = None,
-        context: Any = None,
-    ) -> Top3VerificationResult | None:
-        """unknown 时重试 Verifier 最多 ``verifier_retry`` 次。
-
-        Returns:
-            重试通过时返回 passed 结果;全部失败返回 None。
-        """
-        for attempt in range(1, self.loop_cfg.verifier_retry + 1):
+        if not result.success:
+            if not chunks and str(result.reason).startswith("错误"):
+                raise RuntimeError(
+                    f"检索子智能体失败: {result.reason}")
             self.tracer.log(
-                "retrieval.loop", f"verifier_retry_{attempt}",
+                "retrieval", "exit_with_best",
+                reason=result.reason, count=len(chunks),
             )
-            try:
-                result = await self._verifier.verify(
-                    query=query,
-                    candidates=candidates,
-                    retrieval_query=retrieval_query,
-                    context=context,
-                )
-            except Exception:
-                continue
 
-            if result.status == "passed":
-                self.tracer.log(
-                    "retrieval.loop", "verifier_retry_passed",
-                    attempt=attempt,
-                )
-                return result
-            if result.status == "failed":
-                # 重试中模型明确判定 failed,不再重试
-                break
-
-        return None
-
-    @staticmethod
-    def _final_chunks(
-        chunks: List[Chunk],
-        verification: Top3VerificationResult,
-    ) -> List[Chunk]:
-        """根据验证结果过滤 chunks,只返回 evidence_chunk_ids 中的 chunk。"""
-        ws = get_workspace()
-        processed = ws.data.get("processed_chunks") or ws.data.get("chunks") or chunks
-        if not verification.evidence_chunk_ids:
-            return list(processed)
-        evidence_set = set(verification.evidence_chunk_ids)
-        filtered = [c for c in processed if c.chunk_id in evidence_set]
-        return filtered if filtered else list(processed)
+        return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +329,7 @@ class DirectRetrievalSubAgent:
         self.model, self.cfg, self.tracer = model, cfg, tracer
 
     async def run(self, query: str, region_code: str = "000") -> List[Chunk]:
-        """固定流水线:intergrate_all 一次产出候选片段。
-
-        region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。
-        """
+        """固定流水线:intergrate_all 一次产出候选片段。"""
         ws = get_workspace()
         ws.stage = "retrieval"
         obs = json.loads(intergrate_all.func(query=query,
