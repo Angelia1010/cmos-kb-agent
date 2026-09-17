@@ -7,7 +7,7 @@ from typing import Dict
 @dataclass
 class Config:
     # ---- 检索循环(方案 3.1) ----
-    max_retrieval_rounds: int = 2        # 硬上限,第一版固定 2 轮
+    max_retrieval_rounds: int = 3        # 硬上限,固定 3 轮(intergrate_all→query_rewrite→intergrate_all)
     recall_size: int = 10
     fuse_top_n: int = 8
 

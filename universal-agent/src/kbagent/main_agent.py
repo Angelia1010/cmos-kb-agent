@@ -16,13 +16,11 @@ from typing import Any, List, Optional
 
 from .answer.agent import AnswerSubAgent
 from .processing.agent import ProcessingSubAgent
-# from .retrieval.agent import RetrievalSubAgent
-from .retrieval.agent import RetrievalKeywordSubAgent
+from .retrieval.agent import RetrievalSubAgent
 from .shared.cache import AnswerCache, normalize_query
 from .shared.config import Config, DEFAULT_CONFIG
 from .shared.knowledge_processing.bridge import retrieval_to_candidates
 from .shared.models import FinalAnswer, RetrievalParams, SourceRef
-# from .shared.search import ESClient, build_dsl
 from .shared.search import ESClient
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
@@ -69,7 +67,7 @@ class MainAgent:
         self.tracer = Tracer()
         self.tracer.log("run", "start", query=query, region_code=region_code)
         ws = RunWorkspace(query=query, cfg=self.cfg, es=self.es,
-                          tracer=self.tracer)
+                          tracer=self.tracer, model=self.model)
         set_workspace(ws)
         try:
             # ---- 快速通道 ----
@@ -82,11 +80,9 @@ class MainAgent:
                 hit.elapsed_ms = self.tracer.elapsed_ms()   # 命中耗时,而非原次耗时
                 return hit
 
-            # ---- ① 检索子智能体(直调一体化流水线,传省份信息) ----
-            # chunks = await RetrievalSubAgent(
-            chunks = await RetrievalKeywordSubAgent(
-                self.model, self.cfg, self.tracer,
-                judge_model=self.judge_model).run(query, region_code)
+            # ---- ① 检索子智能体(GoalLoop 三轮:intergrate_all→query_rewrite→intergrate_all) ----
+            chunks = await RetrievalSubAgent(
+                self.model, self.cfg, self.tracer).run(query, region_code)
 
             # ---- 阶段衔接:检索产物 → 处理阶段标准候选 ----
             ws.data["knowledge_candidates"] = retrieval_to_candidates(
