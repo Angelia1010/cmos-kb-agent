@@ -124,6 +124,7 @@ def intergrate_all(query: str = "", region_code: str = "000",
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
     ws.data["merged_results"] = merged
+    ws.data["keywords"] = list((result.get("keywords") if isinstance(result, dict) else []) or [])
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
