@@ -12,7 +12,8 @@ models:
       api_key: "${QWEN_API_KEY}"          # 环境变量注入,注意是 ${VAR} 语法
       base_url: "https://10.254.123.75:30006/v1"
       max_tokens: 8000
-      timeout: 600.0
+      # 观测完整请求耗时期间不设置 LLM 请求超时(注释即不传,缺省无限等待);排障结束后按需恢复
+      # timeout: 600.0
       max_retries: 2
       streaming: true
       cs_verify_ssl: false                # 内网自签证书:跳过证书校验(仅批准端点可用)

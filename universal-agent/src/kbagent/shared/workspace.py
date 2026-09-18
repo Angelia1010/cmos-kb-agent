@@ -25,6 +25,7 @@ class RunWorkspace:
     es: Optional[ESClient] = None
     tracer: Tracer = field(default_factory=Tracer)
     stage: str = ""
+    model: Any = None  # BaseChatModel,供工具内部调用 LLM(如 query_rewrite)
     data: Dict[str, Any] = field(default_factory=dict)   # chunks / keywords / last_dsl ...
 
 

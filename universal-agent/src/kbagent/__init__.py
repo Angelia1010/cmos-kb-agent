@@ -47,5 +47,7 @@ __all__ = [
     "MainAgent",
     "ScriptedChatModel",
     "ESClient", "MockESClient", "ProduceESClient",
-    "RetrievalSubAgent", "ProcessingSubAgent", "AnswerSubAgent",
+    "RetrievalSubAgent",
+    "ProcessingSubAgent",
+    "AnswerSubAgent",
 ]

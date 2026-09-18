@@ -23,11 +23,10 @@ from .shared.config import Config, DEFAULT_CONFIG
 from .shared.models import (
     USABILITY_NOT,
     FinalAnswer,
-    RetrievalParams,
     SourceRef,
     Usability,
 )
-from .shared.search import ESClient, build_dsl
+from .shared.search import ESClient, kresult_to_chunks
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
 
@@ -82,7 +81,7 @@ class MainAgent:
         self.tracer = Tracer()
         self.tracer.log("run", "start", query=query, region_code=region_code)
         ws = RunWorkspace(query=query, cfg=self.cfg, es=self.es,
-                          tracer=self.tracer)
+                          tracer=self.tracer, model=self.model)
         set_workspace(ws)
         try:
             # ---- 快速通道 ----
@@ -123,10 +122,10 @@ class MainAgent:
     def _degrade(self, query: str, reason: str) -> FinalAnswer:
         """降级:原始 query → 保守单轮关键词检索 → 返回 topN 原始片段。"""
         try:
-            from .shared import lexicon
-            params = RetrievalParams(keywords=lexicon.extract_keywords(query),
-                                     retrieval_mode="keyword")
-            hits = self.es.keyword_search(build_dsl(params, size=5))
+            result = (self.es.keyword_search(query=query)
+                      if hasattr(self.es, "keyword_search") else {})
+            merged = result.get("merged", []) if isinstance(result, dict) else []
+            hits = kresult_to_chunks(merged)[:5]
         except Exception:                               # noqa: BLE001
             hits = []
         # 降级来源:相关度按召回名次归一化(最相关一篇 = 100),无关键片段

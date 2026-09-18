@@ -4,7 +4,8 @@
 架构(参考 docs/0917/top3_verifier_integration_guide_20260917.md):
     RetrievalSubAgent 使用 uniagent GoalLoop:
       └─ 每轮 GoalLoop 迭代:
-           ① ReAct Agent 自主决定调用检索工具(intergrate_all / coarse_recall 等)
+           ① ReAct Agent 自主决定调用检索工具(intergrate_all / query_rewrite /
+              keyword_recall / vector_recall)
            ② 迭代结束后,ProcessingVerifier 自动运行:
               - ProcessingSubAgent.run (analyze → filter → markdown → rerank)
               - Top3AnswerabilityVerifier.verify
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from uniagent import AgentFeatures, Budget, BudgetConfig, create_agent
 from uniagent.verification.verifier import VerificationResult
@@ -37,29 +38,14 @@ from ..shared.knowledge_processing.models import (
 from ..shared.models import Chunk
 from ..shared.tracing import Tracer
 from ..shared.workspace import get_workspace
+from .prompt import RETRIEVAL_GOAL, RETRIEVAL_SYSTEM_PROMPT
 from .tools import (
     RETRIEVAL_TOOLS,
-    coarse_recall,
     intergrate_all,
-    keyword_extraction,
+    keyword_recall,
 )
 
 logger = logging.getLogger("kbagent.retrieval")
-
-RETRIEVAL_GOAL = (
-    "为用户问题召回足量、高相关的候选知识片段。"
-    "可用工具:intergrate_all(生产一体化流水线) / coarse_recall(关键词+向量混合召回) / "
-    "keyword_extraction / query_understanding / question_rewrite,由你自主决定调用顺序;"
-    "若收到验证失败反馈,请换策略(改写问题/放宽过滤/调整关键词)重新召回。"
-    "注意:intergrate_all 是生产一体化流水线(槽位提取→知识检索→原子表拼接),"
-    "仅接入生产 ngkm 检索时可用;离线/调试环境请用 coarse_recall。"
-)
-
-RETRIEVAL_SYSTEM_PROMPT = (
-    "你是候选知识检索子智能体,自主规划检索步骤。"
-    "每一轮迭代结束后,系统会自动对召回结果做处理与验证;"
-    "若收到 [验证失败] 反馈,请根据其中的建议调整检索策略并重新召回。"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -334,11 +320,12 @@ class DirectRetrievalSubAgent:
         ws.stage = "retrieval"
         obs = json.loads(intergrate_all.func(query=query,
                                               region_code=region_code))
-        if "error" in obs:
+        if "error" in obs and not ws.data.get("chunks"):
+            # 双路零召回/报错时,单走 keyword 通道再兜底一次
             self.tracer.log("retrieval", "intergrate_all_fallback",
                             reason=obs["error"])
-            keyword_extraction.func()
-            fallback = json.loads(coarse_recall.func())
+            fallback = json.loads(keyword_recall.func(query=query,
+                                                       region_code=region_code))
             if "error" in fallback and not ws.data.get("chunks"):
                 raise RuntimeError(
                     f"检索子智能体失败: {fallback['error']}")

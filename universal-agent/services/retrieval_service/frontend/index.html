@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Retrieval Service 调试台</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f8; color: #1f2329; font-size: 14px; line-height: 1.5;
+  }
+  h1 { margin: 0 0 12px; font-size: 18px; }
+  .nav { margin-bottom: 12px; }
+  .nav a { color: #165dff; text-decoration: none; font-size: 13px; margin-right: 12px; }
+  .nav a:hover { text-decoration: underline; }
+  .layout { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; }
+  .card {
+    background: #fff; border: 1px solid #e5e6eb; border-radius: 6px;
+    padding: 14px 16px; margin-bottom: 14px;
+  }
+  .card h2 { margin: 0 0 10px; font-size: 14px; color: #4e5969; font-weight: 600; }
+  .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .form-row .field { display: flex; flex-direction: column; gap: 4px; }
+  .form-row .field .lbl { color: #4e5969; font-size: 13px; }
+  .form-row .field.query { flex: 2; min-width: 280px; }
+  .form-row .field.region { flex: 1; min-width: 140px; }
+  .form-row .field.mode { flex: 1; min-width: 180px; }
+  .form-row .field.vmode { flex: 1; min-width: 160px; }
+  .form-row .field.kid { flex: 1; min-width: 200px; }
+  .form-row .field.action { flex: 0 0 auto; }
+  .form-row .field.batch-count { flex: 0 0 160px; }
+  /* 批量测试表格 */
+  .batch-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .batch-table th, .batch-table td {
+    border: 1px solid #e5e6eb; padding: 6px 8px; vertical-align: top;
+    word-break: break-all;
+  }
+  .batch-table th {
+    background: #f7f8fa; color: #4e5969; text-align: left; font-weight: 600;
+  }
+  .batch-table tr.hit td { background: #f0fff0; }
+  .batch-table tr.miss td { background: #fff5f5; }
+  .batch-table .idx { text-align: center; width: 36px; }
+  .batch-table .q { min-width: 200px; max-width: 320px; }
+  .batch-table .kids { min-width: 200px; }
+  .batch-table .status { text-align: center; width: 80px; }
+  .batch-summary {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+    background: #f7f8fa; padding: 10px 12px; border-radius: 4px; margin-bottom: 10px;
+  }
+  .batch-summary .stat { color: #4e5969; font-size: 13px; }
+  .batch-summary .stat .v { font-weight: 600; color: #1f2329; }
+  input[type=text], textarea, select {
+    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
+    font-family: inherit; font-size: 13px; background: #fff;
+  }
+  textarea { resize: vertical; min-height: 38px; }
+  button {
+    background: #165dff; color: #fff; border: none; border-radius: 4px;
+    padding: 8px 16px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: #0e42d2; }
+  button:disabled { background: #94bfff; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px; }
+  .meta div { background: #f7f8fa; border-radius: 4px; padding: 6px 8px; }
+  .meta .k { color: #86909c; font-size: 12px; }
+  .meta .v { font-weight: 600; word-break: break-all; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+  .badge.ok { background: #e8ffea; color: #00b42a; }
+  .badge.warn { background: #fff3e0; color: #ff7d00; }
+  .badge.err { background: #ffece8; color: #f53f3f; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: #e8f3ff; color: #165dff; border-radius: 3px; padding: 1px 6px; font-size: 12px; }
+  .chunk { border: 1px solid #e5e6eb; border-radius: 4px; margin-bottom: 8px; }
+  .chunk-head { padding: 8px 10px; background: #f7f8fa; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .chunk-head .t { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chunk-head .s { color: #86909c; font-size: 12px; white-space: nowrap; }
+  .chunk-body { padding: 10px; display: none; }
+  .chunk.open .chunk-body { display: block; }
+  .chunk-body pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  .chunk-body .kv { font-size: 12px; color: #4e5969; margin-bottom: 6px; }
+  details summary { cursor: pointer; color: #4e5969; margin: 6px 0; }
+  details pre { background: #1f2329; color: #c9cdd4; padding: 10px; border-radius: 4px; overflow: auto; font-size: 12px; }
+  .hint { color: #86909c; font-size: 12px; margin-top: 4px; }
+  .empty { color: #86909c; text-align: center; padding: 20px; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/debug">检索调试</a>
+  <a href="/test">召回率测试</a>
+</div>
+<h1>Retrieval Service 调试台</h1>
+<div class="layout">
+  <div class="card">
+    <h2>请求参数</h2>
+    <div class="form-row">
+      <div class="field query">
+        <span class="lbl">query *</span>
+        <textarea id="query" placeholder="输入检索问题,如:如何办理5G套餐"></textarea>
+      </div>
+      <div class="field region">
+        <span class="lbl">region_code</span>
+        <input type="text" id="region_code" value="000" placeholder="省份名或区号,如 福建/591/000">
+      </div>
+      <!-- 原mode字段(已删除,默认integrate)
+      <div class="field mode">
+        <span class="lbl">mode(召回路径)</span>
+        <select id="mode" disabled>
+          <option value="integrate" selected>integrate — GoalLoop 三轮(intergrate_all→query_rewrite→intergrate_all)</option>
+        </select>
+      </div>
+      -->
+      <!-- 原vmode字段(已删除,默认both)
+      <div class="field vmode" id="vmodeField">
+        <span class="lbl">vector_mode(向量模板)</span>
+        <select id="vector_mode">
+          <option value="new">new — 新模板</option>
+          <option value="old">old — 旧模板</option>
+          <option value="both" selected>both — 双模板混合(默认)</option>
+        </select>
+      </div>
+      -->
+      <div class="field kid">
+        <span class="lbl">正确 kid</span>
+        <input type="text" id="correct_kid" placeholder="输入期望命中的知识ID(chunk_id)">
+      </div>
+      <div class="field action">
+        <span class="lbl">&nbsp;</span>
+        <div class="row">
+          <button id="send">发送</button>
+          <span id="status" class="hint"></span>
+        </div>
+      </div>
+    </div>
+    <div class="hint" style="margin-top:10px">请求路径:POST <span id="basePath"></span>/retrieve</div>
+    <!-- 批量测试行:从测试集选取前 count 条逐条执行检索 -->
+    <div class="form-row" style="margin-top:14px;border-top:1px dashed #e5e6eb;padding-top:12px">
+      <div class="field batch-count">
+        <span class="lbl">测试条数</span>
+        <!-- 2026-09-17 14:30:47 曾改为 <input type="number"> 自定义输入,回退到 11:31:29 版本(下拉框)
+        <input type="number" id="batchCount" min="0" step="1" value="10"
+               placeholder="输入数字,0 或留空表示全部">
+        -->
+        <select id="batchCount">
+          <option value="10" selected>10</option>
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="0">全部</option>
+        </select>
+      </div>
+      <div class="field action">
+        <span class="lbl">&nbsp;</span>
+        <div class="row">
+          <button id="batchSend">批量测试</button>
+          <span id="batchStatus" class="hint"></span>
+        </div>
+      </div>
+      <div class="hint" style="flex:1;min-width:200px;align-self:center">
+        请求路径:POST <span id="batchPath"></span>/retrieve/batch · 命中:召回 kid 至少含一个 knowledge_id
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>响应结果</h2>
+    <div id="result"><div class="empty">尚未发送请求</div></div>
+  </div>
+  <div class="card">
+    <h2>批量测试结果</h2>
+    <div id="batchResult"><div class="empty">尚未批量测试</div></div>
+  </div>
+</div>
+
+<script>
+var BASE = "__BASE_PATH__";
+document.getElementById("basePath").textContent = BASE;
+document.getElementById("batchPath").textContent = BASE;
+
+var sendBtn = document.getElementById("send");
+var statusEl = document.getElementById("status");
+
+var batchBtn = document.getElementById("batchSend");
+var batchStatusEl = document.getElementById("batchStatus");
+
+// 原mode/vmode选择器(已删除,默认integrate/both)
+// var modeSel = document.getElementById("mode");
+// var vmodeField = document.getElementById("vmodeField");
+//
+// function toggleVmodeVisibility() {
+//   // mode 固定 integrate,vector_mode 始终显示
+//   vmodeField.style.display = "";
+// }
+// toggleVmodeVisibility();
+
+sendBtn.addEventListener("click", function() {
+  var query = document.getElementById("query").value.trim();
+  var region_code = document.getElementById("region_code").value.trim() || "000";
+  var correct_kid = document.getElementById("correct_kid").value.trim();
+  // mode/vector_mode 已删除选择器,固定默认值
+  var mode = "integrate";
+  var vector_mode = "both";
+  if (!query) { alert("query 不能为空"); return; }
+
+  sendBtn.disabled = true;
+  statusEl.textContent = "请求中...";
+  document.getElementById("result").innerHTML = '<div class="empty">请求中...</div>';
+
+  var body = { query: query, region_code: region_code, mode: mode, vector_mode: vector_mode };
+
+  var t0 = performance.now();
+  fetch(BASE + "/retrieve", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  })
+  .then(function(r) { return r.text().then(function(txt){ return {ok: r.ok, status: r.status, text: txt}; }); })
+  .then(function(resp) {
+    var dt = Math.round(performance.now() - t0);
+    statusEl.textContent = "HTTP " + resp.status + " · 网关 " + dt + "ms";
+    var data;
+    try { data = JSON.parse(resp.text); }
+    catch(e) { renderRaw(resp.text, resp.status); return; }
+    render(data);
+  })
+  .catch(function(err) {
+    statusEl.textContent = "请求失败";
+    document.getElementById("result").innerHTML =
+      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
+  })
+  .finally(function() { sendBtn.disabled = false; });
+});
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function badge(cls, txt) { return '<span class="badge ' + cls + '">' + txt + "</span>"; }
+
+function render(data) {
+  var rtnCode = data.rtnCode, rtnMsg = data.rtnMsg || "", obj = data.object || {};
+  var el = document.getElementById("result");
+
+  if (rtnCode === "0" && obj && obj.chunks) {
+    var bc = obj.outcome === "success" ? "ok"
+           : obj.outcome === "degraded" ? "warn" : "err";
+    var deg = obj.degraded ? badge("warn", "已降级") : "";
+    var html = "";
+    html += '<div class="meta">';
+    html += metaCell("rtnCode", badge(bc, rtnCode));
+    html += metaCell("outcome", obj.outcome || "-");
+    html += metaCell("recalled", obj.recalled_count);
+    html += metaCell("elapsedMs", obj.elapsed_ms);
+    html += metaCell("region", obj.region_code || "-");
+    html += metaCell("traceId", obj.trace_id || "-");
+    html += metaCell("requestId", obj.request_id || "-");
+    html += metaCell("rtnMsg", escapeHtml(rtnMsg) + deg);
+    html += "</div>";
+
+    // ── kid 命中展示区 ──
+    var correctKid = document.getElementById("correct_kid").value.trim();
+    // 原:从 chunks 提取 chunk_id 作为 kid(不准确,chunk_id 是片段ID非知识ID)
+    // var recalledKids = (obj.chunks || []).map(function(c) { return c.chunk_id; });
+    // 新:直接用后端返回的 kids 字段(ranked_kids,按得分降序)
+    var recalledKids = obj.kids || [];
+    var kidHit = correctKid && recalledKids.indexOf(correctKid) >= 0;
+    html += '<div style="margin:8px 0;padding:12px;background:#f7f8fa;border-radius:6px;border:1px solid #e5e6eb">';
+    html += '<div class="k" style="color:#4e5969;font-size:13px;font-weight:600;margin-bottom:8px">kid 命中判定</div>';
+    html += '<div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap;margin-bottom:10px">';
+    html += '<div><div class="k" style="color:#86909c;font-size:12px">正确 kid</div><div style="font-weight:600;word-break:break-all">' + escapeHtml(correctKid || '-') + '</div></div>';
+    if (correctKid) {
+      html += '<div><div class="k" style="color:#86909c;font-size:12px">命中状态</div><div>' + (kidHit ? badge("ok", "✓ 命中") : badge("err", "✗ 未命中")) + '</div></div>';
+    } else {
+      html += '<div><div class="k" style="color:#86909c;font-size:12px">命中状态</div><div>' + badge("warn", "未填写正确 kid") + '</div></div>';
+    }
+    html += '<div><div class="k" style="color:#86909c;font-size:12px">召回 kid 数</div><div style="font-weight:600">' + recalledKids.length + '</div></div>';
+    html += '</div>';
+    html += '<div><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">召回的 kid 列表</div>';
+    html += '<div class="tags">';
+    if (recalledKids.length) {
+      recalledKids.forEach(function(kid) {
+        var isHitKid = correctKid && kid === correctKid;
+        var style = isHitKid
+          ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 8px'
+          : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
+        html += '<span class="tag" style="' + style + '">' + escapeHtml(kid) + (isHitKid ? ' ✓' : '') + '</span>';
+      });
+    } else {
+      html += '<span class="hint">零召回</span>';
+    }
+    html += '</div></div>';
+    html += '</div>';
+
+    var kws = obj.keywords || [];
+    html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">keywords(' + kws.length + ")</div>";
+    html += '<div class="tags">' + (kws.length ? kws.map(function(k){ return '<span class="tag">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
+
+    // 原 rewritten_queries 显示(查询重写,已弃用,改为关键词重写)
+    // var rewrites = obj.rewritten_queries || [];
+    // html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">rewritten_queries(' + rewrites.length + ")</div>";
+    // html += '<div class="tags">' + (rewrites.length ? rewrites.map(function(q){ return '<span class="tag" style="background:#fff0f6;color:#d91ad9">' + escapeHtml(q) + "</span>"; }).join("") : '<span class="hint">无(query_rewrite 未产出或首轮已满足)</span>') + "</div></div>";
+    var rewrittenKeywords = obj.rewritten_keywords || [];
+    html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">rewritten_keywords(' + rewrittenKeywords.length + ")</div>";
+    html += '<div class="tags">' + (rewrittenKeywords.length ? rewrittenKeywords.map(function(k){ return '<span class="tag" style="background:#fff0f6;color:#d91ad9">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无(query_rewrite 未产出或首轮已满足)</span>') + "</div></div>";
+
+    var chunks = obj.chunks || [];
+    html += '<div style="margin-top:10px"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:6px">chunks(' + chunks.length + ")</div>";
+    if (!chunks.length) html += '<div class="empty">零召回</div>';
+    else chunks.forEach(function(c, i) {
+      html += '<div class="chunk" id="chunk-' + i + '">';
+      html += '<div class="chunk-head" onclick="toggleChunk(' + i + ')">';
+      html += '<span class="t">#' + (i+1) + " " + escapeHtml(c.doc_title || c.chunk_id) + "</span>";
+      html += '<span class="s">score ' + (c.score != null ? Number(c.score).toFixed(4) : "-") + " · " + escapeHtml(c.category || "-") + "</span>";
+      html += "</div>";
+      html += '<div class="chunk-body">';
+      html += '<div class="kv">chunk_id: ' + escapeHtml(c.chunk_id) + " · doc_id: " + escapeHtml(c.doc_id) + " · v" + escapeHtml(c.version || "-") + " · " + escapeHtml(c.updated_at || "-") + "</div>";
+      html += '<pre>' + escapeHtml(c.content || "") + "</pre>";
+      if (c.source_chunk_ids && c.source_chunk_ids.length)
+        html += '<div class="kv">source_chunk_ids: ' + escapeHtml(c.source_chunk_ids.join(", ")) + "</div>";
+      if (c.position && Object.keys(c.position).length)
+        html += '<div class="kv">position: ' + escapeHtml(JSON.stringify(c.position)) + "</div>";
+      if (c.extra && Object.keys(c.extra).length)
+        html += '<div class="kv">extra: ' + escapeHtml(JSON.stringify(c.extra)) + "</div>";
+      html += "</div></div>";
+    });
+    html += "</div>";
+    html += rawJson(data);
+    el.innerHTML = html;
+  } else {
+    var eb = rtnCode && rtnCode !== "0" ? "err" : "warn";
+    el.innerHTML = '<div class="meta">' +
+      metaCell("rtnCode", badge(eb, rtnCode || "-")) +
+      metaCell("rtnMsg", escapeHtml(rtnMsg)) +
+      "</div>" + rawJson(data);
+  }
+}
+
+function renderRaw(txt, status) {
+  document.getElementById("result").innerHTML =
+    '<div class="meta">' + metaCell("HTTP", badge("err", status)) + "</div>" +
+    "<details open><summary>原始响应</summary><pre>" + escapeHtml(txt) + "</pre></details>";
+}
+
+function metaCell(k, v) { return '<div><div class="k">' + k + '</div><div class="v">' + v + "</div></div>"; }
+
+function rawJson(data) {
+  return "<details><summary>原始 JSON</summary><pre>" + escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
+}
+
+function toggleChunk(i) {
+  var el = document.getElementById("chunk-" + i);
+  if (el) el.classList.toggle("open");
+}
+
+// ── 批量测试(非流式) ── 回退到 2026-09-17 11:31:29 版本 ────────────────────
+// 2026-09-17 14:39:26 曾改为流式 /retrieve/batch/stream,回退到非流式 /retrieve/batch:
+// 等所有请求完成后一次性返回 JSON,前端解析后渲染表格。
+batchBtn.addEventListener("click", function() {
+  var count = parseInt(document.getElementById("batchCount").value, 10) || 0;
+
+  var el = document.getElementById("batchResult");
+  el.innerHTML = '<div class="empty">批量请求中...</div>';
+  batchBtn.disabled = true;
+  batchStatusEl.textContent = "批量请求中...";
+
+  fetch(BASE + "/retrieve/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ count: count })
+  }).then(function(resp) {
+    return resp.json().then(function(data) {
+      if (!resp.ok || (data.rtnCode && data.rtnCode !== "0")) {
+        batchStatusEl.textContent = "HTTP " + resp.status + " · " + (data.rtnMsg || "失败");
+        el.innerHTML = '<div class="meta">' +
+          metaCell("HTTP", badge("err", resp.status)) +
+          metaCell("rtnMsg", data.rtnMsg || "-") +
+          "</div>" +
+          "<details open><summary>原始响应</summary><pre>" +
+          escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
+        batchBtn.disabled = false;
+        return;
+      }
+
+      var obj = data.object || {};
+      var results = obj.results || [];
+      var total = obj.total != null ? obj.total : results.length;
+      var hitCount = obj.hit_count != null ? obj.hit_count : results.filter(function(r){ return r.hit; }).length;
+      var totalElapsedMs = obj.total_elapsed_ms || 0;
+      var rate = total > 0 ? (hitCount / total * 100).toFixed(1) : "0.0";
+
+      var html =
+        '<div class="batch-summary">' +
+          '<div class="stat">总数 <span class="v">' + total + '</span></div>' +
+          '<div class="stat">命中 <span class="v" style="color:#00b42a">' + hitCount + '</span></div>' +
+          '<div class="stat">未命中 <span class="v" style="color:#f53f3f">' + (total - hitCount) + '</span></div>' +
+          '<div class="stat">命中率 <span class="v">' + rate + '%</span></div>' +
+          '<div class="stat">总耗时 <span class="v">' + totalElapsedMs + 'ms</span></div>' +
+        '</div>' +
+        '<table class="batch-table"><thead><tr>' +
+          '<th class="idx">#</th>' +
+          '<th class="q">用户问</th>' +
+          '<th>区域</th>' +
+          '<th class="kids">期望 kid</th>' +
+          '<th class="kids">召回 kid</th>' +
+          '<th class="status">命中</th>' +
+          '<th>状态</th>' +
+          '<th>耗时</th>' +
+        '</tr></thead><tbody>';
+
+      results.forEach(function(r) {
+        var rowCls = r.hit ? "hit" : "miss";
+        html += '<tr class="' + rowCls + '">';
+        html += '<td class="idx">' + r.index + '</td>';
+        html += '<td class="q">' + escapeHtml(r.user_query || "") + '</td>';
+        html += '<td>' + escapeHtml(r.region_code || "-") + '</td>';
+        // 期望 kid(命中的高亮)
+        var expectedKids = r.expected_kids || [];
+        var hitKidsSet = {};
+        (r.hit_kids || []).forEach(function(k) { hitKidsSet[k] = true; });
+        html += '<td class="kids">';
+        if (expectedKids.length) {
+          html += '<div class="tags">';
+          expectedKids.forEach(function(k) {
+            var isHit = !!hitKidsSet[k];
+            var style = isHit
+              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+              : 'background:#e5e6eb;color:#4e5969;padding:1px 6px';
+            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isHit ? ' ✓' : '') + '</span>';
+          });
+          html += '</div>';
+        } else {
+          html += '<span class="hint">未标注</span>';
+        }
+        html += '</td>';
+        // 召回 kid(命中 expected 的高亮)
+        var recalledKids = r.recalled_kids || [];
+        var expectedSet = {};
+        expectedKids.forEach(function(k) { expectedSet[k] = true; });
+        html += '<td class="kids">';
+        if (recalledKids.length) {
+          html += '<div class="tags">';
+          recalledKids.forEach(function(k) {
+            var isExpected = !!expectedSet[k];
+            var style = isExpected
+              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+              : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
+            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isExpected ? ' ✓' : '') + '</span>';
+          });
+          html += '</div>';
+        } else {
+          html += '<span class="hint">零召回</span>';
+        }
+        html += '</td>';
+        // 命中状态
+        if (r.outcome === "error" || r.outcome === "timeout") {
+          html += '<td class="status">' + badge("err", "异常") + '</td>';
+        } else if (!expectedKids.length) {
+          html += '<td class="status">' + badge("warn", "未标注") + '</td>';
+        } else if (r.hit) {
+          html += '<td class="status">' + badge("ok", "✓ 命中") + '</td>';
+        } else {
+          html += '<td class="status">' + badge("err", "✗ 未命中") + '</td>';
+        }
+        // 单条 outcome
+        html += '<td>' + escapeHtml(r.outcome || "-") +
+          (r.recalled_count != null ? ' / ' + r.recalled_count + '片' : '') + '</td>';
+        // 单条耗时
+        html += '<td>' + (r.elapsed_ms || 0) + 'ms</td>';
+        html += '</tr>';
+      });
+
+      html += '</tbody></table>';
+      el.innerHTML = html;
+      batchStatusEl.textContent = "完成 " + total + " 条 · 命中 " + hitCount + " · " + rate + "% · " + totalElapsedMs + "ms";
+      batchBtn.disabled = false;
+    });
+  }).catch(function(err) {
+    batchStatusEl.textContent = "请求失败";
+    document.getElementById("batchResult").innerHTML =
+      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
+    batchBtn.disabled = false;
+  });
+});
+
+/*
+// ── 以下为 2026-09-17 14:39:26 流式 NDJSON 版本(回退到 11:31:29 后注释保留) ──
+batchBtn.addEventListener("click", function() {
+  var countVal = document.getElementById("batchCount").value.trim();
+  var count = countVal === "" ? 0 : parseInt(countVal, 10);
+  if (isNaN(count) || count < 0) { alert("测试条数需为非负整数,留空表示全部"); return; }
+
+  // 初始化空表格 UI:summary 区 + 空表体,后续逐条 append
+  var el = document.getElementById("batchResult");
+  el.innerHTML =
+    '<div class="batch-summary">' +
+      '<div class="stat">总数 <span class="v" id="bsTotal">0</span></div>' +
+      '<div class="stat">已完成 <span class="v" id="bsDone">0</span></div>' +
+      '<div class="stat">命中 <span class="v" style="color:#00b42a" id="bsHit">0</span></div>' +
+      '<div class="stat">未命中 <span class="v" style="color:#f53f3f" id="bsMiss">0</span></div>' +
+      '<div class="stat">命中率 <span class="v" id="bsRate">0.0%</span></div>' +
+      '<div class="stat">总耗时 <span class="v" id="bsMs">0ms</span></div>' +
+    '</div>' +
+    '<table class="batch-table"><thead><tr>' +
+      '<th class="idx">#</th>' +
+      '<th class="q">用户问</th>' +
+      '<th>区域</th>' +
+      '<th class="kids">期望 kid</th>' +
+      '<th class="kids">召回 kid</th>' +
+      '<th class="status">命中</th>' +
+      '<th>状态</th>' +
+      '<th>耗时</th>' +
+    '</tr></thead><tbody id="batchTbody"></tbody></table>';
+
+  var tbody = document.getElementById("batchTbody");
+  var total = 0, done = 0, hitCount = 0;
+  var t0 = performance.now();
+  batchBtn.disabled = true;
+  batchStatusEl.textContent = "批量请求中...";
+
+  fetch(BASE + "/retrieve/batch/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ count: count })
+  }).then(function(resp) {
+    if (!resp.ok) {
+      // 错误响应是非流式 JSON,直接读文本
+      return resp.text().then(function(txt) {
+        var dt = Math.round(performance.now() - t0);
+        batchStatusEl.textContent = "HTTP " + resp.status + " · 网关 " + dt + "ms";
+        el.innerHTML = '<div class="meta">' +
+          metaCell("HTTP", badge("err", resp.status)) + '</div>' +
+          "<details open><summary>原始响应</summary><pre>" + escapeHtml(txt) + "</pre></details>";
+        throw new Error("HTTP " + resp.status);
+      });
+    }
+    var reader = resp.body.getReader();
+    var decoder = new TextDecoder("utf-8");
+    var buffer = "";
+
+    function updateSummary() {
+      document.getElementById("bsDone").textContent = done;
+      document.getElementById("bsHit").textContent = hitCount;
+      document.getElementById("bsMiss").textContent = done - hitCount;
+      var rate = done > 0 ? (hitCount / done * 100).toFixed(1) : "0.0";
+      document.getElementById("bsRate").textContent = rate + "%";
+    }
+
+    function handleMsg(msg) {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "start") {
+        total = msg.total || 0;
+        document.getElementById("bsTotal").textContent = total;
+        batchStatusEl.textContent = "批量请求中... 0/" + total;
+      } else if (msg.type === "item") {
+        done++;
+        var r = msg.data || {};
+        if (r.hit) hitCount++;
+        appendBatchRow(r);
+        updateSummary();
+        batchStatusEl.textContent = "批量请求中... " + done + "/" + total +
+          " · 命中 " + hitCount;
+      } else if (msg.type === "summary") {
+        var s = msg.data || {};
+        if (s.total_elapsed_ms != null) {
+          document.getElementById("bsMs").textContent = s.total_elapsed_ms + "ms";
+        }
+        if (s.hit_count != null) {
+          hitCount = s.hit_count;
+          updateSummary();
+        }
+        var dt = Math.round(performance.now() - t0);
+        batchStatusEl.textContent = "完成 " + done + " 条 · 命中 " + hitCount +
+          " · 网关 " + dt + "ms";
+      }
+    }
+
+    function processBuffer() {
+      var lines = buffer.split("\n");
+      // 最后一段可能不完整,留到下次拼接
+      buffer = lines.pop();
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line) continue;
+        try { handleMsg(JSON.parse(line)); }
+        catch(e) { console.warn("解析流消息失败:", line, e); }
+      }
+    }
+
+    function appendBatchRow(r) {
+      var rowCls = r.hit ? "hit" : "miss";
+      var html = '<tr class="' + rowCls + '">';
+      html += '<td class="idx">' + r.index + '</td>';
+      html += '<td class="q">' + escapeHtml(r.user_query || "") + '</td>';
+      html += '<td>' + escapeHtml(r.region_code || "-") + '</td>';
+      // 期望 kid(命中的高亮)
+      var expectedKids = r.expected_kids || [];
+      var hitKidsSet = {};
+      (r.hit_kids || []).forEach(function(k) { hitKidsSet[k] = true; });
+      html += '<td class="kids">';
+      if (expectedKids.length) {
+        html += '<div class="tags">';
+        expectedKids.forEach(function(k) {
+          var isHit = !!hitKidsSet[k];
+          var style = isHit
+            ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+            : 'background:#e5e6eb;color:#4e5969;padding:1px 6px';
+          html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isHit ? ' ✓' : '') + '</span>';
+        });
+        html += '</div>';
+      } else {
+        html += '<span class="hint">未标注</span>';
+      }
+      html += '</td>';
+      // 召回 kid(命中 expected 的高亮)
+      var recalledKids = r.recalled_kids || [];
+      var expectedSet = {};
+      expectedKids.forEach(function(k) { expectedSet[k] = true; });
+      html += '<td class="kids">';
+      if (recalledKids.length) {
+        html += '<div class="tags">';
+        recalledKids.forEach(function(k) {
+          var isExpected = !!expectedSet[k];
+          var style = isExpected
+            ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+            : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
+          html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isExpected ? ' ✓' : '') + '</span>';
+        });
+        html += '</div>';
+      } else {
+        html += '<span class="hint">零召回</span>';
+      }
+      html += '</td>';
+      // 命中状态
+      if (r.outcome === "error" || r.outcome === "timeout") {
+        html += '<td class="status">' + badge("err", "异常") + '</td>';
+      } else if (!expectedKids.length) {
+        html += '<td class="status">' + badge("warn", "未标注") + '</td>';
+      } else if (r.hit) {
+        html += '<td class="status">' + badge("ok", "✓ 命中") + '</td>';
+      } else {
+        html += '<td class="status">' + badge("err", "✗ 未命中") + '</td>';
+      }
+      // 单条 outcome
+      html += '<td>' + escapeHtml(r.outcome || "-") +
+        (r.recalled_count != null ? ' / ' + r.recalled_count + '片' : '') + '</td>';
+      // 单条耗时
+      html += '<td>' + (r.elapsed_ms || 0) + 'ms</td>';
+      html += '</tr>';
+      tbody.insertAdjacentHTML("beforeend", html);
+    }
+
+    function read() {
+      reader.read().then(function(result) {
+        if (result.done) {
+          // 处理残余 buffer
+          if (buffer.trim()) {
+            try { handleMsg(JSON.parse(buffer.trim())); } catch(e) {}
+          }
+          batchBtn.disabled = false;
+          if (done < total) {
+            batchStatusEl.textContent += " · 异常中断(" + done + "/" + total + ")";
+          }
+          return;
+        }
+        buffer += decoder.decode(result.value, { stream: true });
+        processBuffer();
+        read();
+      }).catch(function(err) {
+        batchStatusEl.textContent = "流读取失败: " + String(err);
+        batchBtn.disabled = false;
+      });
+    }
+    read();
+  }).catch(function(err) {
+    if (String(err).indexOf("HTTP ") === 0) {
+      // 错误响应已在上面处理,这里不重复
+      batchBtn.disabled = false;
+      return;
+    }
+    batchStatusEl.textContent = "请求失败";
+    document.getElementById("batchResult").innerHTML =
+      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
+    batchBtn.disabled = false;
+  });
+});
+*/
+</script>
+</body>
+</html>

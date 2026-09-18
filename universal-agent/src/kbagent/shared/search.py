@@ -1,80 +1,37 @@
 # -*- coding: utf-8 -*-
-"""检索层:结构化参数校验 → 模板拼装 ES DSL → 混合召回 → RRF 融合。
-
-对应方案 3.2 / 3.3:
-- LLM 永远不接触 DSL 字符串,只输出 RetrievalParams;
-- 字段白名单 + 值域夹紧在 build_dsl 中强制执行,消除注入与语法错误;
-- BM25 与向量 kNN 双通道并行,RRF 融合。
-
-客户端实现:
-- MockESClient    内置坐席知识库样例数据,离线演示/测试用;
-- ProduceESClient 生产 ngkm 检索(槽位提取 → 知识主索引召回 → 原子表拼接),
-                  一体化流水线经 ``full_recall`` 暴露,并映射为标准
-                  ``ESClient`` 接口(keyword_search / vector_search)。
-"""
 from __future__ import annotations
 
-import ast
 import json
 import logging
+import re
+import time
+import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from jinja2 import Template as JinjaTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from .models import Chunk, RetrievalParams, new_id
+from .models import Chunk, new_id
 
 logger = logging.getLogger("kbagent.search")
 
-# ---- 字段白名单(方案 3.2:代码侧校验) ----
-ALLOWED_FILTER_FIELDS = {"category", "status", "region"}
-ALLOWED_BOOST_FIELDS = {"title", "content", "keywords"}
-
-
-# ── ngkm 检索请求模板(Jinja2 占位符 {{ var }}) ─────────────────────────
-_INFO_RECALL_TEMPLATE = """{
-  "beans": [],
-  "params": {
-    "indexType": "knowledges_info",
-    "indexName": "ngkm.knowledges_{{ region_code }}",
-    "page": "1",
-    "size": "100",
-    "keyWord": "{{ keyword }}",
-    "searchInfo": "knowledgeName=10,klgAliasName=5",
-    "analysisType": "smart",
-    "relCalculus": "OR",
-    "highlightField": "knowledgeName,klgAliasName"
-  }
-}"""
-
-_ATOM_RECALL_TEMPLATE = """{
-  "beans": [
-    {"column": "knowledgeId", "value": "{{ knowledgeId }}", "type": "any"}
-  ],
-  "params": {
-        "indexType": "_doc",
-        "mandatoryField": "knowledgeId,paramType,klgAttrAtomId,paramName,content,wkuntt,srcTemplateAttrAtomId,channelCode,groupId,except,annotation,isSendMessage,srcTmpltGrpngId",
-        "indexName": "ngkm.knowledge_atom_{{ region_code }}",
-        "ignoreField": "_id"
-    }
-}"""
-
-_PROVINCE_TO_REGION = {
-        "福建": "591", "甘肃": "931", "海南": "898", "河北": "311",
-        "黑龙江": "451", "河南": "371", "宁夏": "951", "四川": "280",
-        "云南": "871", "全国": "000",
-    }
-
-_SLOT_EXTRACT_URL = "http://restapi.ly4.tyyt.cmos:20070/slot_extract_unified"
-_NGKM_SEARCH_URL = ("http://restapi.ngkmsearch.cs.glb.cmos:20070"
-                    "/ngkmSearch/ws/int/busiSearcher/busiSearcherInterService")
-
-
+#导入各类请求的模板配置
+from .search_config import (
+    _ATOM_RECALL_TEMPLATE, #原子请求模板
+    _INFO_RECALL_TEMPLATE, #信息请求模板
+    _NGKM_SEARCH_URL, #ngkm 检索接口
+    _PROVINCE_TO_REGION, #省份名 → 区号 映射
+    _VECTOR_CONTENT_FIELD, #vector 搜索内容字段
+    _VECTOR_ID_FIELD, #vector 搜索ID字段
+    _VECTOR_PAYLOADS, #vector 搜索请求体
+    _VECTOR_SEARCH_URL, #vector 搜索接口
+    _VECTOR_TITLE_FIELD, #vector 搜索标题字段
+)
 def _region_code(value: str) -> str:
     """省份名 → 区号;已是区号(或其他值)原样返回。"""
     return _PROVINCE_TO_REGION.get(value, value)
-
 
 def _preview(value: Any, limit: int = 800) -> str:
     """日志安全预览:dict/list 转 JSON,控制台换行压成空格,超长截断。"""
@@ -85,7 +42,6 @@ def _preview(value: Any, limit: int = 800) -> str:
     s = s.replace("\n", " ").replace("\r", " ")
     return s if len(s) <= limit else s[:limit] + f"...(共{len(s)}字符)"
 
-
 def _extract_doc_list(parsed: Any) -> List[dict]:
     """从 ngkm 检索响应的 object 解析结果中提取知识条目列表。
 
@@ -95,65 +51,101 @@ def _extract_doc_list(parsed: Any) -> List[dict]:
     if isinstance(parsed, list):
         return [d for d in parsed if isinstance(d, dict)]
     if isinstance(parsed, dict):
-        for key in ("docment", "document", "documents", "docs"):
+        for key in ("document","data"):
             docs = parsed.get(key)
             if isinstance(docs, list):
-                logger.info("ngkm 响应从字段 %r 提取条目列表,共 %d 条",
-                            key, len(docs))
+                # logger.info("ngkm 响应从字段 %r 提取条目列表,共 %d 条",
+                #             key, len(docs))
                 return [d for d in docs if isinstance(d, dict)]
         return [parsed] if parsed else []
     return []
 
+def vresult_to_chunks(resp: Any, source: str = "vector") -> List[Chunk]:
+    """处理 vector_search 返回的结果 → 标准 Chunk 列表。
 
-def build_dsl(params: RetrievalParams, size: int = 10) -> Dict[str, Any]:
-    """由结构化参数拼装 keyword 通道的 ES DSL。只认白名单字段。"""
-    terms = [t for t in (params.keywords + params.expanded_terms) if t]
-    boosts = {k: v for k, v in params.boost_fields.items() if k in ALLOWED_BOOST_FIELDS}
-    if not boosts:
-        boosts = {"title": 2.0, "content": 1.0}
-    fields = [f"{name}^{weight}" for name, weight in boosts.items()]
+    支持两种输入:
+    1. both 模式返回的 dict(含 new/old/all 键):直接处理 all 条目列表(已去重);
+    2. new/old 单路原始响应:walk 提取条目(兼容 object JSON 字符串包裹)。
+    """
+    chunks: List[Chunk] = []
+    seen: set = set()
 
-    must: List[Dict[str, Any]] = [{
-        "multi_match": {
-            "query": " ".join(terms) if terms else "*",
-            "fields": fields,
-            "type": "best_fields",
-        }
-    }]
-    filt: List[Dict[str, Any]] = [
-        {"term": {field: value}}
-        for field, value in params.filters.items()
-        if field in ALLOWED_FILTER_FIELDS          # 白名单外的过滤字段直接丢弃
-    ]
-    return {"size": size, "query": {"bool": {"must": must, "filter": filt}}}
+    def _info_of(entry: Dict[str, Any]) -> Dict[str, Any]:
+        info = entry.get("info")
+        return info if isinstance(info, dict) else {}
 
+    def add_entry(entry: Dict[str, Any]) -> None:
+        info = _info_of(entry)
+        kid = str(entry.get(_VECTOR_ID_FIELD) or info.get(_VECTOR_ID_FIELD) or "")
+        title = str(entry.get(_VECTOR_TITLE_FIELD) or info.get(_VECTOR_TITLE_FIELD) or "")
+        content = str(entry.get(_VECTOR_CONTENT_FIELD) or "") or title
+        key = kid or new_id("vec")
+        if kid and key in seen:
+            return
+        seen.add(key)
+        # 向量通道也尽量携带更新日期(后端有则透传),否则 stale 判定只能保守置旧
+        updated_at = ""
+        for holder in (entry, info):
+            for date_key in ("updateTime", "update_time", "srcTime", "createTime"):
+                if holder.get(date_key):
+                    updated_at = str(holder[date_key])
+                    break
+            if updated_at:
+                break
+        chunks.append(Chunk(
+            chunk_id=f"{kid}" if kid else key,
+            doc_id=kid or "unknown",
+            doc_title=title,
+            content=content,
+            category="",
+            position={"knowledge_id": kid, "rank": len(chunks)},
+            updated_at=updated_at,
+            score=0.0,
+            extra={"source": "vector",
+                   "vector_channel": source,
+                   "raw": entry},
+        ))
 
-def rrf_fuse(keyword_hits: List[Chunk], vector_hits: List[Chunk],
-             k: int = 60, top_n: int = 8) -> List[Chunk]:
-    """Reciprocal Rank Fusion:score = Σ 1/(k + rank)。"""
-    scores: Dict[str, float] = {}
-    pool: Dict[str, Chunk] = {}
-    for hits in (keyword_hits, vector_hits):
-        for rank, chunk in enumerate(hits):
-            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (k + rank + 1)
-            pool.setdefault(chunk.chunk_id, chunk)
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
-    out: List[Chunk] = []
-    for cid, s in ranked:
-        c = pool[cid]
-        c.score = round(s * 30, 4)   # 归一到与阈值同量纲(Mock 用)
-        out.append(c)
-    return out
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            raw_obj = node.get("object")
+            if isinstance(raw_obj, str):
+                try:
+                    walk(json.loads(raw_obj))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            info = _info_of(node)
+            has_id = (node.get(_VECTOR_ID_FIELD) not in (None, "")
+                      or info.get(_VECTOR_ID_FIELD) not in (None, ""))
+            has_title = (node.get(_VECTOR_TITLE_FIELD) not in (None, "")
+                         or info.get(_VECTOR_TITLE_FIELD) not in (None, ""))
+            has_content = node.get(_VECTOR_CONTENT_FIELD) not in (None, "")
+            if (has_id or has_title) and has_content:
+                add_entry(node)
+                return
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
 
+    if isinstance(resp, dict) and "all" in resp:
+        for entry in resp["all"]:
+            if isinstance(entry, dict):
+                add_entry(entry)
+    else:
+        walk(resp)
+    return chunks
 
-def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
+def kresult_to_chunks(kresult: List[Dict[str, Any]]) -> List[Chunk]:
     """一体化流水线的知识条目(info+atoms)→ 标准 Chunk 列表。
 
     一条知识映射一个 Chunk:content 由原子字段拼接(参数名:内容),
     原始条目完整保留在 extra 供溯源;生产侧无显式相关性得分,按出现顺序衰减。
     """
     chunks: List[Chunk] = []
-    for rank, entry in enumerate(merged or []):
+    for rank, entry in enumerate(kresult or []):
         if not isinstance(entry, dict):
             continue
         kid = str(entry.get("knowledgeId") or entry.get("knowledge_id") or "")
@@ -177,7 +169,7 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
                 updated_at = str(entry[key])
                 break
         chunks.append(Chunk(
-            chunk_id=f"ngkm_{kid}" if kid else new_id("ngkm"),
+            chunk_id=f"{kid}" if kid else new_id("ngkm"),
             doc_id=kid or "unknown",
             doc_title=title,
             content=content,
@@ -185,209 +177,376 @@ def merged_to_chunks(merged: List[Dict[str, Any]]) -> List[Chunk]:
             position={"knowledge_id": kid},
             updated_at=updated_at,
             score=round(max(0.5, 1.0 - 0.05 * rank), 4),
-            extra={"status": str(entry.get("status") or ""),
+            extra={"region_code": str(entry.get("region_code") or ""),
+                   "status": str(entry.get("status") or ""),
                    "source": "ngkm",
                    "atoms": atoms},
         ))
-    if len(chunks) < len(merged or []):
-        logger.info("merged_to_chunks: %d 条知识条目 → %d 条有效 Chunk"
-                    "(无内容/原子全失败的条目被丢弃)",
-                    len(merged or []), len(chunks))
-    for c in chunks[:5]:
-        logger.info("merged_to_chunks 产出: id=%s title=%r content_len=%d",
-                    c.chunk_id, c.doc_title, len(c.content))
     return chunks
 
+def get_kid_score(keyword_kid: List[str], vector_kid: List[str]) -> Dict[str, float]:
+    """根据 keyword/vector 两路 kid 列表计算每个 kid 的得分。
+
+    权重:keyword=2.0, vector=1.0。kid 同时出现在两路得 2+1=3,
+    只在 keyword 路得 2,只在 vector 路得 1。
+    返回 {kid: score} 字典。
+    """
+    keyword_set = set(keyword_kid or [])
+    vector_set = set(vector_kid or [])
+    scores: Dict[str, float] = {}
+    for kid in keyword_set | vector_set:
+        score = 0.0
+        if kid in keyword_set:
+            score += 1.0
+        if kid in vector_set:
+            score += 1.0
+        scores[kid] = score
+    return scores
 
 class ESClient(ABC):
-    @abstractmethod
-    def keyword_search(self, dsl: Dict[str, Any]) -> List[Chunk]: ...
+    """检索后端抽象:接口与 ProduceESClient / MockESClient 实际签名一致。
+
+    keyword_search 返回一体化流水线结构 ``{merged, keywords, knowledge_ids, ...}``;
+    vector_search 返回向量通道原始响应(both 模式含 ``all`` 去重列表)。
+    """
 
     @abstractmethod
-    def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]: ...
+    def keyword_search(self, query: str, region_code: str = "",
+                       keywords: Optional[List[str]] = None,
+                       timeout: int = 30) -> Dict[str, Any]: ...
+
+    @abstractmethod
+    def vector_search(self, query_text: str, region_code: str = "",
+                      vector_mode: str = "both") -> Any: ...
 
 
-# ---------------------------------------------------------------------------
-# Mock ES:内置坐席知识库样例(套餐/宽带/账单/投诉)
-# ---------------------------------------------------------------------------
+# 离线样例知识库:知识级条目(ngkm info+atoms 结构),供 MockESClient 使用。
 _KB: List[Dict[str, Any]] = [
-    dict(chunk_id="kb_0001#p1", doc_id="kb_0001", doc_title="5G畅享套餐资费说明",
-         category="套餐", status="在售", updated_at="2026-06-10", version="v3.2",
-         content="5G畅享套餐月费59元,含30GB全国流量、500分钟通话。达量后限速至1Mbps,不额外收费。"
-                 "次月1日生效,当月按天折算。"),
-    dict(chunk_id="kb_0001#p2", doc_id="kb_0001", doc_title="5G畅享套餐资费说明",
-         category="套餐", status="在售", updated_at="2026-06-10", version="v3.2",
-         content="办理条件:实名客户,无欠费。合约期内客户需先解除原合约再变更套餐。"),
-    dict(chunk_id="kb_0002#p1", doc_id="kb_0002", doc_title="流量加油包推荐话术",
-         category="套餐", status="在售", updated_at="2026-05-20", version="v1.4",
-         content="客户反映流量不够用时,优先推荐10元5GB加油包,当月有效,立即生效。"
-                 "月流量长期超量的客户建议升级更高档位套餐。"),
-    dict(chunk_id="kb_0003#p1", doc_id="kb_0003", doc_title="家庭宽带新装流程",
-         category="宽带", status="在售", updated_at="2026-04-01", version="v2.0",
-         content="家庭宽带新装需客户提供安装地址与实名信息,预约后48小时内上门。300M宽带月费30元。"),
-    dict(chunk_id="kb_0004#p1", doc_id="kb_0004", doc_title="话费账单查询指引",
-         category="账单", status="在售", updated_at="2026-03-15", version="v1.1",
-         content="客户可通过APP查询近6个月账单明细。争议扣费由坐席发起账单复核工单,3个工作日内答复。"),
-    dict(chunk_id="kb_0005#p1", doc_id="kb_0005", doc_title="投诉处理时限规范",
-         category="投诉", status="在售", updated_at="2026-01-08", version="v1.0",
-         content="一般投诉48小时内首次回复,资费争议类投诉24小时内升级处理。"),
-    dict(chunk_id="kb_0006#p1", doc_id="kb_0006", doc_title="旧版4G套餐说明(已下架)",
-         category="套餐", status="下架", updated_at="2024-11-01", version="v0.9",
-         content="4G飞享套餐月费38元,含5GB流量,已停止办理。"),
+    dict(knowledgeId="kb_0001", knowledgeName="5G畅享套餐资费说明",
+         category="套餐", status="在售", updateTime="2026-06-10", version="v3.2",
+         atoms=[
+             dict(paramName="资费说明",
+                  content="5G畅享套餐月费59元,含30GB全国流量、500分钟通话。"
+                          "达量后限速至1Mbps,不额外收费。次月1日生效,当月按天折算。"),
+             dict(paramName="办理条件",
+                  content="办理条件:实名客户,无欠费。合约期内客户需先解除原合约再变更套餐。"),
+         ]),
+    dict(knowledgeId="kb_0002", knowledgeName="流量加油包推荐话术",
+         category="套餐", status="在售", updateTime="2026-05-20", version="v1.4",
+         atoms=[
+             dict(paramName="推荐话术",
+                  content="客户反映流量不够用时,优先推荐10元5GB加油包,当月有效,立即生效。"
+                          "月流量长期超量的客户建议升级更高档位套餐。"),
+         ]),
+    dict(knowledgeId="kb_0003", knowledgeName="家庭宽带新装流程",
+         category="宽带", status="在售", updateTime="2026-04-01", version="v2.0",
+         atoms=[
+             dict(paramName="办理流程",
+                  content="家庭宽带新装需客户提供安装地址与实名信息,预约后48小时内上门。"
+                          "300M宽带月费30元。"),
+         ]),
+    dict(knowledgeId="kb_0004", knowledgeName="话费账单查询指引",
+         category="账单", status="在售", updateTime="2026-03-15", version="v1.1",
+         atoms=[
+             dict(paramName="查询指引",
+                  content="客户可通过APP查询近6个月账单明细。争议扣费由坐席发起账单复核工单,"
+                          "3个工作日内答复。"),
+         ]),
+    dict(knowledgeId="kb_0005", knowledgeName="投诉处理时限规范",
+         category="投诉", status="在售", updateTime="2026-01-08", version="v1.0",
+         atoms=[
+             dict(paramName="处理时限",
+                  content="一般投诉48小时内首次回复,资费争议类投诉24小时内升级处理。"),
+         ]),
+    dict(knowledgeId="kb_0006", knowledgeName="旧版4G套餐说明(已下架)",
+         category="套餐", status="下架", updateTime="2024-11-01", version="v0.9",
+         atoms=[
+             dict(paramName="资费说明",
+                  content="4G飞享套餐月费38元,含5GB流量,已停止办理。"),
+         ]),
 ]
 
 
-def _to_chunk(row: Dict[str, Any], score: float) -> Chunk:
-    return Chunk(
-        chunk_id=row["chunk_id"], doc_id=row["doc_id"], doc_title=row["doc_title"],
-        content=row["content"], category=row["category"],
-        position={"para": int(row["chunk_id"].split("#p")[-1])},
-        version=row["version"], updated_at=row["updated_at"], score=score,
-        extra={"status": row["status"]},
-    )
+def _kb_text(entry: Dict[str, Any]) -> str:
+    """样例知识的可匹配全文:标题加权 + 原子内容拼接。"""
+    atoms_text = "".join(str(a.get("content") or "") for a in entry.get("atoms", []))
+    return str(entry.get("knowledgeName", "")) * 2 + atoms_text
 
 
 class MockESClient(ESClient):
-    def keyword_search(self, dsl: Dict[str, Any]) -> List[Chunk]:
-        query_terms = dsl["query"]["bool"]["must"][0]["multi_match"]["query"].split()
-        filters = {list(f["term"].keys())[0]: list(f["term"].values())[0]
-                   for f in dsl["query"]["bool"].get("filter", [])}
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in _KB:
-            if any(row.get(k) != v for k, v in filters.items()):
-                continue
-            text = row["doc_title"] * 2 + row["content"]   # 标题加权
-            s = sum(text.count(t) for t in query_terms)
-            if s > 0:
-                scored.append((float(s), row))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [_to_chunk(r, s) for s, r in scored[: dsl.get("size", 10)]]
+    """离线 Mock 检索后端:内置坐席知识库样例,接口与 ProduceESClient 一致。
 
-    def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]:
-        # 用字符集合重叠率模拟语义相似度,兜住口语化改写
-        q = set(query_text) - set(" ,。?？!")
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in _KB:
-            if any(row.get(k) != v for k, v in filters.items()):
-                continue
-            t = set(row["doc_title"] + row["content"])
-            sim = len(q & t) / max(len(q), 1)
-            if sim > 0.15:
-                scored.append((sim, row))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [_to_chunk(r, round(s, 4)) for s, r in scored[:size]]
-
-
-class ProduceESClient(ESClient):
-    """生产 ngkm 检索客户端。
-
-    keyword 通道:一体化流水线(槽位提取 → 知识主索引召回 → 原子表拼接),
-    经 ``full_recall`` 返回原始结构,``keyword_search`` 将其映射为标准 Chunk。
-    vector 通道:生产侧暂无向量检索,返回空列表,RRF 自动退化为纯关键词融合。
+    - keyword_search:规则分词(lexicon)后按词频打分,返回 ``{merged, keywords,
+      knowledge_ids}`` 一体化流水线结构(与 ngkm 响应同形);
+    - vector_search:字符集合重叠率模拟语义相似度,返回 both 模式结构
+      ``{"all": [...]}``(与 vresult_to_chunks 兼容),兜住口语化改写。
     """
 
-    def __init__(self, region_code: str = "000", timeout: int = 30):
+    def keyword_search(self, query: str, region_code: str = "",
+                       keywords: Optional[List[str]] = None,
+                       timeout: int = 30) -> Dict[str, Any]:
+        from . import lexicon
+        terms = [str(k) for k in (keywords or []) if str(k).strip()]
+        if not terms:
+            terms = lexicon.extract_keywords(query or "") or [str(query or "").strip()]
+            terms = [t for t in terms if t]
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for entry in _KB:
+            text = _kb_text(entry)
+            s = sum(text.count(t) for t in terms)
+            if s > 0:
+                scored.append((float(s), entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        merged = [e for _, e in scored[:10]]
+        if not merged:
+            return {"keywords": terms, "knowledge_ids": [], "merged": [],
+                    "example": {}, "message": "未命中任何样例知识"}
+        return {"keywords": terms,
+                "knowledge_ids": [e["knowledgeId"] for e in merged],
+                "merged": merged, "example": {}}
+
+    def vector_search(self, query_text: str, region_code: str = "",
+                      vector_mode: str = "both") -> Any:
+        if not query_text or not str(query_text).strip():
+            return None
+        q = set(str(query_text)) - set(" ,。?？!")
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for entry in _KB:
+            t = set(_kb_text(entry))
+            sim = len(q & t) / max(len(q), 1)
+            if sim > 0.15:
+                scored.append((sim, entry))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        all_entries = [{
+            _VECTOR_ID_FIELD: e["knowledgeId"],
+            _VECTOR_TITLE_FIELD: e["knowledgeName"],
+            _VECTOR_CONTENT_FIELD: "".join(
+                str(a.get("content") or "") for a in e.get("atoms", [])),
+            "updateTime": e.get("updateTime", ""),
+        } for _, e in scored[:10]]
+        return {"new": None, "old": None, "all": all_entries}
+
+class ProduceESClient(ESClient):
+
+    def __init__(self, region_code: str = "000", model: Any = None,
+                 timeout: int = 30):
         self.region_code = region_code      # 支持省份名,内部自动转区号
-        self.timeout = timeout
+        self.model = model                  # BaseChatModel,供 _extract_keywords 调用
+        self.timeout = timeout              # ngkm HTTP 超时(秒)
+    def vector_search(self, query_text: str, region_code: str, vector_mode: str = "both") -> Any:
+        """向量通道:按 ``vector_mode`` 选择召回函数,直接返回对应结果。
 
-    # ------------------------------------------------------------------
-    # ESClient 标准接口
-    # ------------------------------------------------------------------
-    def keyword_search(self, dsl: Dict[str, Any]) -> List[Chunk]:
-        """按 DSL 中的关键词走 info → atom 召回(关键词已在上游提取,跳过槽位抽取)。"""
-        query = dsl["query"]["bool"]["must"][0]["multi_match"]["query"]
-        keywords = [t for t in query.split() if t and t != "*"]
-        region = self.region_code
-        for f in dsl["query"]["bool"].get("filter", []):
-            term = f.get("term") or {}
-            if "region" in term:
-                region = str(term["region"])
-        if not keywords:
-            return []
-        result = self._info_atom_recall(keywords, region, self.timeout)
-        return merged_to_chunks(result.get("merged", []))[: dsl.get("size", 10)]
+        new/old 单路只请求对应模板;both 时按 vector_weights 混合召回。
+        """
+        if not query_text or not query_text.strip():
+            return None
+        mode = vector_mode 
+        province = _region_code(region_code or "")
+        if mode == "new":
+            return self._vector_recall_new(query_text, province)
+        if mode == "old":
+            return self._vector_recall_old(query_text, province)
+        return self._vector_recall(query_text, province)
 
-    def vector_search(self, query_text: str, filters: Dict[str, str],
-                      size: int = 10) -> List[Chunk]:
-        """生产 ngkm 暂无向量通道,返回空列表(混合召回退化为纯关键词)。"""
-        return []
-
-    # ------------------------------------------------------------------
-    # 一体化流水线:槽位提取 → info 召回 → atom 召回 → 合并
-    # ------------------------------------------------------------------
-    def full_recall(self, query: str, region_code: str = "",
-                    timeout: int = 0) -> dict:
-        """完整流水线,返回 {keywords, knowledge_ids, info, atom, merged_count, merged}。"""
-        raw_region = region_code or self.region_code
-        region_code = _region_code(raw_region)
-        timeout = timeout or self.timeout
-        logger.info("full_recall 开始 query=%r region=%r→%r "
-                    "索引=ngkm.knowledges_%s / ngkm.knowledge_atom_%s timeout=%ss",
-                    query, raw_region, region_code, region_code, region_code, timeout)
+    def _vector_recall_new(self, query_text: str, province: str) -> Optional[dict]:
         try:
-            keywords = self._extract_keywords(query)
+            resp = self._post_vector_search("new", query_text, province=province)
+            # logger.info("向量召回(新模板) query=%r 完成", query_text)
+            return resp
+        except Exception as exc:
+            # logger.warning("向量召回(新模板)失败,降级为空 query=%r err=%r",
+            #                query_text, exc)
+            return None
+
+    def _vector_recall_old(self, query_text: str, province: str) -> Optional[dict]:
+        try:
+            resp = self._post_vector_search("old", query_text, province=province)
+            # logger.info("向量召回(旧模板) query=%r 完成", query_text)
+            return resp
         except Exception as exc:  # noqa: BLE001
-            logger.warning("full_recall 槽位提取异常,流水线终止: %r", exc)
-            return {"error": f"keyword 调用失败: {exc}", "merged": []}
+            # logger.warning("向量召回(旧模板)失败,降级为空 query=%r err=%r",
+            #                query_text, exc)
+            return None
+
+    def _vector_recall(self, query_text: str, province: str) -> Dict[str, Any]:
+        """根据权重召回混合的新旧模板响应,返回各路原始响应 + all(去重合并)。
+
+        权重 > 0 的路才请求;返回 {"new": raw, "old": raw, "all": [...]}
+        (new/old 为原始响应,all 为两路条目按 kid 去重后的合并列表)。
+        """
+        results: Dict[str, Any] = {}
+
+        results["new"] = self._vector_recall_new(query_text, province)
+        results["old"] = self._vector_recall_old(query_text, province)
+
+        seen_kids: set = set()
+        all_entries: List[dict] = []
+        for source in ("new", "old"):
+            raw = results.get(source)
+            if not raw:
+                continue
+            entries = _extract_doc_list(raw)
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                kid = str(entry.get(_VECTOR_ID_FIELD)
+                         or "")
+                if kid and kid in seen_kids:
+                    continue
+                if kid:
+                    seen_kids.add(kid)
+                all_entries.append(entry)
+        results["all"] = all_entries
+        return results
+
+    def _post_vector_search(self, mode: str, query_text: str, province: str = "") -> dict:
+        payload = dict(_VECTOR_PAYLOADS[mode])
+        payload["content"] = query_text
+        payload["provinceId"] = province
+        payload["reqId"] = uuid.uuid4().hex
+        payload["xTransId"] = uuid.uuid4().hex
+        # logger.info("向量检索请求 mode=%s content=%r top=%s embeddingTop=%s "
+        #             "isEnableNewRouteExp=%s",
+        #             mode, query_text, payload.get("top"),
+        #             payload.get("embeddingTop"), payload.get("isEnableNewRouteExp"))
+        try:
+            resp = requests.post(
+                _VECTOR_SEARCH_URL,
+                headers={"Content-Type": "application/json"},
+                json=payload
+            )
+        except Exception as exc:  # noqa: BLE001
+            # logger.warning("向量检索请求失败(网络/超时/DNS) mode=%s url=%s err=%r",
+            #                mode, _VECTOR_SEARCH_URL, exc)
+            raise
+        # logger.info("向量检索响应 mode=%s status=%s",
+        #             mode, resp.status_code)
+        resp.raise_for_status()
+        return resp.json()
+
+    def keyword_search(self, query: str, region_code: str = "",
+                       keywords: Optional[List[str]] = None,
+                       timeout: int = 30) -> dict:
+        """完整流水线,返回 {keywords, knowledge_ids, info, atom, merged_count, merged}。
+        若显式传入 keywords,直接使用,跳过 _extract_keywords 调用。
+        """
+        region_code = _region_code(region_code or self.region_code)
+        # logger.info("keyword_search 开始 query=%r region=%r→%r "
+        #             "索引=ngkm.knowledges_%s / ngkm.knowledge_atom_%s",
+        #             query, region_code, region_code, region_code)
+        if keywords:
+            # logger.info("keyword_search 外部传入 keywords,跳过提取: %s", keywords)
+            pass
+        else:
+            try:
+                keywords = self._extract_keywords(query)
+                # logger.info("槽位提取关键词 query=%r: %s", query, keywords)
+            except Exception as exc:  # noqa: BLE001
+                # logger.warning("keyword_search 槽位提取异常,流水线终止: %r", exc)
+                return {"error": f"keyword 调用失败: {exc}", "merged": []}
         if not keywords:
-            logger.warning("full_recall 未提取到有效关键词 → 零召回 query=%r", query)
+            # logger.warning("keyword_search 未提取到有效关键词 → 零召回 query=%r", query)
             return {"keywords": [], "info": [], "atom": [], "merged": [],
                     "message": "未提取到有效关键词"}
         return self._info_atom_recall(keywords, region_code, timeout)
 
     def _extract_keywords(self, query: str) -> List[str]:
-        """Step 1:槽位抽取服务提取检索关键词。"""
-        payload = {
-            "query": query,
-            "context": {
-                "app_id": "hint_server",
-                "province_id": "test_pro",
-                "channel_id": "web",
-            },
-            "confidence_threshold": 0.5,
-        }
+        """Step 1:使用大模型从用户问题中提取检索关键词。"""
+        # lazy import 打破 search → retrieval.prompt → retrieval.__init__ → agent → workspace → search 循环
+        from ..retrieval.prompt import _KEYWORD_EXTRACT_SYSTEM
+        if self.model is None:
+            # logger.warning("ProduceESClient 未注入 model,关键词提取降级为原始 query")
+            return [query.strip()] if query.strip() else []
+        t0 = time.time()
         try:
-            resp = requests.post(_SLOT_EXTRACT_URL,
-                                 headers={"Content-Type": "application/json"},
-                                 json=payload, timeout=self.timeout)
+            resp = self.model.invoke([
+                SystemMessage(content=_KEYWORD_EXTRACT_SYSTEM),
+                HumanMessage(content=f"用户问题:{query}"),
+            ])
         except Exception as exc:  # noqa: BLE001
-            logger.warning("槽位提取请求失败(网络/超时/DNS) url=%s err=%r",
-                           _SLOT_EXTRACT_URL, exc)
+            # logger.warning("关键词提取 LLM 调用异常: %r", exc)
             raise
-        if resp.status_code != 200:
-            logger.warning("槽位提取返回非200 status=%s body=%s",
-                           resp.status_code, resp.text[:300])
-        resp.raise_for_status()
-        data = resp.json()
-        logger.info("槽位提取原始响应 query=%r: %s", query, _preview(data))
-        slots = data.get("slots", []) if isinstance(data, dict) else []
-        keywords: List[str] = []
-        for slot in slots:
-            raw = slot.get("slot_value", "") if isinstance(slot, dict) else ""
-            if not raw:
-                continue
-            try:
-                parsed = ast.literal_eval(raw)
-                if isinstance(parsed, (list, tuple)):
-                    keywords.extend(str(v).strip() for v in parsed if v)
-                else:
-                    keywords.append(str(parsed).strip())
-            except (ValueError, SyntaxError):
-                keywords.append(raw.strip())
+        elapsed = time.time() - t0
+        raw = str(getattr(resp, "content", resp))
+        # logger.info("关键词提取 LLM 返回 耗时%.1fs 长度=%d 内容=%s",
+        #             elapsed, len(raw), raw[:500].replace("\n", " "))
+        cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.M).strip()
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            # logger.warning("关键词提取 JSON 解析失败 err=%s 原始=%s",
+            #                exc, cleaned[:300])
+            return [query.strip()] if query.strip() else []
+        keywords = data.get("keywords", []) if isinstance(data, dict) else []
+        if not isinstance(keywords, list):
+            keywords = [str(keywords)]
         seen: set = set()
-        deduped = [k for k in keywords if k and not (k in seen or seen.add(k))]
-        logger.info("槽位提取完成 query=%r slots=%d个 → keywords=%s",
-                    query, len(slots), deduped)
+        deduped = [str(k).strip() for k in keywords
+                   if k and not (str(k).strip() in seen or seen.add(str(k).strip()))]
+        # logger.info("关键词提取完成 query=%r → keywords=%s", query, deduped)
         if not deduped:
-            logger.warning("槽位提取返回空关键词,响应体=%s", str(data)[:300])
-        return deduped
-
+            # logger.warning("关键词提取返回空,降级为原始 query")
+            return [query.strip()] if query.strip() else []
+        return deduped#此处返回的是["k1","k2","k3"]
+    
+    # def _extract_keywords(self, query: str) -> List[str]: #优化槽位提取结果，只保留有效信息（代办）
+    #     """Step 1:槽位抽取服务提取检索关键词。"""
+    #     payload = {
+    #         "query": query,
+    #         "context": {
+    #             "app_id": "hint_server",
+    #             "province_id": "test_pro",
+    #             "channel_id": "web",
+    #         },
+    #         "confidence_threshold": 0.5,
+    #     }
+    #     try:
+    #         resp = requests.post(_SLOT_EXTRACT_URL,
+    #                              headers={"Content-Type": "application/json"},
+    #                              json=payload, timeout=self.timeout)
+    #     except Exception as exc:  # noqa: BLE001
+    #         logger.warning("槽位提取请求失败(网络/超时/DNS) url=%s err=%r",
+    #                        _SLOT_EXTRACT_URL, exc)
+    #         raise
+    #     if resp.status_code != 200:
+    #         logger.warning("槽位提取返回非200 status=%s body=%s",
+    #                        resp.status_code, resp.text[:300])
+    #     resp.raise_for_status()
+    #     data = resp.json()
+    #     logger.info("槽位提取原始响应 query=%r: %s", query, _preview(data))
+    #     slots = data.get("slots", []) if isinstance(data, dict) else []
+    #     keywords: List[str] = []
+    #     for slot in slots:
+    #         raw = slot.get("slot_value", "") if isinstance(slot, dict) else ""
+    #         if not raw:
+    #             continue
+    #         try:
+    #             parsed = ast.literal_eval(raw)
+    #             if isinstance(parsed, (list, tuple)):
+    #                 keywords.extend(str(v).strip() for v in parsed if v)
+    #             else:
+    #                 keywords.append(str(parsed).strip())
+    #         except (ValueError, SyntaxError):
+    #             keywords.append(raw.strip())
+    #     seen: set = set()
+    #     deduped = [k for k in keywords if k and not (k in seen or seen.add(k))]
+    #     logger.info("槽位提取完成 query=%r slots=%d个 → keywords=%s",
+    #                 query, len(slots), deduped)
+    #     if not deduped:
+    #         logger.warning("槽位提取返回空关键词,响应体=%s", str(data)[:300])
+    #     return deduped
+    
     def _info_atom_recall(self, keywords: List[str], region_code: str,
                           timeout: int) -> dict:
         """Step 2-4:info 召回 → 按 knowledgeId 拉 atom → 合并。"""
         region_code = _region_code(region_code)
+
+        info_eg: dict = {}
+        info_parsed_eg: Any = {}
+        info_list_eg: List[dict] = []
+        atom_eg: dict = {}
+        atom_parsed_eg: Any = {}
+        atom_list_eg: List[dict] = []
 
         # ---- Step 2: 收集所有 info 条目(跨所有 keyword) ----
         all_infos: List[dict] = []
@@ -396,31 +555,38 @@ class ProduceESClient(ESClient):
                 info_resp = self._get_info(keyword=kw, region_code=region_code,
                                            timeout=timeout)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("info 召回失败,跳过该关键词 keyword=%r "
-                               "索引=ngkm.knowledges_%s err=%r",
-                               kw, region_code, exc)
+                # logger.warning("info 召回失败,跳过该关键词 keyword=%r "
+                #                "索引=ngkm.knowledges_%s err=%r",
+                #                kw, region_code, exc)
                 continue
-            logger.info("info 原始响应 keyword=%r: %s", kw, _preview(info_resp))
+            # logger.info("info 原始响应 keyword=%r: %s", kw, _preview(info_resp))
             raw_obj = info_resp.get("object", "") if isinstance(info_resp, dict) else ""
             try:
                 parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
             except json.JSONDecodeError as exc:
-                logger.warning("info 响应 object 非 JSON,跳过 keyword=%r err=%r raw=%s",
-                               kw, exc, str(raw_obj)[:200])
+                # logger.warning("info 响应 object 非 JSON,跳过 keyword=%r err=%r raw=%s",
+                #                kw, exc, str(raw_obj)[:200])
                 continue
             infos = _extract_doc_list(parsed)
+            if not info_eg and isinstance(info_resp, dict):
+                info_eg = dict(info_resp)
+            if not info_parsed_eg:
+                info_parsed_eg = parsed
+            if not info_list_eg and infos:
+                info_list_eg = [dict(d) for d in infos[:1] if isinstance(d, dict)]
             for info in infos:
                 if not isinstance(info, dict):
                     continue
                 info["_keyword"] = kw
                 all_infos.append(info)
-            logger.info("info 召回 keyword=%r → %d 条", kw, len(infos))
+            # logger.info("info 召回 keyword=%r → %d 条", kw, len(infos))
             for i, info in enumerate(infos[:5]):
                 if isinstance(info, dict):
-                    logger.info("  info[%d]: knowledgeId=%s name=%r keys=%s", i,
-                                info.get("knowledgeId") or info.get("knowledge_id"),
-                                info.get("knowledgeName") or info.get("knowledge_name"),
-                                sorted(info.keys())[:12])
+                    # logger.info("  info[%d]: knowledgeId=%s name=%r keys=%s", i,
+                    #             info.get("knowledgeId") or info.get("knowledge_id"),
+                    #             info.get("knowledgeName") or info.get("knowledge_name"),
+                    #             sorted(info.keys())[:12])
+                    pass
 
         # 收集所有 knowledgeId(去重)
         seen_kids: set = set()
@@ -430,12 +596,13 @@ class ProduceESClient(ESClient):
             if kid and kid not in seen_kids:
                 seen_kids.add(kid)
                 kid_order.append(kid)
-        logger.info("info 召回汇总: keywords=%s 总条目=%d knowledgeIds=%s",
-                    keywords, len(all_infos), kid_order)
+        # logger.info("info 召回汇总: keywords=%s 总条目=%d knowledgeIds=%s",
+        #             keywords, len(all_infos), kid_order)
         if not all_infos:
-            logger.warning("所有关键词均无 info 召回——请检查索引 "
-                           "ngkm.knowledges_%s 是否存在、其中有无匹配知识",
-                           region_code)
+            # logger.warning("所有关键词均无 info 召回——请检查索引 "
+            #                "ngkm.knowledges_%s 是否存在、其中有无匹配知识",
+            #                region_code)
+            pass
 
         # ---- Step 3: 按 knowledgeId 检索 atom(去重复用) ----
         atoms_cache: Dict[str, List[dict]] = {}
@@ -443,70 +610,80 @@ class ProduceESClient(ESClient):
             try:
                 atom_resp = self._get_atom(knowledgeId=kid, region_code=region_code,
                                            timeout=timeout)
-                logger.info("atom 原始响应 knowledgeId=%s: %s", kid, _preview(atom_resp))
+                # logger.info("atom 原始响应 knowledgeId=%s: %s", kid, _preview(atom_resp))
                 raw_obj = atom_resp.get("object", "") if isinstance(atom_resp, dict) else ""
                 parsed = json.loads(raw_obj) if isinstance(raw_obj, str) else raw_obj or {}
                 atoms = _extract_doc_list(parsed)
+                if not atom_eg and isinstance(atom_resp, dict):
+                    atom_eg = dict(atom_resp)
+                if not atom_parsed_eg:
+                    atom_parsed_eg = parsed
+                if not atom_list_eg and atoms:
+                    atom_list_eg = [dict(d) for d in atoms[:1] if isinstance(d, dict)]
                 for a in atoms:
                     if isinstance(a, dict):
                         a["knowledgeId"] = kid
-                logger.info("atom 召回 knowledgeId=%s → %d 条", kid, len(atoms))
+                # logger.info("atom 召回 knowledgeId=%s → %d 条", kid, len(atoms))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("atom 召回失败 knowledgeId=%s "
-                               "索引=ngkm.knowledge_atom_%s err=%r",
-                               kid, region_code, exc)
+                # logger.warning("atom 召回失败 knowledgeId=%s "
+                #                "索引=ngkm.knowledge_atom_%s err=%r",
+                #                kid, region_code, exc)
                 atoms = [{"knowledgeId": kid, "error": f"atom 调用失败: {exc}"}]
             atoms_cache[kid] = atoms
 
         # ---- Step 4: 合并 info + atom ----
         merged: List[dict] = []
-        all_info_clean: List[dict] = []
         for info in all_infos:
             kid = info.get("knowledgeId") or info.get("knowledge_id") or ""
             entry = dict(info)
             entry["atoms"] = atoms_cache.get(kid, []) if kid else []
             entry.pop("_keyword", None)
             merged.append(entry)
-            all_info_clean.append(entry)
 
         all_atoms: List[dict] = [a for atoms in atoms_cache.values() for a in atoms]
-        logger.info("full_recall 完成: merged=%d 条 (info=%d, atom=%d) knowledgeIds=%s",
-                    len(merged), len(all_info_clean), len(all_atoms), kid_order)
+        # logger.info("keyword_search 完成: merged=%d 条 (info=%d, atom=%d) knowledgeIds=%s",
+        #             len(merged), len(all_info_clean), len(all_atoms), kid_order)
         return {
             "keywords": keywords,
             "knowledge_ids": kid_order,
-            "info": all_info_clean,
+            "info": all_infos,
             "atom": all_atoms,
             "merged_count": len(merged),
             "merged": merged,
         }
 
     # ------------------------------------------------------------------
-    # ngkm HTTP 调用
-    # ------------------------------------------------------------------
+    # ngkm HTTP 调-----------
     def _get_info(self, keyword: str, region_code: str = "000",
                   timeout: int = 30) -> dict:
         """知识主索引关键词检索(ngkm.knowledges_{region_code})。"""
         rendered = JinjaTemplate(_INFO_RECALL_TEMPLATE).render(
             keyword=keyword, region_code=_region_code(region_code))
-        logger.info("ngkm info 请求体 keyword=%r: %s", keyword,
-                    rendered.replace("\n", " "))
+        # logger.info("ngkm info 请求体 keyword=%r: %s", keyword,
+        #             rendered.replace("\n", " "))
         try:
+            # 观测完整请求耗时期间不设置 HTTP 超时(requests 缺省 timeout=None 即无限等待)
+            # resp = requests.post(
+            #     _NGKM_SEARCH_URL,
+            #     headers={"Content-Type": "application/json"},
+            #     json=json.loads(rendered), timeout=timeout,
+            # )
             resp = requests.post(
                 _NGKM_SEARCH_URL,
                 headers={"Content-Type": "application/json"},
-                json=json.loads(rendered), timeout=timeout,
+                json=json.loads(rendered),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("ngkm info 请求失败(网络/超时/DNS) url=%s keyword=%r err=%r",
-                           _NGKM_SEARCH_URL, keyword, exc)
+            # logger.warning("ngkm info 请求失败(网络/超时/DNS) url=%s keyword=%r err=%r",
+            #                _NGKM_SEARCH_URL, keyword, exc)
             raise
-        logger.info("ngkm info 响应 keyword=%r status=%s body=%s",
-                    keyword, resp.status_code, resp.text[:800])
+        # logger.info("ngkm info 响应 keyword=%r status=%s body=%s",
+        #             keyword, resp.status_code, resp.text[:800])
         if resp.status_code != 200:
-            logger.warning("ngkm info 检索非200 keyword=%r 索引=ngkm.knowledges_%s "
-                           "status=%s", keyword, _region_code(region_code),
-                           resp.status_code)
+            # logger.warning("ngkm info 检索非200 keyword=%r 索引=ngkm.knowledges_%s "
+            #                "status=%s", keyword, _region_code(region_code),
+            #                resp.status_code)
+            pass
         resp.raise_for_status()
         return resp.json()
 
@@ -515,24 +692,31 @@ class ProduceESClient(ESClient):
         """原子表按 knowledgeId 检索(ngkm.knowledge_atom_{region_code})。"""
         rendered = JinjaTemplate(_ATOM_RECALL_TEMPLATE).render(
             knowledgeId=knowledgeId, region_code=_region_code(region_code))
-        logger.info("ngkm atom 请求体 knowledgeId=%s: %s", knowledgeId,
-                    rendered.replace("\n", " "))
+        # logger.info("ngkm atom 请求体 knowledgeId=%s: %s", knowledgeId,
+        #             rendered.replace("\n", " "))
         try:
+            # 观测完整请求耗时期间不设置 HTTP 超时(requests 缺省 timeout=None 即无限等待)
+            # resp = requests.post(
+            #     _NGKM_SEARCH_URL,
+            #     headers={"Content-Type": "application/json"},
+            #     json=json.loads(rendered), timeout=timeout,
+            # )
             resp = requests.post(
                 _NGKM_SEARCH_URL,
                 headers={"Content-Type": "application/json"},
-                json=json.loads(rendered), timeout=timeout,
+                json=json.loads(rendered),
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("ngkm atom 请求失败(网络/超时/DNS) url=%s knowledgeId=%s err=%r",
-                           _NGKM_SEARCH_URL, knowledgeId, exc)
+            # logger.warning("ngkm atom 请求失败(网络/超时/DNS) url=%s knowledgeId=%s err=%r",
+            #                _NGKM_SEARCH_URL, knowledgeId, exc)
             raise
-        logger.info("ngkm atom 响应 knowledgeId=%s status=%s body=%s",
-                    knowledgeId, resp.status_code, resp.text[:800])
+        # logger.info("ngkm atom 响应 knowledgeId=%s status=%s body=%s",
+        #             knowledgeId, resp.status_code, resp.text[:800])
         if resp.status_code != 200:
-            logger.warning("ngkm atom 检索非200 knowledgeId=%s "
-                           "索引=ngkm.knowledge_atom_%s status=%s",
-                           knowledgeId, _region_code(region_code),
-                           resp.status_code)
+            # logger.warning("ngkm atom 检索非200 knowledgeId=%s "
+            #                "索引=ngkm.knowledge_atom_%s status=%s",
+            #                knowledgeId, _region_code(region_code),
+            #                resp.status_code)
+            pass
         resp.raise_for_status()
         return resp.json()

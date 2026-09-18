@@ -92,18 +92,27 @@ class ScriptedChatModel(BaseChatModel):
             return ChatResult(generations=[ChatGeneration(
                 message=AIMessage(content=self._scripted_locate(all_text)))])
 
+        # ---- 检索关键词提取/重写直调(keyword_search 流水线 / query_rewrite) ----
+        if "[TASK:keyword_extract]" in all_text:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content=self._scripted_keyword_extract(all_text)))])
+        if "[TASK:keyword_rewrite]" in all_text:
+            return ChatResult(generations=[ChatGeneration(
+                message=AIMessage(content=self._scripted_keyword_rewrite(all_text)))])
+
         # ---- ReAct 工具调用模式 ----
         retry = "[验证失败]" in all_text
         called = _called_tools(messages, since_last_feedback=retry)
         tool_names = set(kwargs.get("bound_tool_names") or [])
 
         is_processing = "清洗候选知识" in all_text or (
-            "apply_business_skill" in tool_names and "coarse_recall" not in tool_names)
+            "apply_business_skill" in tool_names
+            and "intergrate_all" not in tool_names)
         is_retrieval = not is_processing and (
-            "coarse_recall" in tool_names or "候选知识" in all_text)
+            "intergrate_all" in tool_names or "候选知识" in all_text)
 
-        if is_retrieval and "coarse_recall" not in called:
-            ai = self._next_retrieval(all_text, called)
+        if is_retrieval:
+            ai = self._next_retrieval(all_text, called, messages)
         elif is_processing and not self._processing_done(called, all_text):
             ai = self._next_processing(all_text, called)
         else:
@@ -111,21 +120,68 @@ class ScriptedChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=ai)])
 
     # ---- 检索子智能体决策 ----
-    def _next_retrieval(self, text: str, called: List[str]) -> AIMessage:
+    def _next_retrieval(self, text: str, called: List[str],
+                        messages: List[BaseMessage]) -> AIMessage:
+        """新工具集脚本:首轮 intergrate_all;验证失败后 query_rewrite
+        → 携改写关键词二次 intergrate_all(called 只统计反馈后的调用)。"""
         retry = "[验证失败]" in text
-        if not retry and "query_understanding" not in called:
-            return AIMessage(content="先理解问题意图。",
-                             tool_calls=[_tool_call("query_understanding", {})])
-        if retry and "question_rewrite" not in called:
-            return AIMessage(content="上一轮验证失败,改写检索问题。",
-                             tool_calls=[_tool_call("question_rewrite", {})])
-        if "keyword_extraction" not in called:
-            return AIMessage(content="提取关键词并做同义扩展。",
-                             tool_calls=[_tool_call("keyword_extraction",
-                                                    {"expand": True})])
-        return AIMessage(content="执行混合召回。",
-                         tool_calls=[_tool_call("coarse_recall",
-                                                {"relax_filters": retry})])
+        if not retry:
+            if "intergrate_all" not in called:
+                return AIMessage(content="首轮:一体化双路召回。",
+                                 tool_calls=[_tool_call("intergrate_all", {})])
+            return AIMessage(content="已完成召回,等待处理与验证。")
+        if "query_rewrite" not in called:
+            return AIMessage(content="上一轮验证失败,重写检索关键词。",
+                             tool_calls=[_tool_call("query_rewrite", {})])
+        if "intergrate_all" not in called:
+            return AIMessage(
+                content="使用改写关键词二次召回。",
+                tool_calls=[_tool_call(
+                    "intergrate_all",
+                    {"keywords": self._rewritten_keywords(messages)})])
+        return AIMessage(content="已完成二次召回,等待处理与验证。")
+
+    @staticmethod
+    def _rewritten_keywords(messages: List[BaseMessage]) -> List[str]:
+        """从最近一条 query_rewrite 工具结果里取改写关键词。"""
+        for m in reversed(messages):
+            content = str(getattr(m, "content", ""))
+            if "rewritten_keywords" not in content:
+                continue
+            try:
+                data = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            kws = data.get("rewritten_keywords") if isinstance(data, dict) else None
+            if kws:
+                return [str(k) for k in kws]
+        return []
+
+    # ---- 检索关键词提取/重写脚本 ----
+    @staticmethod
+    def _scripted_keyword_extract(text: str) -> str:
+        """离线模拟 [TASK:keyword_extract]:词表命中优先,兜底取查询行。"""
+        kws = lexicon.extract_keywords(text)
+        if kws == [text[:8]]:      # 词表零命中时的 text[:8] 兜底对长 prompt 无意义
+            m = re.search(r"(?:用户问题|检索问题|查询)[::]\s*(\S+)", text)
+            kws = [m.group(1)[:8]] if m else []
+        return json.dumps({"keywords": kws[:5]}, ensure_ascii=False)
+
+    @staticmethod
+    def _scripted_keyword_rewrite(text: str) -> str:
+        """离线模拟 [TASK:keyword_rewrite]:原关键词 + 同义扩展。"""
+        m = re.search(r"上一轮查询[::]\s*(.+)", text)
+        source = m.group(1).strip() if m else ""
+        kws = [] if source in ("", "(无)") else lexicon.extract_keywords(source)
+        if kws == [source[:8]]:
+            kws = [source[:8]]
+        expanded = list(dict.fromkeys(kws + lexicon.expand_terms(kws)))
+        if not expanded:
+            m2 = re.search(r"上一轮关键词[::]\s*(.+)", text)
+            expanded = [k.strip() for k in re.split(r"[,,、]", m2.group(1))
+                        if k.strip() and k.strip() != "(无)"] if m2 else []
+        return json.dumps({"rewritten_keywords": expanded[:3]},
+                          ensure_ascii=False)
 
     # ---- 数据处理子智能体决策 ----
     _ORDER = ["analyze_data", "clean_data", "denoise_data",

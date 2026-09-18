@@ -187,10 +187,10 @@ class TC03_LLMFailureDegrades(KbagentE2EBase):
 
 class TC04_ChunkIdTransparency(KbagentE2EBase):
 
+    # 新检索栈按知识级(kid)产出 Chunk:chunk_id = knowledgeId(MockESClient 样例)
     KNOWN_CHUNK_IDS = {
-        "kb_0001#p1", "kb_0001#p2",
-        "kb_0002#p1", "kb_0003#p1",
-        "kb_0004#p1", "kb_0005#p1",
+        "kb_0001", "kb_0002", "kb_0003",
+        "kb_0004", "kb_0005", "kb_0006",
     }
 
     def test_sources_chunk_ids_from_kb(self):

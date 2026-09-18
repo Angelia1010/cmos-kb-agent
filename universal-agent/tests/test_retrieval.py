@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""RetrievalSubAgent 测试
+"""RetrievalSubAgent 测试(合并 kbagent-retrieval-dev 后的新检索栈)
 
 覆盖范围:
-  T1  build_dsl — DSL 字段白名单强制执行
-  T2  retrieval/tools — query_understanding / keyword_extraction /
-                        question_rewrite / coarse_recall 单元测试
-  T3  SufficiencyVerifier — 规则层充分性判定
-  T4  RetrievalSubAgent — 完整子智能体运行(GoalLoop 护栏)
+  T1  search 转换层 — kresult_to_chunks / vresult_to_chunks / get_kid_score
+                      + MockESClient 新接口契约
+  T2  retrieval/tools — intergrate_all / keyword_recall / vector_recall /
+                        query_rewrite 单元测试
+  T3  SufficiencyVerifier — 固定三轮计数判定
+  T4  RetrievalSubAgent — GoalLoop(检索→处理→ProcessingVerifier 验证)完整运行
+      + DirectRetrievalSubAgent 零 LLM 直调
 
 运行方式:
   PYTHONPATH=src python -m unittest tests.test_retrieval -v
@@ -18,10 +20,14 @@ import unittest
 
 sys.path.insert(0, "src")
 
-from kbagent.shared.config import DEFAULT_CONFIG, Config
-from kbagent.shared.models import Chunk, RetrievalParams
+from kbagent.scripted_model import ScriptedChatModel
+from kbagent.shared.config import DEFAULT_CONFIG
+from kbagent.shared.models import Chunk
 from kbagent.shared.search import (
-    ALLOWED_FILTER_FIELDS, MockESClient, build_dsl,
+    MockESClient,
+    kresult_to_chunks,
+    vresult_to_chunks,
+    get_kid_score,
 )
 from kbagent.shared.tracing import Tracer
 from kbagent.shared.workspace import RunWorkspace, set_workspace
@@ -30,13 +36,14 @@ from kbagent.shared.workspace import RunWorkspace, set_workspace
 # ─────────────────────────────── helpers ────────────────────────────────── #
 
 def _ws(query: str = "套餐办理", data: dict | None = None,
-        stage: str = "retrieval") -> RunWorkspace:
+        stage: str = "retrieval", model=None) -> RunWorkspace:
     """创建并注入测试工作区。"""
     ws = RunWorkspace(
         query=query,
         cfg=DEFAULT_CONFIG,
         es=MockESClient(),
         tracer=Tracer(),
+        model=model,
     )
     ws.stage = stage
     if data:
@@ -45,68 +52,154 @@ def _ws(query: str = "套餐办理", data: dict | None = None,
     return ws
 
 
-def _chunk(chunk_id: str = "c1", score: float = 0.9,
-           category: str = "套餐", status: str = "在售") -> Chunk:
-    return Chunk(
-        chunk_id=chunk_id, doc_id="d1", doc_title="测试文档",
-        content="5G畅享套餐月费(每月)59元,含30GB流量,办理条件:实名客户,无欠费。",
-        category=category, extra={"status": status},
-        score=score, updated_at="2026-06-10",
-    )
+def _ngkm_entry(kid: str = "K001", title: str = "5G畅享套餐资费说明",
+                content: str = "月费59元,含30GB全国流量") -> dict:
+    """ngkm 一体化流水线知识条目(info+atoms 结构)。"""
+    return {
+        "knowledgeId": kid,
+        "knowledgeName": title,
+        "category": "套餐",
+        "status": "在售",
+        "updateTime": "2026-06-10",
+        "atoms": [
+            {"paramName": "资费说明", "content": content},
+            {"paramName": "空原子", "content": ""},          # 应被丢弃
+            {"error": "原子表查询失败"},                        # 应被丢弃
+        ],
+    }
+
+
+def _vector_entry(kid: str = "K001", title: str = "流量加油包",
+                  content: str = "10元5GB加油包") -> dict:
+    return {"knowledgeId": kid, "knowledgeName": title, "content": content}
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
-#  T1  DSL 字段白名单                                                        #
+#  T1  search 转换层 + MockESClient 契约                                     #
 # ══════════════════════════════════════════════════════════════════════════ #
 
-class TestBuildDSL(unittest.TestCase):
+class TestKresultToChunks(unittest.TestCase):
 
-    def test_whitelist_strips_unknown_filter_fields(self):
-        """非白名单字段被 build_dsl 静默过滤，不出现在 ES DSL 里。"""
-        params = RetrievalParams(
-            keywords=["套餐"],
-            filters={
-                "category": "套餐",      # 合法
-                "status": "在售",        # 合法
-                "malicious_field": "x",  # 非法
-                "__proto__": "y",        # 非法
-            },
-        )
-        dsl = build_dsl(params)
-        filter_fields = {
-            list(f["term"].keys())[0]
-            for f in dsl["query"]["bool"]["filter"]
-        }
-        self.assertTrue(filter_fields.issubset(ALLOWED_FILTER_FIELDS),
-                        f"出现了非白名单字段: {filter_fields - ALLOWED_FILTER_FIELDS}")
-        self.assertNotIn("malicious_field", filter_fields)
-        self.assertNotIn("__proto__", filter_fields)
+    def test_entry_maps_to_chunk_with_atom_content(self):
+        chunks = kresult_to_chunks([_ngkm_entry()])
+        self.assertEqual(1, len(chunks))
+        c = chunks[0]
+        self.assertIsInstance(c, Chunk)
+        self.assertEqual("K001", c.chunk_id)
+        self.assertEqual("K001", c.doc_id)
+        self.assertEqual("5G畅享套餐资费说明", c.doc_title)
+        self.assertIn("资费说明:月费59元", c.content)
+        self.assertNotIn("空原子", c.content)
+        self.assertEqual("套餐", c.category)
+        self.assertEqual("2026-06-10", c.updated_at)
+        self.assertEqual("ngkm", c.extra["source"])
+        self.assertEqual("在售", c.extra["status"])
 
-    def test_dsl_structure_has_required_keys(self):
-        """构建出的 DSL 必须含 size / query.bool.must / query.bool.filter。"""
-        params = RetrievalParams(keywords=["流量", "套餐"])
-        dsl = build_dsl(params, size=5)
-        self.assertEqual(dsl["size"], 5)
-        self.assertIn("bool", dsl["query"])
-        self.assertIn("must", dsl["query"]["bool"])
-        self.assertIn("filter", dsl["query"]["bool"])
+    def test_score_decays_with_rank_and_floor(self):
+        chunks = kresult_to_chunks(
+            [_ngkm_entry(f"K{i:03d}") for i in range(20)])
+        self.assertEqual(1.0, chunks[0].score)
+        self.assertEqual(0.95, chunks[1].score)
+        self.assertTrue(all(c.score >= 0.5 for c in chunks))
 
-    def test_boost_fields_whitelist_applied(self):
-        """boost_fields 中非允许字段不注入 DSL，防止字段注入。"""
-        params = RetrievalParams(
-            keywords=["套餐"],
-            boost_fields={"title": 2.0, "evil_field": 99.0},
-        )
-        dsl = build_dsl(params)
-        query_str = json.dumps(dsl)
-        self.assertNotIn("evil_field", query_str)
+    def test_empty_and_invalid_entries(self):
+        self.assertEqual([], kresult_to_chunks([]))
+        self.assertEqual([], kresult_to_chunks(None))
+        # 非 dict 条目与无内容条目被丢弃
+        self.assertEqual([], kresult_to_chunks(
+            ["not-a-dict", {"knowledgeId": "X", "atoms": []}]))
 
-    def test_empty_keywords_uses_wildcard(self):
-        """无关键词时查询词退化为 *，不崩溃。"""
-        params = RetrievalParams(keywords=[])
-        dsl = build_dsl(params)
-        mm = dsl["query"]["bool"]["must"][0]["multi_match"]
-        self.assertEqual(mm["query"], "*")
+    def test_dict_input_yields_no_chunks(self):
+        """整包 dict(非 merged 列表)传入时迭代出字符串 key,静默产出 0 条 —
+        intergrate_all 曾因此丢失 keyword 通道,回归防护。"""
+        self.assertEqual([], kresult_to_chunks(
+            {"merged": [_ngkm_entry()], "keywords": ["套餐"]}))
+
+
+class TestVresultToChunks(unittest.TestCase):
+
+    def test_both_mode_all_list(self):
+        chunks = vresult_to_chunks(
+            {"new": None, "old": None,
+             "all": [_vector_entry("K1"), _vector_entry("K2", "宽带", "300M")]})
+        self.assertEqual(["K1", "K2"], [c.chunk_id for c in chunks])
+        self.assertEqual("流量加油包", chunks[0].doc_title)
+        self.assertEqual("vector", chunks[0].extra["source"])
+
+    def test_dedupe_by_kid(self):
+        chunks = vresult_to_chunks(
+            {"all": [_vector_entry("K1"), _vector_entry("K1", "重复", "重复")]})
+        self.assertEqual(1, len(chunks))
+
+    def test_walk_nested_object_json_string(self):
+        """new/old 单路原始响应:object 为 JSON 字符串包裹也能提取。"""
+        raw = {"object": json.dumps(
+            {"document": [_vector_entry("K9")]}, ensure_ascii=False)}
+        chunks = vresult_to_chunks(raw)
+        self.assertEqual(["K9"], [c.chunk_id for c in chunks])
+
+    def test_none_and_empty(self):
+        self.assertEqual([], vresult_to_chunks(None))
+        self.assertEqual([], vresult_to_chunks({}))
+
+    def test_updated_at_passthrough(self):
+        """向量条目携带 updateTime 时应透传到 Chunk.updated_at(缺失则空)。"""
+        entry = _vector_entry("K1")
+        entry["updateTime"] = "2026-04-01"
+        chunks = vresult_to_chunks({"all": [entry, _vector_entry("K2")]})
+        self.assertEqual("2026-04-01", chunks[0].updated_at)
+        self.assertEqual("", chunks[1].updated_at)
+
+
+class TestGetKidScore(unittest.TestCase):
+
+    def test_dual_path_scores_higher(self):
+        scores = get_kid_score(["A", "B"], ["B", "C"])
+        self.assertEqual(2.0, scores["B"])     # 双路命中
+        self.assertEqual(1.0, scores["A"])     # 仅 keyword
+        self.assertEqual(1.0, scores["C"])     # 仅 vector
+
+    def test_empty_inputs(self):
+        self.assertEqual({}, get_kid_score([], []))
+        self.assertEqual({"A": 1.0}, get_kid_score(["A"], None))
+
+
+class TestMockESClientContract(unittest.TestCase):
+
+    def test_keyword_search_returns_pipeline_shape(self):
+        result = MockESClient().keyword_search(query="流量套餐怎么推荐")
+        self.assertIsInstance(result, dict)
+        for key in ("merged", "keywords", "knowledge_ids"):
+            self.assertIn(key, result)
+        self.assertTrue(result["merged"])
+        entry = result["merged"][0]
+        self.assertIn("knowledgeId", entry)
+        self.assertIn("atoms", entry)
+        self.assertEqual([e["knowledgeId"] for e in result["merged"]],
+                         result["knowledge_ids"])
+
+    def test_keyword_search_accepts_explicit_keywords(self):
+        result = MockESClient().keyword_search(query="随便什么", keywords=["宽带"])
+        self.assertTrue(result["merged"])
+        self.assertTrue(all("宽带" in json.dumps(e, ensure_ascii=False)
+                            for e in result["merged"]))
+
+    def test_keyword_search_zero_hit_message(self):
+        result = MockESClient().keyword_search(query="量子隐形传态资费",
+                                               keywords=["量子隐形传态"])
+        self.assertEqual([], result["merged"])
+        self.assertIn("message", result)
+
+    def test_vector_search_returns_both_shape(self):
+        result = MockESClient().vector_search("流量不够用怎么办")
+        self.assertIsInstance(result, dict)
+        self.assertIn("all", result)
+        self.assertTrue(result["all"])
+        chunks = vresult_to_chunks(result)
+        self.assertTrue(all(isinstance(c, Chunk) for c in chunks))
+
+    def test_vector_search_empty_query(self):
+        self.assertIsNone(MockESClient().vector_search("  "))
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -116,255 +209,222 @@ class TestBuildDSL(unittest.TestCase):
 class TestRetrievalTools(unittest.TestCase):
 
     def setUp(self):
-        # 每个 case 前重置工作区
-        self.ws = _ws("用户想办理流量套餐")
+        self.ws = _ws("用户想办理流量套餐", model=ScriptedChatModel())
 
-    # ── query_understanding ──────────────────────────────────────────────── #
+    # ── intergrate_all ───────────────────────────────────────────────────── #
 
-    def test_query_understanding_returns_intent_list(self):
-        from kbagent.retrieval.tools import query_understanding
-        raw = query_understanding.func()
-        data = json.loads(raw)
-        self.assertIn("intents", data)
-        self.assertIsInstance(data["intents"], list)
+    def test_intergrate_all_dual_channel_recall(self):
+        from kbagent.retrieval.tools import intergrate_all
+        data = json.loads(intergrate_all.func(query="流量套餐推荐"))
+        self.assertGreater(data.get("recalled", 0), 0)
+        # keyword 通道必须产出 Chunk(回归:kresult_to_chunks 整包 dict bug)
+        self.assertTrue(self.ws.data["keyword_chunks"])
+        self.assertTrue(self.ws.data["vector_chunks"])
+        self.assertTrue(self.ws.data["chunks"])
+        self.assertTrue(self.ws.data["ranked_kids"])
+        self.assertEqual(1, self.ws.data["recall_round"])
 
-    def test_query_understanding_writes_to_workspace(self):
-        from kbagent.retrieval.tools import query_understanding
-        query_understanding.func()
-        self.assertIn("intents", self.ws.data)
+    def test_intergrate_all_kid_ranking_dual_hit_first(self):
+        """双路命中的 kid 得分最高,merged_chunks 按其排序靠前。"""
+        from kbagent.retrieval.tools import intergrate_all
+        intergrate_all.func(query="流量套餐推荐")
+        kid_scores = self.ws.data["kid_scores"]
+        ranked = self.ws.data["ranked_kids"]
+        self.assertTrue(ranked)
+        self.assertEqual(max(kid_scores.values()), kid_scores[ranked[0]])
 
-    def test_query_understanding_detects_taocan_category(self):
-        """套餐相关问题应识别出 '套餐' 意图。"""
-        from kbagent.retrieval.tools import query_understanding
-        query_understanding.func()
-        self.assertIn("套餐", self.ws.data["intents"])
+    def test_intergrate_all_explicit_keywords_skip_extraction(self):
+        from kbagent.retrieval.tools import intergrate_all
+        data = json.loads(intergrate_all.func(query="随便什么", keywords=["宽带"]))
+        self.assertGreater(data.get("recalled", 0), 0)
+        self.assertEqual(["宽带"], self.ws.data["keywords"])
 
-    def test_query_understanding_uses_param_over_workspace(self):
-        """传入 query 参数时应优先使用，而非工作区的 ws.query。"""
-        from kbagent.retrieval.tools import query_understanding
-        raw = query_understanding.func(query="宽带新装")
-        data = json.loads(raw)
-        # 结果应基于 "宽带新装"，不是工作区原始问题
-        self.assertIsInstance(data["intents"], list)
+    def test_intergrate_all_zero_recall_returns_error(self):
+        """双路零召回 → error 观测,不抛异常。"""
+        class _EmptyES:
+            def keyword_search(self, query, region_code="", keywords=None,
+                               timeout=30):
+                return {"merged": [], "keywords": [], "knowledge_ids": [],
+                        "message": "未提取到有效关键词"}
 
-    # ── keyword_extraction ───────────────────────────────────────────────── #
+            def vector_search(self, query_text, region_code="",
+                              vector_mode="both"):
+                return None
 
-    def test_keyword_extraction_without_expand(self):
-        from kbagent.retrieval.tools import keyword_extraction
-        raw = keyword_extraction.func(expand=False)
-        data = json.loads(raw)
-        self.assertIn("keywords", data)
-        self.assertGreater(len(data["keywords"]), 0)
-        self.assertEqual(data["expanded_terms"], [])
+        ws = _ws("量子隐形传态")
+        ws.es = _EmptyES()
+        from kbagent.retrieval.tools import intergrate_all
+        data = json.loads(intergrate_all.func(query="量子隐形传态资费"))
+        self.assertIn("error", data)
+        self.assertEqual([], ws.data["chunks"])
 
-    def test_keyword_extraction_with_expand(self):
-        from kbagent.retrieval.tools import keyword_extraction
-        raw = keyword_extraction.func(expand=True)
-        data = json.loads(raw)
-        self.assertIn("expanded_terms", data)
+    def test_intergrate_all_round_counter_increments(self):
+        from kbagent.retrieval.tools import intergrate_all
+        intergrate_all.func(query="流量套餐")
+        intergrate_all.func(query="流量套餐")
+        self.assertEqual(2, self.ws.data["recall_round"])
 
-    def test_keyword_extraction_uses_rewritten_query_first(self):
-        """改写后的问题优先于原始问题用于关键词提取。"""
-        self.ws.data["rewritten_query"] = "宽带如何新装"
-        from kbagent.retrieval.tools import keyword_extraction
-        raw = keyword_extraction.func(expand=False)
-        data = json.loads(raw)
-        # 关键词应从改写后问题提取，应包含宽带相关词
-        kws = " ".join(data["keywords"])
-        self.assertTrue("宽" in kws or "带" in kws or "新" in kws or "装" in kws,
-                        f"改写问题关键词未出现: {data['keywords']}")
+    # ── keyword_recall / vector_recall ──────────────────────────────────── #
 
-    def test_keyword_extraction_writes_to_workspace(self):
-        from kbagent.retrieval.tools import keyword_extraction
-        keyword_extraction.func()
-        self.assertIn("keywords", self.ws.data)
-        self.assertIn("expanded_terms", self.ws.data)
+    def test_keyword_recall_returns_chunks(self):
+        from kbagent.retrieval.tools import keyword_recall
+        data = json.loads(keyword_recall.func(query="宽带新装怎么办理"))
+        self.assertGreater(data.get("recalled", 0), 0)
+        titles = [c.doc_title for c in self.ws.data["chunks"]]
+        self.assertIn("家庭宽带新装流程", titles)
 
-    # ── question_rewrite ─────────────────────────────────────────────────── #
+    def test_vector_recall_returns_chunks(self):
+        from kbagent.retrieval.tools import vector_recall
+        data = json.loads(vector_recall.func(query="流量不够用怎么办"))
+        self.assertGreater(data.get("recalled", 0), 0)
+        self.assertTrue(all(c.extra["source"] == "vector"
+                            for c in self.ws.data["chunks"]))
 
-    def test_question_rewrite_sets_retry_flag(self):
-        ws = _ws("怎么办不了套餐")
-        from kbagent.retrieval.tools import question_rewrite
-        question_rewrite.func()
-        self.assertTrue(ws.data.get("is_retry"),
-                        "改写工具应设置 is_retry 标志")
+    def test_recall_tools_report_error_on_unsupported_backend(self):
+        class _NoVectorES(MockESClient):
+            vector_search = None
 
-    def test_question_rewrite_produces_rewritten_query(self):
-        ws = _ws("怎么办套餐")
-        from kbagent.retrieval.tools import question_rewrite
-        raw = question_rewrite.func()
-        data = json.loads(raw)
-        self.assertIn("rewritten_query", data)
-        self.assertIn("rewritten_query", ws.data)
-        self.assertGreater(len(ws.data["rewritten_query"]), 0)
+        ws = _ws("流量套餐")
+        ws.es = _NoVectorES()
+        from kbagent.retrieval.tools import vector_recall
+        # getattr(ws.es, "vector_search") 为 None → error 观测
+        data = json.loads(vector_recall.func(query="流量套餐"))
+        self.assertIn("error", data)
 
-    def test_question_rewrite_normalizes_colloquial(self):
-        """'怎么' 应规一化为 '如何'。"""
-        ws = _ws("套餐怎么办理")
-        from kbagent.retrieval.tools import question_rewrite
-        question_rewrite.func()
-        self.assertIn("如何", ws.data["rewritten_query"])
+    # ── query_rewrite ───────────────────────────────────────────────────── #
 
-    # ── coarse_recall ────────────────────────────────────────────────────── #
-
-    def test_coarse_recall_returns_chunks(self):
+    def test_query_rewrite_produces_rewritten_keywords(self):
+        self.ws.data["original_query"] = "用户想办理流量套餐"
         self.ws.data["keywords"] = ["流量", "套餐"]
-        self.ws.data["expanded_terms"] = []
-        from kbagent.retrieval.tools import coarse_recall
-        raw = coarse_recall.func(retrieval_mode="keyword")
-        data = json.loads(raw)
-        self.assertIn("recalled", data)
-        self.assertGreater(data["recalled"], 0)
+        from kbagent.retrieval.tools import query_rewrite
+        data = json.loads(query_rewrite.func())
+        kws = data.get("rewritten_keywords")
+        self.assertIsInstance(kws, list)
+        self.assertTrue(kws)
+        self.assertEqual(kws, self.ws.data["rewritten_keywords"])
+        self.assertLessEqual(len(kws), 3)
 
-    def test_coarse_recall_writes_chunks_to_workspace(self):
-        self.ws.data["keywords"] = ["流量", "套餐"]
-        from kbagent.retrieval.tools import coarse_recall
-        coarse_recall.func(retrieval_mode="hybrid")
-        self.assertIn("chunks", self.ws.data)
-        self.assertIsInstance(self.ws.data["chunks"], list)
-
-    def test_coarse_recall_without_keywords_returns_error(self):
-        """未提取关键词时 coarse_recall 应返回错误，不崩溃。"""
-        from kbagent.retrieval.tools import coarse_recall
-        raw = coarse_recall.func()
-        data = json.loads(raw)
-        self.assertIn("error", data,
-                      "缺关键词时应返回 error 字段")
-
-    def test_coarse_recall_increments_round_counter(self):
-        self.ws.data["keywords"] = ["套餐"]
-        from kbagent.retrieval.tools import coarse_recall
-        coarse_recall.func()
-        coarse_recall.func()
-        self.assertEqual(self.ws.data.get("recall_round"), 2)
-
-    def test_coarse_recall_records_last_dsl(self):
-        self.ws.data["keywords"] = ["套餐"]
-        from kbagent.retrieval.tools import coarse_recall
-        coarse_recall.func(retrieval_mode="keyword")
-        self.assertIn("last_dsl", self.ws.data)
-        self.assertIn("query", self.ws.data["last_dsl"])
+    def test_query_rewrite_without_model_returns_error(self):
+        ws = _ws("流量套餐")          # model=None
+        from kbagent.retrieval.tools import query_rewrite
+        data = json.loads(query_rewrite.func())
+        self.assertIn("error", data)
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
-#  T3  充分性验证器                                                          #
+#  T3  SufficiencyVerifier — 固定三轮计数                                    #
 # ══════════════════════════════════════════════════════════════════════════ #
 
 class TestSufficiencyVerifier(unittest.TestCase):
 
-    def _verify(self, chunks: list) -> object:
+    def _verify_once(self, verifier) -> object:
         ws = _ws()
-        ws.data["chunks"] = chunks
+        return asyncio.run(verifier.verify("goal", {})), ws
+
+    def test_fixed_three_round_pattern(self):
         from kbagent.retrieval.sufficiency import SufficiencyVerifier
-        return asyncio.run(SufficiencyVerifier().verify("goal", {}))
+        v = SufficiencyVerifier()
+        r1, _ = self._verify_once(v)
+        r2, _ = self._verify_once(v)
+        r3, _ = self._verify_once(v)
+        self.assertFalse(r1.passed)
+        self.assertFalse(r2.passed)
+        self.assertTrue(r3.passed)
 
-    def test_passes_with_3_high_score_chunks(self):
-        chunks = [_chunk(f"c{i}", score=0.9) for i in range(3)]
-        r = self._verify(chunks)
-        self.assertTrue(r.passed)
+    def test_result_metadata(self):
+        from kbagent.retrieval.sufficiency import SufficiencyVerifier
+        r, ws = self._verify_once(SufficiencyVerifier())
+        self.assertEqual("fixed_rounds", r.layer)
+        self.assertEqual(1.0, r.confidence)
+        self.assertIn("sufficiency.fixed_round_fail",
+                      [e.event for e in ws.tracer.events])
 
-    def test_passes_with_more_than_3_chunks(self):
-        chunks = [_chunk(f"c{i}", score=0.85) for i in range(5)]
-        r = self._verify(chunks)
-        self.assertTrue(r.passed)
-
-    def test_fails_when_chunk_count_below_threshold(self):
-        """少于 min_chunk_count(默认 3) 应失败。"""
-        chunks = [_chunk("c1", score=0.9), _chunk("c2", score=0.9)]
-        r = self._verify(chunks)
-        self.assertFalse(r.passed)
-        self.assertIn("候选数", r.evidence)
-
-    def test_fails_when_top3_scores_below_threshold(self):
-        """top3 得分均低于 top3_score_threshold 时应失败。"""
-        chunks = [_chunk(f"c{i}", score=0.1) for i in range(4)]
-        r = self._verify(chunks)
-        self.assertFalse(r.passed)
-        self.assertIn("得分", r.evidence)
-
-    def test_fails_with_empty_chunks(self):
-        r = self._verify([])
-        self.assertFalse(r.passed)
-
-    def test_failure_evidence_contains_retry_hint(self):
-        """验证失败的 evidence 要包含改写/放宽建议，供 GoalLoop 注入。"""
-        r = self._verify([_chunk("c1", score=0.1)])
-        self.assertIn("请换策略", r.evidence)
-
-    def test_confidence_is_1_for_rule_based_result(self):
-        """纯规则层结果 confidence 应为 1.0。"""
-        r = self._verify([_chunk("c1", score=0.1)])
-        self.assertEqual(r.confidence, 1.0)
-
-    def test_layer_is_rules(self):
-        r = self._verify([_chunk(f"c{i}", score=0.9) for i in range(3)])
-        self.assertEqual(r.layer, "rules")
+    def test_llm_judge_param_kept_for_compat(self):
+        from kbagent.retrieval.sufficiency import SufficiencyVerifier
+        v = SufficiencyVerifier(llm_judge=lambda system, user: "{}")
+        r, _ = self._verify_once(v)
+        self.assertFalse(r.passed)     # 计数模式不受 judge 影响
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
-#  T4  RetrievalSubAgent 完整运行                                            #
+#  T4  RetrievalSubAgent(GoalLoop + ProcessingVerifier)/ Direct 直调       #
 # ══════════════════════════════════════════════════════════════════════════ #
 
 class TestRetrievalSubAgent(unittest.TestCase):
 
-    def _make_agent(self):
-        from kbagent.retrieval.agent import RetrievalSubAgent
-        from kbagent.scripted_model import ScriptedChatModel
-        return RetrievalSubAgent(ScriptedChatModel(), DEFAULT_CONFIG, Tracer())
-
-    def _run(self, query: str) -> list:
+    def _run(self, query: str, agent_cls: str = "RetrievalSubAgent"):
+        from kbagent.retrieval import agent as agent_mod
         ws = RunWorkspace(
-            query=query, cfg=DEFAULT_CONFIG, es=MockESClient(), tracer=Tracer()
+            query=query, cfg=DEFAULT_CONFIG, es=MockESClient(),
+            tracer=Tracer(), model=ScriptedChatModel(),
         )
         ws.stage = "retrieval"
         set_workspace(ws)
-        return asyncio.run(self._make_agent().run(query))
+        agent = getattr(agent_mod, agent_cls)(
+            ScriptedChatModel(), DEFAULT_CONFIG, ws.tracer)
+        chunks = asyncio.run(agent.run(query))
+        return ws, chunks
 
-    def test_hot_query_returns_nonempty_chunks(self):
-        """常见套餐问题应一轮成功，返回非空 chunk 列表。"""
-        chunks = self._run("用户想办理流量套餐,如何推荐?")
+    def test_hot_query_returns_processed_chunks(self):
+        """GoalLoop 走通:召回 → Processing → Top3 验证,返回非空结果。"""
+        ws, chunks = self._run("用户想办理流量套餐,如何推荐?")
         self.assertIsInstance(chunks, list)
-        self.assertGreater(len(chunks), 0,
-                           "热门问题检索结果不应为空")
+        self.assertGreater(len(chunks), 0)
+        self.assertTrue(all(isinstance(c, Chunk) for c in chunks))
+        events = [(e.stage, e.event) for e in ws.tracer.events]
+        self.assertIn(("retrieval", "loop_result"), events)
 
-    def test_all_chunks_have_chunk_id(self):
-        chunks = self._run("流量套餐怎么推荐")
+    def test_loop_produces_verification_trace(self):
+        """每轮迭代后 ProcessingVerifier 自动运行,trace 留下验证事件。"""
+        ws, _ = self._run("流量套餐怎么推荐")
+        verify_events = [e.event for e in ws.tracer.events
+                         if e.stage == "retrieval.verify"]
+        self.assertTrue(verify_events, f"缺少验证事件: {ws.tracer.events}")
+
+    def test_all_chunks_have_identity_and_content(self):
+        _, chunks = self._run("宽带新装怎么办理")
         for c in chunks:
             self.assertTrue(c.chunk_id, f"chunk 缺少 chunk_id: {c}")
-
-    def test_all_chunks_have_content(self):
-        chunks = self._run("宽带新装怎么办理")
-        for c in chunks:
             self.assertTrue(c.content, "chunk.content 不应为空")
 
     def test_cold_query_does_not_raise(self):
-        """冷门问题 2 轮耗尽后应以 best 退出，不抛异常。"""
+        """冷门问题轮次耗尽后携最优退出,不抛异常。"""
         try:
-            chunks = self._run("副卡怎么共享主卡额度")
-            # 轮次耗尽，可能返回空列表或少量片段
+            _, chunks = self._run("副卡怎么共享主卡额度")
             self.assertIsInstance(chunks, list)
         except Exception as exc:
             self.fail(f"冷门问题不应抛出异常: {exc}")
 
-    def test_result_chunks_are_chunk_instances(self):
-        chunks = self._run("流量套餐")
-        for c in chunks:
-            self.assertIsInstance(c, Chunk)
+    def test_direct_subagent_zero_llm_recall(self):
+        """DirectRetrievalSubAgent:直调 intergrate_all,零 LLM。"""
+        ws, chunks = self._run("流量套餐推荐", agent_cls="DirectRetrievalSubAgent")
+        self.assertTrue(chunks)
+        self.assertIn(("retrieval", "done"),
+                      [(e.stage, e.event) for e in ws.tracer.events])
 
-    def test_tracer_records_recall_events(self):
-        """GoalLoop 运行后 trace 里应有召回相关事件。"""
-        ws = RunWorkspace(
-            query="套餐推荐", cfg=DEFAULT_CONFIG,
-            es=MockESClient(), tracer=Tracer()
-        )
+    def test_direct_subagent_fallback_and_raise(self):
+        """intergrate_all 报错且零召回 → keyword_recall 兜底,仍空则抛错。"""
+        from kbagent.retrieval.agent import DirectRetrievalSubAgent
+
+        class _DeadES(MockESClient):
+            def keyword_search(self, query, region_code="", keywords=None,
+                               timeout=30):
+                return {"merged": [], "keywords": [], "knowledge_ids": [],
+                        "error": "ngkm 不可用"}
+
+            def vector_search(self, query_text, region_code="",
+                              vector_mode="both"):
+                return None
+
+        ws = RunWorkspace(query="流量套餐", cfg=DEFAULT_CONFIG, es=_DeadES(),
+                          tracer=Tracer())
         ws.stage = "retrieval"
         set_workspace(ws)
-        asyncio.run(self._make_agent().run("套餐推荐"))
-        events = [e.event for e in ws.tracer.events]
-        self.assertTrue(
-            any("recall" in ev for ev in events),
-            f"trace 中未找到召回事件: {events}"
-        )
+        agent = DirectRetrievalSubAgent(None, DEFAULT_CONFIG, ws.tracer)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(agent.run("流量套餐"))
+        self.assertIn("intergrate_all_fallback",
+                      [e.event for e in ws.tracer.events])
 
 
 if __name__ == "__main__":

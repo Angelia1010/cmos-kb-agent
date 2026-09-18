@@ -198,11 +198,11 @@ def _default_model() -> Any:
     return ScriptedChatModel()
 
 
-def _default_es() -> Any:
+def _default_es(model: Any = None) -> Any:
     """按环境变量选择检索后端;**缺省即生产后端**。
 
     默认/KB_SERVICE_ES=produce → ProduceESClient(生产 ngkm 一体化流水线:
-    槽位提取 → 知识主索引召回 → 原子表拼接,intergrate_all 的
+    大模型关键词提取 → 知识主索引召回 → 原子表拼接,intergrate_all 的
     full_recall 必然可用,不会再落入"后端不支持"分支);
     仅 KB_SERVICE_ES=mock → 离线 MockESClient(内置样例,本地演示)。
     """
@@ -212,7 +212,7 @@ def _default_es() -> Any:
         return MockESClient()
     region = os.environ.get(ENV_ES_REGION, "000").strip() or "000"
     logger.info("检索后端: 生产 ngkm ProduceESClient region=%s", region)
-    return ProduceESClient(region_code=region)
+    return ProduceESClient(region_code=region, model=model)
 
 
 def create_app(model: Any = None, es: Any = None,
@@ -229,7 +229,7 @@ def create_app(model: Any = None, es: Any = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.model = model or _default_model()
-        app.state.es = es or _default_es()
+        app.state.es = es or _default_es(app.state.model)
         app.state.timeout_s = timeout_s
         logger.info("kbagent 服务就绪 base=%s model=%s es=%s skills=%s",
                     base, type(app.state.model).__name__,
