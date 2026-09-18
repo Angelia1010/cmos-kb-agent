@@ -38,7 +38,7 @@ PYTHONPATH=src python -m unittest discover -s . -p "test_kbagent*.py" -v
 用户Query → 缓存快速通道(命中直接返回)
   → ① RetrievalSubAgent (自主规划, GoalLoop护栏, max 2轮)
   → ② ProcessingSubAgent (自主规划, SkillMiddleware注入业务技能包)
-  → ③ AnswerSubAgent (逐篇locate定位片段+相关度 → LLM组织话术 → 一次批量一致性校验; LLM调用=N+2)
+  → ③ AnswerSubAgent (逐篇locate定位片段+相关度,线程池并行(≤4) → LLM组织话术 → 一次批量一致性校验; LLM调用=N+2)
   → 任一异常/超时 → 降级：原始query单轮检索返回原文
 ```
 

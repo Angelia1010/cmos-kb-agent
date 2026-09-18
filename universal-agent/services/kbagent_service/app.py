@@ -77,9 +77,18 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-# 端到端超时(秒):略大于 Config.budget["end_to_end"]=120000ms;
-# 覆盖内网大模型多轮调用(检索循环 + 答案生成),超时返回 50002
-DEFAULT_TIMEOUT_S = 120.0
+# 端到端超时(秒):覆盖内网大模型多轮调用(检索 GoalLoop + 答案生成),
+# 超时返回 50002。可经环境变量 KB_SERVICE_TIMEOUT_S 覆盖(优先于默认值);
+# ⚠️ 平台网关的超时必须大于该值,否则平台先掐断,50002 都到不了调用方。
+DEFAULT_TIMEOUT_S = 240.0
+ENV_TIMEOUT_S = "KB_SERVICE_TIMEOUT_S"
+# 检索 GoalLoop 轮次上限:默认沿用 Config.max_retrieval_rounds(=3)。
+# 每轮含完整 处理+Top3验证,是端到端最贵的一段;生产可经环境变量
+# KB_SERVICE_MAX_RETRIEVAL_ROUNDS 收紧(如 =2),机制不变,只调上限。
+ENV_MAX_RETRIEVAL_ROUNDS = "KB_SERVICE_MAX_RETRIEVAL_ROUNDS"
+# ngkm/ES HTTP 超时(秒):默认沿用 ProduceESClient(30s);生产可经
+# KB_SERVICE_ES_TIMEOUT 收紧(如 =10),防单次后端挂起吃光端到端预算。
+ENV_ES_TIMEOUT = "KB_SERVICE_ES_TIMEOUT"
 # appId 白名单环境变量:逗号分隔;为空则全部放行
 ENV_APP_IDS = "KB_SERVICE_APP_IDS"
 # 检索后端选择:默认 produce=生产 ngkm 一体化流水线(ProduceESClient);
@@ -211,16 +220,53 @@ def _default_es(model: Any = None) -> Any:
         logger.warning("KB_SERVICE_ES=mock: 使用离线 MockESClient(仅 7 条内置样例)")
         return MockESClient()
     region = os.environ.get(ENV_ES_REGION, "000").strip() or "000"
-    logger.info("检索后端: 生产 ngkm ProduceESClient region=%s", region)
-    return ProduceESClient(region_code=region, model=model)
+    es_kwargs: dict = {}
+    raw_timeout = os.environ.get(ENV_ES_TIMEOUT, "").strip()
+    if raw_timeout:
+        try:
+            es_kwargs["timeout"] = max(1, int(float(raw_timeout)))
+        except ValueError:
+            logger.warning("%s=%r 非法,忽略,使用 ProduceESClient 默认超时",
+                           ENV_ES_TIMEOUT, raw_timeout)
+    logger.info("检索后端: 生产 ngkm ProduceESClient region=%s timeout=%s",
+                region, es_kwargs.get("timeout", "默认"))
+    return ProduceESClient(region_code=region, model=model, **es_kwargs)
+
+
+def _resolve_timeout_s(explicit: Optional[float] = None) -> float:
+    """端到端超时(秒):显式入参 > 环境变量 KB_SERVICE_TIMEOUT_S > 默认值。"""
+    if explicit is not None:
+        return float(explicit)
+    raw = os.environ.get(ENV_TIMEOUT_S, "").strip()
+    try:
+        val = float(raw)
+    except ValueError:
+        return DEFAULT_TIMEOUT_S
+    return val if val > 0 else DEFAULT_TIMEOUT_S
+
+
+def _resolve_cfg() -> Any:
+    """MainAgent 领域配置:默认 DEFAULT_CONFIG(GoalLoop 3 轮不变);
+    仅当设置 KB_SERVICE_MAX_RETRIEVAL_ROUNDS 时收紧检索轮次上限。"""
+    from dataclasses import replace
+
+    from kbagent.shared.config import DEFAULT_CONFIG
+    raw = os.environ.get(ENV_MAX_RETRIEVAL_ROUNDS, "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        cfg = replace(DEFAULT_CONFIG, max_retrieval_rounds=int(raw))
+        logger.info("检索轮次上限被环境变量覆盖: max_retrieval_rounds=%s", raw)
+        return cfg
+    return DEFAULT_CONFIG
 
 
 def create_app(model: Any = None, es: Any = None,
-               timeout_s: float = DEFAULT_TIMEOUT_S,
+               timeout_s: Optional[float] = None,
                base_path: Optional[str] = None) -> FastAPI:
     """创建服务应用。
 
     model / es 可显式注入(测试或生产接真实依赖);
+    timeout_s 端到端超时,缺省取环境变量 KB_SERVICE_TIMEOUT_S,
+    再缺省为 DEFAULT_TIMEOUT_S;
     base_path 为业务路由前缀,缺省取环境变量 KB_SERVICE_BASE_PATH,
     再缺省为 DEFAULT_BASE_PATH(/api/kb-agent-service/prod)。
     """
@@ -230,10 +276,13 @@ def create_app(model: Any = None, es: Any = None,
     async def lifespan(app: FastAPI):
         app.state.model = model or _default_model()
         app.state.es = es or _default_es(app.state.model)
-        app.state.timeout_s = timeout_s
-        logger.info("kbagent 服务就绪 base=%s model=%s es=%s skills=%s",
+        app.state.timeout_s = _resolve_timeout_s(timeout_s)
+        app.state.cfg = _resolve_cfg()
+        logger.info("kbagent 服务就绪 base=%s model=%s es=%s timeout=%.0fs "
+                    "max_retrieval_rounds=%s skills=%s",
                     base, type(app.state.model).__name__,
-                    type(app.state.es).__name__, _SKILLS_DIR)
+                    type(app.state.es).__name__, app.state.timeout_s,
+                    app.state.cfg.max_retrieval_rounds, _SKILLS_DIR)
         yield
 
     app = FastAPI(title="kbagent-service", version="1.0.0", lifespan=lifespan)
@@ -364,6 +413,7 @@ def _register_routes(app: FastAPI, base: str) -> None:
         try:
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
+                              cfg=request.app.state.cfg,
                               skill_dirs=[_SKILLS_DIR])
             # 省份信息经 region_code 下传:检索一体化流水线据此选省级索引
             ans = await asyncio.wait_for(
@@ -424,6 +474,7 @@ def _register_routes(app: FastAPI, base: str) -> None:
             # 每请求新建 MainAgent(实例持有 tracer,不可并发复用)
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
+                              cfg=request.app.state.cfg,
                               skill_dirs=[_SKILLS_DIR])
             task = asyncio.ensure_future(
                 agent.arun(query, region_code=p.userInfo.province))

@@ -152,5 +152,38 @@ class TestRetrieveStream(unittest.TestCase):
         self.assertEqual([], resp["object"]["processTrace"])
 
 
+@unittest.skipUnless(TestClient is not None, "缺少 fastapi/TestClient 服务依赖")
+class TestEnvOverrides(unittest.TestCase):
+    """50002 超时治理的环境变量覆盖:TIMEOUT_S / MAX_RETRIEVAL_ROUNDS。"""
+
+    def test_timeout_env_override_and_explicit_precedence(self):
+        from kbagent_service.app import DEFAULT_TIMEOUT_S, _resolve_timeout_s
+        with patch.dict(os.environ, {"KB_SERVICE_TIMEOUT_S": "300"}):
+            self.assertEqual(300.0, _resolve_timeout_s())
+            self.assertEqual(45.0, _resolve_timeout_s(45.0))  # 显式入参优先
+        with patch.dict(os.environ, {"KB_SERVICE_TIMEOUT_S": "not-a-number"}):
+            self.assertEqual(DEFAULT_TIMEOUT_S, _resolve_timeout_s())
+        os.environ.pop("KB_SERVICE_TIMEOUT_S", None)
+        self.assertEqual(DEFAULT_TIMEOUT_S, _resolve_timeout_s())
+
+    def test_max_rounds_env_override(self):
+        from kbagent.shared.config import DEFAULT_CONFIG
+        from kbagent_service.app import _resolve_cfg
+        with patch.dict(os.environ, {"KB_SERVICE_MAX_RETRIEVAL_ROUNDS": "2"}):
+            self.assertEqual(2, _resolve_cfg().max_retrieval_rounds)
+        os.environ.pop("KB_SERVICE_MAX_RETRIEVAL_ROUNDS", None)
+        self.assertEqual(DEFAULT_CONFIG.max_retrieval_rounds,
+                         _resolve_cfg().max_retrieval_rounds)
+
+    def test_app_state_picks_up_env(self):
+        with patch.dict(os.environ, {"KB_SERVICE_TIMEOUT_S": "123",
+                                     "KB_SERVICE_MAX_RETRIEVAL_ROUNDS": "1"}):
+            client = TestClient(create_app(
+                model=ScriptedChatModel(), es=MockESClient(), base_path=BASE))
+            with client:      # 触发 lifespan
+                self.assertEqual(123.0, client.app.state.timeout_s)
+                self.assertEqual(1, client.app.state.cfg.max_retrieval_rounds)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
