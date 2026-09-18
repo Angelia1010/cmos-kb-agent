@@ -51,7 +51,7 @@ def _extract_doc_list(parsed: Any) -> List[dict]:
     if isinstance(parsed, list):
         return [d for d in parsed if isinstance(d, dict)]
     if isinstance(parsed, dict):
-        for key in ("docment", "document", "documents", "docs"):
+        for key in ("document","data"):
             docs = parsed.get(key)
             if isinstance(docs, list):
                 # logger.info("ngkm 响应从字段 %r 提取条目列表,共 %d 条",
@@ -373,7 +373,7 @@ class ProduceESClient(ESClient):
         if not deduped:
             # logger.warning("关键词提取返回空,降级为原始 query")
             return [query.strip()] if query.strip() else []
-        return deduped
+        return deduped#此处返回的是["k1","k2","k3"]
     
     # def _extract_keywords(self, query: str) -> List[str]: #优化槽位提取结果，只保留有效信息（代办）
     #     """Step 1:槽位抽取服务提取检索关键词。"""
@@ -519,14 +519,12 @@ class ProduceESClient(ESClient):
 
         # ---- Step 4: 合并 info + atom ----
         merged: List[dict] = []
-        all_info_clean: List[dict] = []
         for info in all_infos:
             kid = info.get("knowledgeId") or info.get("knowledge_id") or ""
             entry = dict(info)
             entry["atoms"] = atoms_cache.get(kid, []) if kid else []
             entry.pop("_keyword", None)
             merged.append(entry)
-            all_info_clean.append(entry)
 
         all_atoms: List[dict] = [a for atoms in atoms_cache.values() for a in atoms]
         # logger.info("keyword_search 完成: merged=%d 条 (info=%d, atom=%d) knowledgeIds=%s",
@@ -534,16 +532,8 @@ class ProduceESClient(ESClient):
         return {
             "keywords": keywords,
             "knowledge_ids": kid_order,
-            "info": all_info_clean,
+            "info": all_infos,
             "atom": all_atoms,
-            "example": {
-                "info_resp": info_eg,
-                "info_parsed": info_parsed_eg,
-                "infos": info_list_eg,
-                "atom_resp": atom_eg,
-                "atom_parsed": atom_parsed_eg,
-                "atoms": atom_list_eg,
-            },
             "merged_count": len(merged),
             "merged": merged,
         }

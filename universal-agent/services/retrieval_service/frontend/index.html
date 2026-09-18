@@ -140,8 +140,17 @@
     <div class="form-row" style="margin-top:14px;border-top:1px dashed #e5e6eb;padding-top:12px">
       <div class="field batch-count">
         <span class="lbl">测试条数</span>
+        <!-- 2026-09-17 14:30:47 曾改为 <input type="number"> 自定义输入,回退到 11:31:29 版本(下拉框)
         <input type="number" id="batchCount" min="0" step="1" value="10"
                placeholder="输入数字,0 或留空表示全部">
+        -->
+        <select id="batchCount">
+          <option value="10" selected>10</option>
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="0">全部</option>
+        </select>
       </div>
       <div class="field action">
         <span class="lbl">&nbsp;</span>
@@ -151,7 +160,7 @@
         </div>
       </div>
       <div class="hint" style="flex:1;min-width:200px;align-self:center">
-        请求路径:POST <span id="batchPath"></span>/retrieve/batch/stream · 流式(NDJSON),每完成一条立即推送,避免 504 · 命中:召回 kid 至少含一个 knowledge_id · 0 或留空 = 全部
+        请求路径:POST <span id="batchPath"></span>/retrieve/batch · 命中:召回 kid 至少含一个 knowledge_id
       </div>
     </div>
   </div>
@@ -345,10 +354,138 @@ function toggleChunk(i) {
   if (el) el.classList.toggle("open");
 }
 
-// ── 批量测试(流式 NDJSON) ────────────────────────────────────────────────
-// 原非流式 handler(等所有请求完才返回)在网关 504 时不可用,改为流式:
-// 后端每完成一条立即 yield 一行 JSON,前端用 ReadableStream + TextDecoder
-// 边读边解析,实时 append 到表格,实时刷新 summary。
+// ── 批量测试(非流式) ── 回退到 2026-09-17 11:31:29 版本 ────────────────────
+// 2026-09-17 14:39:26 曾改为流式 /retrieve/batch/stream,回退到非流式 /retrieve/batch:
+// 等所有请求完成后一次性返回 JSON,前端解析后渲染表格。
+batchBtn.addEventListener("click", function() {
+  var count = parseInt(document.getElementById("batchCount").value, 10) || 0;
+
+  var el = document.getElementById("batchResult");
+  el.innerHTML = '<div class="empty">批量请求中...</div>';
+  batchBtn.disabled = true;
+  batchStatusEl.textContent = "批量请求中...";
+
+  fetch(BASE + "/retrieve/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ count: count })
+  }).then(function(resp) {
+    return resp.json().then(function(data) {
+      if (!resp.ok || (data.rtnCode && data.rtnCode !== "0")) {
+        batchStatusEl.textContent = "HTTP " + resp.status + " · " + (data.rtnMsg || "失败");
+        el.innerHTML = '<div class="meta">' +
+          metaCell("HTTP", badge("err", resp.status)) +
+          metaCell("rtnMsg", data.rtnMsg || "-") +
+          "</div>" +
+          "<details open><summary>原始响应</summary><pre>" +
+          escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
+        batchBtn.disabled = false;
+        return;
+      }
+
+      var obj = data.object || {};
+      var results = obj.results || [];
+      var total = obj.total != null ? obj.total : results.length;
+      var hitCount = obj.hit_count != null ? obj.hit_count : results.filter(function(r){ return r.hit; }).length;
+      var totalElapsedMs = obj.total_elapsed_ms || 0;
+      var rate = total > 0 ? (hitCount / total * 100).toFixed(1) : "0.0";
+
+      var html =
+        '<div class="batch-summary">' +
+          '<div class="stat">总数 <span class="v">' + total + '</span></div>' +
+          '<div class="stat">命中 <span class="v" style="color:#00b42a">' + hitCount + '</span></div>' +
+          '<div class="stat">未命中 <span class="v" style="color:#f53f3f">' + (total - hitCount) + '</span></div>' +
+          '<div class="stat">命中率 <span class="v">' + rate + '%</span></div>' +
+          '<div class="stat">总耗时 <span class="v">' + totalElapsedMs + 'ms</span></div>' +
+        '</div>' +
+        '<table class="batch-table"><thead><tr>' +
+          '<th class="idx">#</th>' +
+          '<th class="q">用户问</th>' +
+          '<th>区域</th>' +
+          '<th class="kids">期望 kid</th>' +
+          '<th class="kids">召回 kid</th>' +
+          '<th class="status">命中</th>' +
+          '<th>状态</th>' +
+          '<th>耗时</th>' +
+        '</tr></thead><tbody>';
+
+      results.forEach(function(r) {
+        var rowCls = r.hit ? "hit" : "miss";
+        html += '<tr class="' + rowCls + '">';
+        html += '<td class="idx">' + r.index + '</td>';
+        html += '<td class="q">' + escapeHtml(r.user_query || "") + '</td>';
+        html += '<td>' + escapeHtml(r.region_code || "-") + '</td>';
+        // 期望 kid(命中的高亮)
+        var expectedKids = r.expected_kids || [];
+        var hitKidsSet = {};
+        (r.hit_kids || []).forEach(function(k) { hitKidsSet[k] = true; });
+        html += '<td class="kids">';
+        if (expectedKids.length) {
+          html += '<div class="tags">';
+          expectedKids.forEach(function(k) {
+            var isHit = !!hitKidsSet[k];
+            var style = isHit
+              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+              : 'background:#e5e6eb;color:#4e5969;padding:1px 6px';
+            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isHit ? ' ✓' : '') + '</span>';
+          });
+          html += '</div>';
+        } else {
+          html += '<span class="hint">未标注</span>';
+        }
+        html += '</td>';
+        // 召回 kid(命中 expected 的高亮)
+        var recalledKids = r.recalled_kids || [];
+        var expectedSet = {};
+        expectedKids.forEach(function(k) { expectedSet[k] = true; });
+        html += '<td class="kids">';
+        if (recalledKids.length) {
+          html += '<div class="tags">';
+          recalledKids.forEach(function(k) {
+            var isExpected = !!expectedSet[k];
+            var style = isExpected
+              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
+              : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
+            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isExpected ? ' ✓' : '') + '</span>';
+          });
+          html += '</div>';
+        } else {
+          html += '<span class="hint">零召回</span>';
+        }
+        html += '</td>';
+        // 命中状态
+        if (r.outcome === "error" || r.outcome === "timeout") {
+          html += '<td class="status">' + badge("err", "异常") + '</td>';
+        } else if (!expectedKids.length) {
+          html += '<td class="status">' + badge("warn", "未标注") + '</td>';
+        } else if (r.hit) {
+          html += '<td class="status">' + badge("ok", "✓ 命中") + '</td>';
+        } else {
+          html += '<td class="status">' + badge("err", "✗ 未命中") + '</td>';
+        }
+        // 单条 outcome
+        html += '<td>' + escapeHtml(r.outcome || "-") +
+          (r.recalled_count != null ? ' / ' + r.recalled_count + '片' : '') + '</td>';
+        // 单条耗时
+        html += '<td>' + (r.elapsed_ms || 0) + 'ms</td>';
+        html += '</tr>';
+      });
+
+      html += '</tbody></table>';
+      el.innerHTML = html;
+      batchStatusEl.textContent = "完成 " + total + " 条 · 命中 " + hitCount + " · " + rate + "% · " + totalElapsedMs + "ms";
+      batchBtn.disabled = false;
+    });
+  }).catch(function(err) {
+    batchStatusEl.textContent = "请求失败";
+    document.getElementById("batchResult").innerHTML =
+      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
+    batchBtn.disabled = false;
+  });
+});
+
+/*
+// ── 以下为 2026-09-17 14:39:26 流式 NDJSON 版本(回退到 11:31:29 后注释保留) ──
 batchBtn.addEventListener("click", function() {
   var countVal = document.getElementById("batchCount").value.trim();
   var count = countVal === "" ? 0 : parseInt(countVal, 10);
@@ -548,6 +685,7 @@ batchBtn.addEventListener("click", function() {
     batchBtn.disabled = false;
   });
 });
+*/
 </script>
 </body>
 </html>

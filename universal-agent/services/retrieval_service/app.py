@@ -422,6 +422,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
         return BatchRetrievalResponse(
             rtnCode=RTN_OK, rtnMsg="success", object=obj)
 
+    # ── 2026-09-17 14:39:26 新增 /retrieve/batch/stream 流式端点;回退到 11:31:29 版本,整体注释 ──
+    '''
     @app.post(f"{base}/retrieve/batch/stream")
     async def retrieve_batch_stream(payload: BatchRetrievalRequest, request: Request):
         """流式批量检索端点(NDJSON):每完成一条立即 yield,避免网关 504。
@@ -551,6 +553,7 @@ def _register_routes(app: FastAPI, base: str) -> None:
                 "Cache-Control": "no-cache",
             },
         )
+    '''
 
     @app.post(f"{base}/keyword", response_model=RetrievalResponse)
     # 原端点共用 RetrievalRequest(含无关的 vector_mode),关键词路径不走向量召回,
