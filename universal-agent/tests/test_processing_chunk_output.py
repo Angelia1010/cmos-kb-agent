@@ -18,6 +18,7 @@ from kbagent.scripted_model import ScriptedChatModel  # noqa: E402
 from kbagent.shared.knowledge_processing.models import ProcessedKnowledge  # noqa: E402
 from kbagent.shared.models import Chunk  # noqa: E402
 from kbagent.shared.workspace import RunWorkspace, workspace_scope  # noqa: E402
+from tests.processing_mock_data import build_source_chunks  # noqa: E402
 
 
 SENSITIVE_MARKER = "SYNTHETIC_RAW_METADATA_MUST_NOT_LEAK"
@@ -30,6 +31,7 @@ def _processed(
     retrieval_score: float | None,
 ) -> ProcessedKnowledge:
     return ProcessedKnowledge(
+        chunk_id=knowledge_id,
         knowledge_id=knowledge_id,
         name=f"标题-{knowledge_id}",
         retrieval_rank=retrieval_rank,
@@ -55,6 +57,7 @@ def _processed(
 
 def _candidate(prefix: str, index: int) -> dict:
     return {
+        "chunk_id": f"{prefix}-{index:03d}",
         "knowledge_id": f"{prefix}-{index:03d}",
         "knowledge_name": f"流量知识{index}",
         "retrieval_rank": index,
@@ -86,6 +89,7 @@ def _workspace(candidates: list[dict]) -> RunWorkspace:
                 "audience": "agent",
                 "customer_type": "个人客户",
             },
+            "chunks": build_source_chunks(candidates),
             "knowledge_candidates": copy.deepcopy(candidates),
         },
     )
@@ -96,6 +100,27 @@ class _BrokenScriptedModel(ScriptedChatModel):
         raise RuntimeError("synthetic rerank failure")
 
 
+def _source_chunk(chunk_id: str, index: int) -> Chunk:
+    """构造原 Retrieval Chunk(带敏感 metadata/raw,验证输出白名单)。"""
+    return Chunk(
+        chunk_id=chunk_id,
+        doc_id=f"DOC-{chunk_id}",
+        doc_title=f"文档-{chunk_id}",
+        content=f"{chunk_id} 原始正文",
+        category="套餐",
+        position={"para": index},
+        version="v2.0",
+        updated_at="2026-09-01",
+        score=round(1 - index / 10, 2),
+        source_chunk_ids=[f"{chunk_id}-SRC"],
+        extra={
+            "atoms": [{"content": "结构化原子"}],
+            "metadata": {"secret": SENSITIVE_MARKER},
+            "raw": {"secret": SENSITIVE_MARKER},
+        },
+    )
+
+
 class TestTop3ToProcessedChunks(unittest.TestCase):
     def test_mapping_order_markdown_scores_and_whitelist(self):
         candidates = [
@@ -104,66 +129,58 @@ class TestTop3ToProcessedChunks(unittest.TestCase):
             _processed("K003", retrieval_rank=3, retrieval_score=None),
         ]
         original = copy.deepcopy(candidates)
-
-        chunks = top3_to_processed_chunks(candidates)
-
-        self.assertEqual(["K001", "K002", "K003"], [item.chunk_id for item in chunks])
-        self.assertEqual(["K001", "K002", "K003"], [item.doc_id for item in chunks])
-        self.assertEqual([0.10, 0.90, 0.0], [item.score for item in chunks])
-        self.assertEqual([False, False, True], [
-            item.extra["processing"]["score_missing"] for item in chunks
-        ])
-        self.assertEqual(candidates[0].content_md, chunks[0].content)
-        self.assertIn("| 剩余流量 | 10GB |", chunks[0].content)
-        self.assertTrue(all(isinstance(item, Chunk) for item in chunks))
-        self.assertTrue(all(item.category == "" for item in chunks))
-        self.assertTrue(all(item.position == {} for item in chunks))
-        self.assertTrue(all(item.version == "v1.0" for item in chunks))
-        self.assertTrue(all(item.updated_at == "" for item in chunks))
-        self.assertTrue(all(item.source_chunk_ids == [] for item in chunks))
-
-        expected_extra_fields = {
-            "retrieval_rank",
-            "rerank_rank",
-            "included_atom_count",
-            "matched_atom_ids",
-            "source_routes",
-            "knowledge_type",
-            "template_id",
-            "score_missing",
+        source_chunks = {
+            item.chunk_id: _source_chunk(item.chunk_id, index)
+            for index, item in enumerate(candidates, start=1)
         }
+        sources_original = copy.deepcopy(source_chunks)
+
+        chunks = top3_to_processed_chunks(candidates, source_chunks)
+
+        # 顺序与身份字段完全继承原 Chunk
+        self.assertEqual(["K001", "K002", "K003"], [item.chunk_id for item in chunks])
+        self.assertEqual(
+            ["DOC-K001", "DOC-K002", "DOC-K003"], [item.doc_id for item in chunks])
+        self.assertEqual([0.9, 0.8, 0.7], [item.score for item in chunks])
+        self.assertTrue(all(isinstance(item, Chunk) for item in chunks))
+        self.assertTrue(all(item.category == "套餐" for item in chunks))
+        self.assertTrue(all(item.version == "v2.0" for item in chunks))
+        self.assertTrue(all(item.updated_at == "2026-09-01" for item in chunks))
+        self.assertEqual([{"para": 1}, {"para": 2}, {"para": 3}],
+                         [item.position for item in chunks])
+        self.assertEqual([["K001-SRC"], ["K002-SRC"], ["K003-SRC"]],
+                         [item.source_chunk_ids for item in chunks])
+
+        # content 替换为 Markdown;extra 只保留 processing.rerank_rank 白名单
+        self.assertEqual(
+            [item.content_md for item in candidates],
+            [item.content for item in chunks],
+        )
+        self.assertIn("| 剩余流量 | 10GB |", chunks[0].content)
         self.assertTrue(all(set(item.extra) == {"processing"} for item in chunks))
-        self.assertTrue(all(
-            set(item.extra["processing"]) == expected_extra_fields for item in chunks
-        ))
+        self.assertEqual([1, 2, 3],
+                         [item.extra["processing"]["rerank_rank"] for item in chunks])
+
+        # 敏感字段不外泄;输入候选与原 Chunk 均不被修改
         serialized = json.dumps([item.to_dict() for item in chunks], ensure_ascii=False)
-        self.assertNotIn("raw", serialized)
         self.assertNotIn("metadata", serialized)
         self.assertNotIn(SENSITIVE_MARKER, serialized)
         self.assertEqual(original, candidates)
+        self.assertEqual(sources_original, source_chunks)
 
-        chunks[0].extra["processing"]["matched_atom_ids"].append("NEW")
-        chunks[0].extra["processing"]["source_routes"].append("NEW")
-        chunks[0].position["para"] = 1
-        self.assertEqual(original, candidates)
-        self.assertNotIn("NEW", candidates[0].matched_atom_ids)
-        self.assertNotIn("NEW", candidates[0].source_routes)
-        self.assertIsNot(chunks[0].position, chunks[1].position)
+        # 输出 extra 为新构造字典,回写不污染源 Chunk
+        chunks[0].extra["processing"]["rerank_rank"] = 99
+        self.assertNotIn("processing", source_chunks["K001"].extra)
+        self.assertEqual(sources_original, source_chunks)
 
     def test_empty_input_and_missing_id(self):
-        self.assertEqual([], top3_to_processed_chunks([]))
-        zero_score, missing_score = top3_to_processed_chunks([
-            _processed("ZERO", retrieval_rank=1, retrieval_score=0.0),
-            _processed("MISSING", retrieval_rank=2, retrieval_score=None),
-        ])
-        self.assertEqual(0.0, zero_score.score)
-        self.assertFalse(zero_score.extra["processing"]["score_missing"])
-        self.assertEqual(0.0, missing_score.score)
-        self.assertTrue(missing_score.extra["processing"]["score_missing"])
-        with self.assertRaisesRegex(ValueError, "knowledge_id"):
-            top3_to_processed_chunks([
-                _processed("", retrieval_rank=1, retrieval_score=0.5),
-            ])
+        self.assertEqual([], top3_to_processed_chunks([], {}))
+        with self.assertRaisesRegex(ValueError, "chunk_id"):
+            top3_to_processed_chunks(
+                [_processed("", retrieval_rank=1, retrieval_score=0.5)], {})
+        with self.assertRaisesRegex(ValueError, "找不到 chunk_id=MISSING"):
+            top3_to_processed_chunks(
+                [_processed("MISSING", retrieval_rank=1, retrieval_score=0.5)], {})
 
 
 class TestOrchestratorProcessedChunks(unittest.IsolatedAsyncioTestCase):
@@ -180,7 +197,7 @@ class TestOrchestratorProcessedChunks(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(isinstance(item, Chunk) for item in chunks))
         self.assertTrue(all(isinstance(item, ProcessedKnowledge) for item in result))
         self.assertEqual(
-            [item.knowledge_id for item in result],
+            [item.chunk_id for item in result],
             [item.chunk_id for item in chunks],
         )
         self.assertEqual(
@@ -238,6 +255,8 @@ class TestOrchestratorProcessedChunks(unittest.IsolatedAsyncioTestCase):
             ws.data["knowledge_candidates"] = [
                 _candidate("SECOND", index) for index in range(1, 5)
             ]
+            ws.data["chunks"] = build_source_chunks(
+                ws.data["knowledge_candidates"])
             with patch(
                 "kbagent.processing.agent.top3_to_processed_chunks",
                 side_effect=RuntimeError("synthetic conversion error"),

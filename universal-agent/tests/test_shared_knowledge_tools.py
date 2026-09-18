@@ -45,7 +45,10 @@ from kbagent.shared.tools import (  # noqa: E402
     filter_knowledge_candidates,
 )
 from kbagent.shared.workspace import RunWorkspace, set_workspace  # noqa: E402
-from tests.processing_mock_data import make_top100_candidates  # noqa: E402
+from tests.processing_mock_data import (  # noqa: E402
+    build_source_chunks,
+    make_top100_candidates,
+)
 from uniagent.agents.factory import create_agent  # noqa: E402
 from uniagent.config.app_config import AppConfig  # noqa: E402
 from uniagent.tools.registry import get_available_tools  # noqa: E402
@@ -524,6 +527,7 @@ class TestSharedKnowledgeTools(unittest.TestCase):
         ws.data.update({
             "processing_context": copy.deepcopy(context),
             "retrieval_query": "5G 流量套餐",
+            "chunks": build_source_chunks(raw),
             "knowledge_candidates": raw,
         })
         set_workspace(ws)

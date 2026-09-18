@@ -1,6 +1,36 @@
 """独立知识处理流水线的确定性 Mock 候选。"""
 from __future__ import annotations
 
+from typing import Any
+
+
+def build_source_chunks(candidates: list[dict]) -> list[Any]:
+    """由候选 dict 构造可关联的原始 Chunk 列表(新流水线的工作区输入)。
+
+    ProcessingSubAgent.run 需要 ``ws.data["chunks"]`` 做 Top3→原 Chunk 关联;
+    候选缺 ``chunk_id`` 时按 ``knowledge_id`` 就地补齐(会修改候选 dict,
+    调用方需在调用后再取 deepcopy 快照)。
+    """
+    from kbagent.shared.models import Chunk
+
+    chunks = []
+    for index, candidate in enumerate(candidates):
+        chunk_id = (candidate.get("chunk_id")
+                    or candidate.get("knowledge_id")
+                    or f"CHUNK-{index + 1:03d}")
+        candidate["chunk_id"] = chunk_id
+        content = candidate.get("content")
+        score = candidate.get("retrieval_score")
+        chunks.append(Chunk(
+            chunk_id=chunk_id,
+            doc_id=str(candidate.get("knowledge_id") or chunk_id),
+            doc_title=str(candidate.get("knowledge_name") or ""),
+            content=content if isinstance(content, str) else "",
+            category="",
+            score=float(score) if isinstance(score, (int, float)) else 0.0,
+        ))
+    return chunks
+
 
 def make_top100_candidates(count: int = 100) -> list[dict]:
     """生成指定数量的稳定候选；默认保持原 Top100 契约。"""
@@ -10,6 +40,7 @@ def make_top100_candidates(count: int = 100) -> list[dict]:
     for index in range(1, count + 1):
         relevant = index in {42, 73, 99}
         candidates.append({
+            "chunk_id": f"REAL-KNOWLEDGE-{index:03d}",
             "knowledge_id": f"REAL-KNOWLEDGE-{index:03d}",
             "knowledge_name": "5G流量套餐" if relevant else f"普通业务{index}",
             "retrieval_rank": index,

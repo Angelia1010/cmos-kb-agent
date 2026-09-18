@@ -30,7 +30,10 @@ from kbagent.shared.knowledge_processing.models import (  # noqa: E402
     ProcessedKnowledge,
 )
 from kbagent.shared.workspace import RunWorkspace, set_workspace  # noqa: E402
-from tests.processing_mock_data import make_top100_candidates  # noqa: E402
+from tests.processing_mock_data import (  # noqa: E402
+    build_source_chunks,
+    make_top100_candidates,
+)
 
 
 LOGGER_NAME = "processing_demo"
@@ -630,6 +633,9 @@ async def run_demo(config: DemoConfig) -> DemoRunResult:
     logger = _configure_logging(output_dir, config.verbose)
     started = time.perf_counter()
     raw_candidates, source, json_runtime_input = _load_candidates(config)
+    # 新流水线要求工作区携带原始 Chunk 供 Top3 关联;先补齐 chunk_id 再取快照,
+    # 保证 input_unchanged 校验(编排器不得修改候选)语义不变。
+    source_chunks = build_source_chunks(raw_candidates)
     input_snapshot = copy.deepcopy(raw_candidates)
     input_elapsed_ms = round((time.perf_counter() - started) * 1000)
 
@@ -638,6 +644,7 @@ async def run_demo(config: DemoConfig) -> DemoRunResult:
     ws.data.update({
         "processing_context": context,
         "retrieval_query": retrieval_query,
+        "chunks": source_chunks,
         "knowledge_candidates": raw_candidates,
     })
     set_workspace(ws)

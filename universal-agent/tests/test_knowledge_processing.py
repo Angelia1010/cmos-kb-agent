@@ -54,7 +54,7 @@ from kbagent.shared.knowledge_processing.richtext import (
     render_richtext_with_warnings,
 )
 from kbagent.shared.workspace import RunWorkspace, set_workspace
-from tests.processing_mock_data import make_top100_candidates
+from tests.processing_mock_data import build_source_chunks, make_top100_candidates
 
 
 class _CapturingModel:
@@ -1012,6 +1012,7 @@ class TestRerank(unittest.TestCase):
                 "audience": "agent",
             },
             "retrieval_query": "5G 套餐 流量",
+            "chunks": build_source_chunks(raw),
             "knowledge_candidates": raw,
         })
         set_workspace(ws)
@@ -1171,6 +1172,23 @@ class TestRerank(unittest.TestCase):
 
 class TestToolsAndOrchestrator(unittest.TestCase):
     def test_all_warnings_survive_every_processing_stage_in_stable_order(self):
+        candidates = [
+            {"knowledge_id": "status", "knowledge_name": "未知状态", "content": "A",
+             "applicability": {"status": "mystery"}},
+            {"knowledge_id": "start", "knowledge_name": "非法开始", "content": "B",
+             "applicability": {"effective_start": "bad-start"}},
+            {"knowledge_id": "end", "knowledge_name": "非法结束", "content": "C",
+             "applicability": {"effective_end": "bad-end"}},
+            {"knowledge_id": "shape", "knowledge_name": "异常范围", "content": "D",
+             "applicability": {"region_ids": {"bad": "shape"}}},
+            {"knowledge_id": "atom", "knowledge_name": "原子告警", "content": "主体",
+             "atoms": [
+                 {"param_name": "不适用", "content": "X",
+                  "applicability": {"regions": ["北京"]}},
+                 {"param_name": "受限注解", "content": "Y",
+                  "annotation": {"visibility": "agent", "content": "内部说明"}},
+             ]},
+        ]
         ws = RunWorkspace(query="风险告警")
         ws.data.update({
             "processing_context": {
@@ -1178,23 +1196,8 @@ class TestToolsAndOrchestrator(unittest.TestCase):
                 "request_time": "2026-08-28T12:00:00+08:00",
             },
             "retrieval_query": "风险告警",
-            "knowledge_candidates": [
-                {"knowledge_id": "status", "knowledge_name": "未知状态", "content": "A",
-                 "applicability": {"status": "mystery"}},
-                {"knowledge_id": "start", "knowledge_name": "非法开始", "content": "B",
-                 "applicability": {"effective_start": "bad-start"}},
-                {"knowledge_id": "end", "knowledge_name": "非法结束", "content": "C",
-                 "applicability": {"effective_end": "bad-end"}},
-                {"knowledge_id": "shape", "knowledge_name": "异常范围", "content": "D",
-                 "applicability": {"region_ids": {"bad": "shape"}}},
-                {"knowledge_id": "atom", "knowledge_name": "原子告警", "content": "主体",
-                 "atoms": [
-                     {"param_name": "不适用", "content": "X",
-                      "applicability": {"regions": ["北京"]}},
-                     {"param_name": "受限注解", "content": "Y",
-                      "annotation": {"visibility": "agent", "content": "内部说明"}},
-                 ]},
-            ],
+            "chunks": build_source_chunks(candidates),
+            "knowledge_candidates": candidates,
         })
         set_workspace(ws)
         asyncio.run(KnowledgeProcessingOrchestrator(_CapturingModel()).run())
@@ -1215,11 +1218,13 @@ class TestToolsAndOrchestrator(unittest.TestCase):
 
     def test_workspace_degradation_reasons_come_from_authoritative_rerank_details(self):
         async def run_case(model, options, count=8):
+            raw = make_top100_candidates()[:count]
             ws = RunWorkspace(query="套餐")
             ws.data.update({
                 "processing_context": {"audience": "agent"},
                 "retrieval_query": "套餐",
-                "knowledge_candidates": make_top100_candidates()[:count],
+                "chunks": build_source_chunks(raw),
+                "knowledge_candidates": raw,
             })
             set_workspace(ws)
             await KnowledgeProcessingOrchestrator(model, options).run()
@@ -1275,6 +1280,7 @@ class TestToolsAndOrchestrator(unittest.TestCase):
         ws.data.update({
             "processing_context": {"region_name": "河南"},
             "retrieval_query": "5G 流量",
+            "chunks": build_source_chunks(raw),
             "knowledge_candidates": raw,
         })
         set_workspace(ws)
