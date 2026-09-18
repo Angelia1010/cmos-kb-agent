@@ -185,10 +185,6 @@ def kresult_to_chunks(kresult: List[Dict[str, Any]]) -> List[Chunk]:
 
 def get_kid_score(keyword_kid: List[str], vector_kid: List[str]) -> Dict[str, float]:
     """根据 keyword/vector 两路 kid 列表计算每个 kid 的得分。
-
-    权重:keyword=2.0, vector=1.0。kid 同时出现在两路得 2+1=3,
-    只在 keyword 路得 2,只在 vector 路得 1。
-    返回 {kid: score} 字典。
     """
     keyword_set = set(keyword_kid or [])
     vector_set = set(vector_kid or [])
@@ -337,11 +333,11 @@ class ProduceESClient(ESClient):
         return self._info_atom_recall(keywords, region_code, timeout)
 
     def _extract_keywords(self, query: str) -> List[str]:
-        """Step 1:使用大模型从用户问题中提取检索关键词。"""
-        # lazy import 打破 search → retrieval.prompt → retrieval.__init__ → agent → workspace → search 循环
         from ..retrieval.prompt import _KEYWORD_EXTRACT_SYSTEM
+        print("━━━ _extract_keywords query =", repr(query))                # 加这行
+        print("    self.model is None =", self.model is None)              # ← 重点看这行
         if self.model is None:
-            # logger.warning("ProduceESClient 未注入 model,关键词提取降级为原始 query")
+            print("    → fallback 1: model is None, 返回原始 query")       # 加
             return [query.strip()] if query.strip() else []
         t0 = time.time()
         try:
@@ -350,29 +346,40 @@ class ProduceESClient(ESClient):
                 HumanMessage(content=f"用户问题:{query}"),
             ])
         except Exception as exc:  # noqa: BLE001
+            print("    → LLM 调用异常:", repr(exc))
             # logger.warning("关键词提取 LLM 调用异常: %r", exc)
             raise
         elapsed = time.time() - t0
         raw = str(getattr(resp, "content", resp))
+        print(f"    LLM 耗时={elapsed:.2f}s raw={raw[:300]!r}")
         # logger.info("关键词提取 LLM 返回 耗时%.1fs 长度=%d 内容=%s",
         #             elapsed, len(raw), raw[:500].replace("\n", " "))
         cleaned = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.M).strip()
+        print(f"    cleaned={cleaned[:300]!r}")
+        print("    LLM raw =", repr(raw[:200]))                            # 加
+        print("    LLM cleaned =", repr(cleaned[:200]))                    # 加
+
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError as exc:
+            print("    → fallback 2: JSON 解析失败, err=", exc)            # 加
             # logger.warning("关键词提取 JSON 解析失败 err=%s 原始=%s",
             #                exc, cleaned[:300])
             return [query.strip()] if query.strip() else []
         keywords = data.get("keywords", []) if isinstance(data, dict) else []
+        print(f"    JSON data={data!r}  keywords(raw)={keywords!r}")
         if not isinstance(keywords, list):
             keywords = [str(keywords)]
         seen: set = set()
         deduped = [str(k).strip() for k in keywords
                    if k and not (str(k).strip() in seen or seen.add(str(k).strip()))]
         # logger.info("关键词提取完成 query=%r → keywords=%s", query, deduped)
+        print("    deduped =", deduped)                                    # 加
         if not deduped:
+            print("    → fallback 3: deduped 空,返回原始 query")            # 加
             # logger.warning("关键词提取返回空,降级为原始 query")
             return [query.strip()] if query.strip() else []
+        print(f"    ✓ 正常返回 deduped={deduped!r}")
         return deduped#此处返回的是["k1","k2","k3"]
     
     # def _extract_keywords(self, query: str) -> List[str]: #优化槽位提取结果，只保留有效信息（代办）

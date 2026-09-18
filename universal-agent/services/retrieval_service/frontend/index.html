@@ -25,12 +25,9 @@
   .form-row .field .lbl { color: #4e5969; font-size: 13px; }
   .form-row .field.query { flex: 2; min-width: 280px; }
   .form-row .field.region { flex: 1; min-width: 140px; }
-  .form-row .field.mode { flex: 1; min-width: 180px; }
-  .form-row .field.vmode { flex: 1; min-width: 160px; }
   .form-row .field.kid { flex: 1; min-width: 200px; }
   .form-row .field.action { flex: 0 0 auto; }
   .form-row .field.batch-count { flex: 0 0 160px; }
-  /* 批量测试表格 */
   .batch-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .batch-table th, .batch-table td {
     border: 1px solid #e5e6eb; padding: 6px 8px; vertical-align: top;
@@ -105,27 +102,9 @@
         <span class="lbl">region_code</span>
         <input type="text" id="region_code" value="000" placeholder="省份名或区号,如 福建/591/000">
       </div>
-      <!-- 原mode字段(已删除,默认integrate)
-      <div class="field mode">
-        <span class="lbl">mode(召回路径)</span>
-        <select id="mode" disabled>
-          <option value="integrate" selected>integrate — GoalLoop 三轮(intergrate_all→query_rewrite→intergrate_all)</option>
-        </select>
-      </div>
-      -->
-      <!-- 原vmode字段(已删除,默认both)
-      <div class="field vmode" id="vmodeField">
-        <span class="lbl">vector_mode(向量模板)</span>
-        <select id="vector_mode">
-          <option value="new">new — 新模板</option>
-          <option value="old">old — 旧模板</option>
-          <option value="both" selected>both — 双模板混合(默认)</option>
-        </select>
-      </div>
-      -->
       <div class="field kid">
         <span class="lbl">正确 kid</span>
-        <input type="text" id="correct_kid" placeholder="输入期望命中的知识ID(chunk_id)">
+        <input type="text" id="correct_kid" placeholder="输入期望命中的知识ID">
       </div>
       <div class="field action">
         <span class="lbl">&nbsp;</span>
@@ -136,14 +115,9 @@
       </div>
     </div>
     <div class="hint" style="margin-top:10px">请求路径:POST <span id="basePath"></span>/retrieve</div>
-    <!-- 批量测试行:从测试集选取前 count 条逐条执行检索 -->
     <div class="form-row" style="margin-top:14px;border-top:1px dashed #e5e6eb;padding-top:12px">
       <div class="field batch-count">
         <span class="lbl">测试条数</span>
-        <!-- 2026-09-17 14:30:47 曾改为 <input type="number"> 自定义输入,回退到 11:31:29 版本(下拉框)
-        <input type="number" id="batchCount" min="0" step="1" value="10"
-               placeholder="输入数字,0 或留空表示全部">
-        -->
         <select id="batchCount">
           <option value="10" selected>10</option>
           <option value="20">20</option>
@@ -155,21 +129,21 @@
       <div class="field action">
         <span class="lbl">&nbsp;</span>
         <div class="row">
-          <button id="batchSend">批量测试</button>
+          <button id="batchSend">批量测试(流式)</button>
           <span id="batchStatus" class="hint"></span>
         </div>
       </div>
       <div class="hint" style="flex:1;min-width:200px;align-self:center">
-        请求路径:POST <span id="batchPath"></span>/retrieve/batch · 命中:召回 kid 至少含一个 knowledge_id
+        请求路径:POST <span id="batchPath"></span>/retrieve/batch/stream · NDJSON 逐条流式
       </div>
     </div>
   </div>
   <div class="card">
-    <h2>响应结果</h2>
+    <h2>单条响应结果</h2>
     <div id="result"><div class="empty">尚未发送请求</div></div>
   </div>
   <div class="card">
-    <h2>批量测试结果</h2>
+    <h2>批量流式结果(每条测试项完成立即追加)</h2>
     <div id="batchResult"><div class="empty">尚未批量测试</div></div>
   </div>
 </div>
@@ -181,25 +155,13 @@ document.getElementById("batchPath").textContent = BASE;
 
 var sendBtn = document.getElementById("send");
 var statusEl = document.getElementById("status");
-
 var batchBtn = document.getElementById("batchSend");
 var batchStatusEl = document.getElementById("batchStatus");
 
-// 原mode/vmode选择器(已删除,默认integrate/both)
-// var modeSel = document.getElementById("mode");
-// var vmodeField = document.getElementById("vmodeField");
-//
-// function toggleVmodeVisibility() {
-//   // mode 固定 integrate,vector_mode 始终显示
-//   vmodeField.style.display = "";
-// }
-// toggleVmodeVisibility();
-
+// ── 单条非流式 ──
 sendBtn.addEventListener("click", function() {
   var query = document.getElementById("query").value.trim();
   var region_code = document.getElementById("region_code").value.trim() || "000";
-  var correct_kid = document.getElementById("correct_kid").value.trim();
-  // mode/vector_mode 已删除选择器,固定默认值
   var mode = "integrate";
   var vector_mode = "both";
   if (!query) { alert("query 不能为空"); return; }
@@ -209,7 +171,6 @@ sendBtn.addEventListener("click", function() {
   document.getElementById("result").innerHTML = '<div class="empty">请求中...</div>';
 
   var body = { query: query, region_code: region_code, mode: mode, vector_mode: vector_mode };
-
   var t0 = performance.now();
   fetch(BASE + "/retrieve", {
     method: "POST",
@@ -233,37 +194,27 @@ sendBtn.addEventListener("click", function() {
   .finally(function() { sendBtn.disabled = false; });
 });
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
-
+function escapeHtml(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function badge(cls, txt) { return '<span class="badge ' + cls + '">' + txt + "</span>"; }
 
 function render(data) {
   var rtnCode = data.rtnCode, rtnMsg = data.rtnMsg || "", obj = data.object || {};
   var el = document.getElementById("result");
-
   if (rtnCode === "0" && obj && obj.chunks) {
     var bc = obj.outcome === "success" ? "ok"
            : obj.outcome === "degraded" ? "warn" : "err";
     var deg = obj.degraded ? badge("warn", "已降级") : "";
-    var html = "";
-    html += '<div class="meta">';
-    html += metaCell("rtnCode", badge(bc, rtnCode));
-    html += metaCell("outcome", obj.outcome || "-");
-    html += metaCell("recalled", obj.recalled_count);
-    html += metaCell("elapsedMs", obj.elapsed_ms);
-    html += metaCell("region", obj.region_code || "-");
-    html += metaCell("traceId", obj.trace_id || "-");
-    html += metaCell("requestId", obj.request_id || "-");
-    html += metaCell("rtnMsg", escapeHtml(rtnMsg) + deg);
-    html += "</div>";
-
-    // ── kid 命中展示区 ──
+    var html = '<div class="meta">' +
+      metaCell("rtnCode", badge(bc, rtnCode)) +
+      metaCell("outcome", obj.outcome || "-") +
+      metaCell("recalled", obj.recalled_count) +
+      metaCell("elapsedMs", obj.elapsed_ms) +
+      metaCell("region", obj.region_code || "-") +
+      metaCell("traceId", obj.trace_id || "-") +
+      metaCell("requestId", obj.request_id || "-") +
+      metaCell("rtnMsg", escapeHtml(rtnMsg) + deg) +
+      "</div>";
     var correctKid = document.getElementById("correct_kid").value.trim();
-    // 原:从 chunks 提取 chunk_id 作为 kid(不准确,chunk_id 是片段ID非知识ID)
-    // var recalledKids = (obj.chunks || []).map(function(c) { return c.chunk_id; });
-    // 新:直接用后端返回的 kids 字段(ranked_kids,按得分降序)
     var recalledKids = obj.kids || [];
     var kidHit = correctKid && recalledKids.indexOf(correctKid) >= 0;
     html += '<div style="margin:8px 0;padding:12px;background:#f7f8fa;border-radius:6px;border:1px solid #e5e6eb">';
@@ -273,12 +224,11 @@ function render(data) {
     if (correctKid) {
       html += '<div><div class="k" style="color:#86909c;font-size:12px">命中状态</div><div>' + (kidHit ? badge("ok", "✓ 命中") : badge("err", "✗ 未命中")) + '</div></div>';
     } else {
-      html += '<div><div class="k" style="color:#86909c;font-size:12px">命中状态</div><div>' + badge("warn", "未填写正确 kid") + '</div></div>';
+      html += '<div><div class="k" style="color:#86909c;font-size:12px">命中状态</div><div>' + badge("warn", "未填写") + '</div></div>';
     }
     html += '<div><div class="k" style="color:#86909c;font-size:12px">召回 kid 数</div><div style="font-weight:600">' + recalledKids.length + '</div></div>';
     html += '</div>';
-    html += '<div><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">召回的 kid 列表</div>';
-    html += '<div class="tags">';
+    html += '<div><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">召回 kid 列表</div><div class="tags">';
     if (recalledKids.length) {
       recalledKids.forEach(function(kid) {
         var isHitKid = correctKid && kid === correctKid;
@@ -287,47 +237,9 @@ function render(data) {
           : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
         html += '<span class="tag" style="' + style + '">' + escapeHtml(kid) + (isHitKid ? ' ✓' : '') + '</span>';
       });
-    } else {
-      html += '<span class="hint">零召回</span>';
-    }
-    html += '</div></div>';
-    html += '</div>';
-
-    var kws = obj.keywords || [];
-    html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">keywords(' + kws.length + ")</div>";
-    html += '<div class="tags">' + (kws.length ? kws.map(function(k){ return '<span class="tag">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无</span>') + "</div></div>";
-
-    // 原 rewritten_queries 显示(查询重写,已弃用,改为关键词重写)
-    // var rewrites = obj.rewritten_queries || [];
-    // html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">rewritten_queries(' + rewrites.length + ")</div>";
-    // html += '<div class="tags">' + (rewrites.length ? rewrites.map(function(q){ return '<span class="tag" style="background:#fff0f6;color:#d91ad9">' + escapeHtml(q) + "</span>"; }).join("") : '<span class="hint">无(query_rewrite 未产出或首轮已满足)</span>') + "</div></div>";
-    var rewrittenKeywords = obj.rewritten_keywords || [];
-    html += '<div style="margin:8px 0"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:4px">rewritten_keywords(' + rewrittenKeywords.length + ")</div>";
-    html += '<div class="tags">' + (rewrittenKeywords.length ? rewrittenKeywords.map(function(k){ return '<span class="tag" style="background:#fff0f6;color:#d91ad9">' + escapeHtml(k) + "</span>"; }).join("") : '<span class="hint">无(query_rewrite 未产出或首轮已满足)</span>') + "</div></div>";
-
-    var chunks = obj.chunks || [];
-    html += '<div style="margin-top:10px"><div class="k" style="color:#86909c;font-size:12px;margin-bottom:6px">chunks(' + chunks.length + ")</div>";
-    if (!chunks.length) html += '<div class="empty">零召回</div>';
-    else chunks.forEach(function(c, i) {
-      html += '<div class="chunk" id="chunk-' + i + '">';
-      html += '<div class="chunk-head" onclick="toggleChunk(' + i + ')">';
-      html += '<span class="t">#' + (i+1) + " " + escapeHtml(c.doc_title || c.chunk_id) + "</span>";
-      html += '<span class="s">score ' + (c.score != null ? Number(c.score).toFixed(4) : "-") + " · " + escapeHtml(c.category || "-") + "</span>";
-      html += "</div>";
-      html += '<div class="chunk-body">';
-      html += '<div class="kv">chunk_id: ' + escapeHtml(c.chunk_id) + " · doc_id: " + escapeHtml(c.doc_id) + " · v" + escapeHtml(c.version || "-") + " · " + escapeHtml(c.updated_at || "-") + "</div>";
-      html += '<pre>' + escapeHtml(c.content || "") + "</pre>";
-      if (c.source_chunk_ids && c.source_chunk_ids.length)
-        html += '<div class="kv">source_chunk_ids: ' + escapeHtml(c.source_chunk_ids.join(", ")) + "</div>";
-      if (c.position && Object.keys(c.position).length)
-        html += '<div class="kv">position: ' + escapeHtml(JSON.stringify(c.position)) + "</div>";
-      if (c.extra && Object.keys(c.extra).length)
-        html += '<div class="kv">extra: ' + escapeHtml(JSON.stringify(c.extra)) + "</div>";
-      html += "</div></div>";
-    });
-    html += "</div>";
-    html += rawJson(data);
-    el.innerHTML = html;
+    } else { html += '<span class="hint">零召回</span>'; }
+    html += '</div></div></div>';
+    el.innerHTML = html + rawJson(data);
   } else {
     var eb = rtnCode && rtnCode !== "0" ? "err" : "warn";
     el.innerHTML = '<div class="meta">' +
@@ -336,162 +248,22 @@ function render(data) {
       "</div>" + rawJson(data);
   }
 }
-
 function renderRaw(txt, status) {
   document.getElementById("result").innerHTML =
     '<div class="meta">' + metaCell("HTTP", badge("err", status)) + "</div>" +
     "<details open><summary>原始响应</summary><pre>" + escapeHtml(txt) + "</pre></details>";
 }
-
 function metaCell(k, v) { return '<div><div class="k">' + k + '</div><div class="v">' + v + "</div></div>"; }
-
 function rawJson(data) {
   return "<details><summary>原始 JSON</summary><pre>" + escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
 }
 
-function toggleChunk(i) {
-  var el = document.getElementById("chunk-" + i);
-  if (el) el.classList.toggle("open");
-}
-
-// ── 批量测试(非流式) ── 回退到 2026-09-17 11:31:29 版本 ────────────────────
-// 2026-09-17 14:39:26 曾改为流式 /retrieve/batch/stream,回退到非流式 /retrieve/batch:
-// 等所有请求完成后一次性返回 JSON,前端解析后渲染表格。
-batchBtn.addEventListener("click", function() {
-  var count = parseInt(document.getElementById("batchCount").value, 10) || 0;
-
-  var el = document.getElementById("batchResult");
-  el.innerHTML = '<div class="empty">批量请求中...</div>';
-  batchBtn.disabled = true;
-  batchStatusEl.textContent = "批量请求中...";
-
-  fetch(BASE + "/retrieve/batch", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ count: count })
-  }).then(function(resp) {
-    return resp.json().then(function(data) {
-      if (!resp.ok || (data.rtnCode && data.rtnCode !== "0")) {
-        batchStatusEl.textContent = "HTTP " + resp.status + " · " + (data.rtnMsg || "失败");
-        el.innerHTML = '<div class="meta">' +
-          metaCell("HTTP", badge("err", resp.status)) +
-          metaCell("rtnMsg", data.rtnMsg || "-") +
-          "</div>" +
-          "<details open><summary>原始响应</summary><pre>" +
-          escapeHtml(JSON.stringify(data, null, 2)) + "</pre></details>";
-        batchBtn.disabled = false;
-        return;
-      }
-
-      var obj = data.object || {};
-      var results = obj.results || [];
-      var total = obj.total != null ? obj.total : results.length;
-      var hitCount = obj.hit_count != null ? obj.hit_count : results.filter(function(r){ return r.hit; }).length;
-      var totalElapsedMs = obj.total_elapsed_ms || 0;
-      var rate = total > 0 ? (hitCount / total * 100).toFixed(1) : "0.0";
-
-      var html =
-        '<div class="batch-summary">' +
-          '<div class="stat">总数 <span class="v">' + total + '</span></div>' +
-          '<div class="stat">命中 <span class="v" style="color:#00b42a">' + hitCount + '</span></div>' +
-          '<div class="stat">未命中 <span class="v" style="color:#f53f3f">' + (total - hitCount) + '</span></div>' +
-          '<div class="stat">命中率 <span class="v">' + rate + '%</span></div>' +
-          '<div class="stat">总耗时 <span class="v">' + totalElapsedMs + 'ms</span></div>' +
-        '</div>' +
-        '<table class="batch-table"><thead><tr>' +
-          '<th class="idx">#</th>' +
-          '<th class="q">用户问</th>' +
-          '<th>区域</th>' +
-          '<th class="kids">期望 kid</th>' +
-          '<th class="kids">召回 kid</th>' +
-          '<th class="status">命中</th>' +
-          '<th>状态</th>' +
-          '<th>耗时</th>' +
-        '</tr></thead><tbody>';
-
-      results.forEach(function(r) {
-        var rowCls = r.hit ? "hit" : "miss";
-        html += '<tr class="' + rowCls + '">';
-        html += '<td class="idx">' + r.index + '</td>';
-        html += '<td class="q">' + escapeHtml(r.user_query || "") + '</td>';
-        html += '<td>' + escapeHtml(r.region_code || "-") + '</td>';
-        // 期望 kid(命中的高亮)
-        var expectedKids = r.expected_kids || [];
-        var hitKidsSet = {};
-        (r.hit_kids || []).forEach(function(k) { hitKidsSet[k] = true; });
-        html += '<td class="kids">';
-        if (expectedKids.length) {
-          html += '<div class="tags">';
-          expectedKids.forEach(function(k) {
-            var isHit = !!hitKidsSet[k];
-            var style = isHit
-              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
-              : 'background:#e5e6eb;color:#4e5969;padding:1px 6px';
-            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isHit ? ' ✓' : '') + '</span>';
-          });
-          html += '</div>';
-        } else {
-          html += '<span class="hint">未标注</span>';
-        }
-        html += '</td>';
-        // 召回 kid(命中 expected 的高亮)
-        var recalledKids = r.recalled_kids || [];
-        var expectedSet = {};
-        expectedKids.forEach(function(k) { expectedSet[k] = true; });
-        html += '<td class="kids">';
-        if (recalledKids.length) {
-          html += '<div class="tags">';
-          recalledKids.forEach(function(k) {
-            var isExpected = !!expectedSet[k];
-            var style = isExpected
-              ? 'background:#e8ffea;color:#00b42a;font-weight:600;border:1px solid #00b42a;padding:2px 6px'
-              : 'background:#e8f3ff;color:#165dff;padding:1px 6px';
-            html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isExpected ? ' ✓' : '') + '</span>';
-          });
-          html += '</div>';
-        } else {
-          html += '<span class="hint">零召回</span>';
-        }
-        html += '</td>';
-        // 命中状态
-        if (r.outcome === "error" || r.outcome === "timeout") {
-          html += '<td class="status">' + badge("err", "异常") + '</td>';
-        } else if (!expectedKids.length) {
-          html += '<td class="status">' + badge("warn", "未标注") + '</td>';
-        } else if (r.hit) {
-          html += '<td class="status">' + badge("ok", "✓ 命中") + '</td>';
-        } else {
-          html += '<td class="status">' + badge("err", "✗ 未命中") + '</td>';
-        }
-        // 单条 outcome
-        html += '<td>' + escapeHtml(r.outcome || "-") +
-          (r.recalled_count != null ? ' / ' + r.recalled_count + '片' : '') + '</td>';
-        // 单条耗时
-        html += '<td>' + (r.elapsed_ms || 0) + 'ms</td>';
-        html += '</tr>';
-      });
-
-      html += '</tbody></table>';
-      el.innerHTML = html;
-      batchStatusEl.textContent = "完成 " + total + " 条 · 命中 " + hitCount + " · " + rate + "% · " + totalElapsedMs + "ms";
-      batchBtn.disabled = false;
-    });
-  }).catch(function(err) {
-    batchStatusEl.textContent = "请求失败";
-    document.getElementById("batchResult").innerHTML =
-      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
-    batchBtn.disabled = false;
-  });
-});
-
-/*
-// ── 以下为 2026-09-17 14:39:26 流式 NDJSON 版本(回退到 11:31:29 后注释保留) ──
+// ── 批量测试(流式 NDJSON) ──
 batchBtn.addEventListener("click", function() {
   var countVal = document.getElementById("batchCount").value.trim();
   var count = countVal === "" ? 0 : parseInt(countVal, 10);
-  if (isNaN(count) || count < 0) { alert("测试条数需为非负整数,留空表示全部"); return; }
+  if (isNaN(count) || count < 0) { alert("测试条数需为非负整数"); return; }
 
-  // 初始化空表格 UI:summary 区 + 空表体,后续逐条 append
   var el = document.getElementById("batchResult");
   el.innerHTML =
     '<div class="batch-summary">' +
@@ -517,7 +289,7 @@ batchBtn.addEventListener("click", function() {
   var total = 0, done = 0, hitCount = 0;
   var t0 = performance.now();
   batchBtn.disabled = true;
-  batchStatusEl.textContent = "批量请求中...";
+  batchStatusEl.textContent = "流式请求中...";
 
   fetch(BASE + "/retrieve/batch/stream", {
     method: "POST",
@@ -525,12 +297,9 @@ batchBtn.addEventListener("click", function() {
     body: JSON.stringify({ count: count })
   }).then(function(resp) {
     if (!resp.ok) {
-      // 错误响应是非流式 JSON,直接读文本
       return resp.text().then(function(txt) {
-        var dt = Math.round(performance.now() - t0);
-        batchStatusEl.textContent = "HTTP " + resp.status + " · 网关 " + dt + "ms";
-        el.innerHTML = '<div class="meta">' +
-          metaCell("HTTP", badge("err", resp.status)) + '</div>' +
+        batchStatusEl.textContent = "HTTP " + resp.status;
+        el.innerHTML = '<div class="meta">' + metaCell("HTTP", badge("err", resp.status)) + '</div>' +
           "<details open><summary>原始响应</summary><pre>" + escapeHtml(txt) + "</pre></details>";
         throw new Error("HTTP " + resp.status);
       });
@@ -552,33 +321,26 @@ batchBtn.addEventListener("click", function() {
       if (msg.type === "start") {
         total = msg.total || 0;
         document.getElementById("bsTotal").textContent = total;
-        batchStatusEl.textContent = "批量请求中... 0/" + total;
+        batchStatusEl.textContent = "流式请求中... 0/" + total;
       } else if (msg.type === "item") {
         done++;
         var r = msg.data || {};
         if (r.hit) hitCount++;
         appendBatchRow(r);
         updateSummary();
-        batchStatusEl.textContent = "批量请求中... " + done + "/" + total +
-          " · 命中 " + hitCount;
+        batchStatusEl.textContent = done + "/" + total + " · 命中 " + hitCount;
       } else if (msg.type === "summary") {
         var s = msg.data || {};
-        if (s.total_elapsed_ms != null) {
+        if (s.total_elapsed_ms != null)
           document.getElementById("bsMs").textContent = s.total_elapsed_ms + "ms";
-        }
-        if (s.hit_count != null) {
-          hitCount = s.hit_count;
-          updateSummary();
-        }
-        var dt = Math.round(performance.now() - t0);
+        if (s.hit_count != null) { hitCount = s.hit_count; updateSummary(); }
         batchStatusEl.textContent = "完成 " + done + " 条 · 命中 " + hitCount +
-          " · 网关 " + dt + "ms";
+          " · 网关 " + Math.round(performance.now() - t0) + "ms";
       }
     }
 
     function processBuffer() {
       var lines = buffer.split("\n");
-      // 最后一段可能不完整,留到下次拼接
       buffer = lines.pop();
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim();
@@ -594,7 +356,6 @@ batchBtn.addEventListener("click", function() {
       html += '<td class="idx">' + r.index + '</td>';
       html += '<td class="q">' + escapeHtml(r.user_query || "") + '</td>';
       html += '<td>' + escapeHtml(r.region_code || "-") + '</td>';
-      // 期望 kid(命中的高亮)
       var expectedKids = r.expected_kids || [];
       var hitKidsSet = {};
       (r.hit_kids || []).forEach(function(k) { hitKidsSet[k] = true; });
@@ -609,11 +370,8 @@ batchBtn.addEventListener("click", function() {
           html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isHit ? ' ✓' : '') + '</span>';
         });
         html += '</div>';
-      } else {
-        html += '<span class="hint">未标注</span>';
-      }
+      } else { html += '<span class="hint">未标注</span>'; }
       html += '</td>';
-      // 召回 kid(命中 expected 的高亮)
       var recalledKids = r.recalled_kids || [];
       var expectedSet = {};
       expectedKids.forEach(function(k) { expectedSet[k] = true; });
@@ -628,11 +386,8 @@ batchBtn.addEventListener("click", function() {
           html += '<span class="tag" style="' + style + '">' + escapeHtml(k) + (isExpected ? ' ✓' : '') + '</span>';
         });
         html += '</div>';
-      } else {
-        html += '<span class="hint">零召回</span>';
-      }
+      } else { html += '<span class="hint">零召回</span>'; }
       html += '</td>';
-      // 命中状态
       if (r.outcome === "error" || r.outcome === "timeout") {
         html += '<td class="status">' + badge("err", "异常") + '</td>';
       } else if (!expectedKids.length) {
@@ -642,10 +397,8 @@ batchBtn.addEventListener("click", function() {
       } else {
         html += '<td class="status">' + badge("err", "✗ 未命中") + '</td>';
       }
-      // 单条 outcome
       html += '<td>' + escapeHtml(r.outcome || "-") +
         (r.recalled_count != null ? ' / ' + r.recalled_count + '片' : '') + '</td>';
-      // 单条耗时
       html += '<td>' + (r.elapsed_ms || 0) + 'ms</td>';
       html += '</tr>';
       tbody.insertAdjacentHTML("beforeend", html);
@@ -654,14 +407,9 @@ batchBtn.addEventListener("click", function() {
     function read() {
       reader.read().then(function(result) {
         if (result.done) {
-          // 处理残余 buffer
-          if (buffer.trim()) {
-            try { handleMsg(JSON.parse(buffer.trim())); } catch(e) {}
-          }
+          if (buffer.trim()) { try { handleMsg(JSON.parse(buffer.trim())); } catch(e) {} }
           batchBtn.disabled = false;
-          if (done < total) {
-            batchStatusEl.textContent += " · 异常中断(" + done + "/" + total + ")";
-          }
+          if (done < total) batchStatusEl.textContent += " · 异常中断";
           return;
         }
         buffer += decoder.decode(result.value, { stream: true });
@@ -674,18 +422,11 @@ batchBtn.addEventListener("click", function() {
     }
     read();
   }).catch(function(err) {
-    if (String(err).indexOf("HTTP ") === 0) {
-      // 错误响应已在上面处理,这里不重复
-      batchBtn.disabled = false;
-      return;
-    }
+    if (String(err).indexOf("HTTP ") === 0) { batchBtn.disabled = false; return; }
     batchStatusEl.textContent = "请求失败";
-    document.getElementById("batchResult").innerHTML =
-      '<div class="empty">网络/服务异常: ' + escapeHtml(String(err)) + "</div>";
     batchBtn.disabled = false;
   });
 });
-*/
 </script>
 </body>
 </html>

@@ -246,15 +246,7 @@ def intergrate_all(query: str = "", region_code: str = "000",
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
     ws.data["keywords"] = list((kresult.get("keywords") if isinstance(kresult, dict) else []) or [])
-    ws.data["merged_results"] = kresult.get("merged", []) if isinstance(kresult, dict) else []
-    ws.data["keyword_chunks"] = kchunks
-    ws.data["keyword_kid"] = keyword_kid
-    ws.data["vector_results"] = vresult
-    ws.data["vector_chunks"] = vchunks
-    ws.data["vector_kid"] = vector_kid
-    ws.data["kid_scores"] = kid_scores
     ws.data["ranked_kids"] = sorted_kids
-    ws.data["example"] = kresult.get("example", {}) if isinstance(kresult, dict) else {}
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
