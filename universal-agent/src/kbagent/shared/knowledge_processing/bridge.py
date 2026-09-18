@@ -64,11 +64,15 @@ def _chunk_to_candidate(index: int, chunk: Chunk) -> Dict[str, Any]:
             if not isinstance(atom, dict) or atom.get("error"):
                 continue
             atoms.append(_merged_atom_to_dict(chunk.doc_id, len(atoms), atom))
+    # 候选正文:结构化 ngkm 条目走 extra["atoms"](已映射进 atoms);
+    # 离线 MockES / 关键词回退等非结构化 chunk 只有 chunk.content —— 必须
+    # 落到候选 content,否则 has_renderable_candidate_content 判空,filter
+    # 会以 empty_content 把全部候选丢弃,导致 Top3 恒空、验证 loop 永远走不通。
     return {
         "chunk_id": chunk.chunk_id,
         "knowledge_id": chunk.doc_id,
         "knowledge_name": chunk.doc_title,
-        "content": "",
+        "content": _text(chunk.content) or "",
         "retrieval_rank": index + 1,
         "source_index": index,
         "retrieval_score": chunk.score,

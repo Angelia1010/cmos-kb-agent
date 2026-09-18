@@ -6,13 +6,27 @@
     Linux:    PYTHONPATH=src:services python -m uvicorn retrieval_service.app:app --host 0.0.0.0 --port 8000
 
 服务定位:
-    只调用固定检索流水线(intergrate_all,全程零 LLM),不拼接对话历史、
-    不做答案生成;需要完整问答(检索 + 加工 + 生成)时走 kbagent_service。
+    检索→处理→验证 Agent Loop(不拼接对话历史、不做答案生成):
+      RetrievalSubAgent 经 uniagent create_agent() 组装 —
+        ① ReAct 自主调用检索工具(intergrate_all / coarse_recall 等)
+        ② 每轮迭代结束自动跑 ProcessingVerifier:
+           ProcessingSubAgent(analyze→filter→markdown→rerank→Top3)
+           + Top3AnswerabilityVerifier(LLM 判 Top3 是否足以回答原始问题)
+        ③ passed → 结束;failed → GoalLoop 注入检索反馈 → 换策略重召
+           (Budget: max_retrieval_rounds 轮 / retrieval_total 毫秒)
+    响应 object 携带验证器结论(verified / verification_status /
+    verification_reason_codes / loop_iterations)。
+    需要完整问答(检索 + 加工 + 答案生成)时走 kbagent_service。
+
+模型选择:
+    - 缺省按 config.yaml 的 models[].use 构建真实大模型(与 kbagent_service 一致);
+    - 配置缺失/解析失败 → 回退离线 ScriptedChatModel(链路照常跑通,仅演示质量);
+    - 也可 create_app(model=...) 显式注入覆盖。
 
 并发模型:
-    - es 全局共享(ES client 需线程安全);
+    - es / model 全局共享(ES client 与模型内部 httpx client 均线程安全);
     - 每请求新建 RunWorkspace / RetrievalSubAgent / Tracer,请求间零共享;
-    - 检索链路为纯同步 IO(HTTP 调 ngkm),经 asyncio.wait_for 包端到端超时。
+    - Agent Loop 含多次 LLM 调用,经 asyncio.wait_for 包端到端超时(默认 300s)。
 
 后端选择:
     - 缺省 produce → ProduceESClient(生产 ngkm 一体化流水线);
@@ -47,6 +61,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from kbagent import ScriptedChatModel
 from kbagent.shared.search import ESClient, MockESClient, ProduceESClient
 
 from .models import (
@@ -84,9 +99,10 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-# 端到端超时(秒):纯检索链路(无 LLM 多轮),60s 覆盖内网 ngkm 慢查询;
-# 超时返回 50002
-DEFAULT_TIMEOUT_S = 60.0
+# 端到端超时(秒):Agent Loop 最多 max_retrieval_rounds 轮,
+# 每轮含 ReAct 检索 + Processing + Top3 验证多次 LLM 调用,
+# 内网网关单次可达分钟级,与 kbagent_service 对齐给足 300s;超时返回 50002
+DEFAULT_TIMEOUT_S = 300.0
 # ngkm 单次 HTTP 超时(秒),下传 ProduceESClient
 DEFAULT_NGKM_TIMEOUT_S = 30
 # 检索后端选择:缺省 produce=生产 ngkm 一体化流水线(ProduceESClient);
@@ -146,6 +162,31 @@ def _default_es() -> ESClient:
     return ProduceESClient(region_code=region, timeout=ngkm_timeout)
 
 
+def _default_model() -> Any:
+    """优先按 config.yaml 的 models[].use 构建真实大模型;失败回退离线模型。
+
+    与 kbagent_service._default_model 同语义:Agent Loop(ReAct 检索 +
+    Top3AnswerabilityVerifier)必须有模型才能跑;离线/配置缺失时回退
+    ScriptedChatModel 保证链路可用(仅演示质量)。
+    """
+    try:
+        from uniagent.config.app_config import get_app_config
+        from uniagent.imports.resolvers import resolve_class
+        cfg = get_app_config()
+        if cfg.models:
+            mc = next((m for m in cfg.models if m.name == "default"),
+                      cfg.models[0])
+            model_cls = resolve_class(mc.use)
+            model = model_cls(model=mc.model, temperature=mc.temperature,
+                              **mc.kwargs)
+            logger.info("真实大模型就绪 use=%s model=%s", mc.use, mc.model)
+            return model
+        logger.warning("config.yaml 未配置 models,使用离线 ScriptedChatModel")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载模型配置失败(%r),使用离线 ScriptedChatModel", exc)
+    return ScriptedChatModel()
+
+
 def create_app(es: Any = None,
                timeout_s: float = DEFAULT_TIMEOUT_S,
                base_path: Optional[str] = None,
@@ -153,8 +194,8 @@ def create_app(es: Any = None,
     """创建服务应用。
 
     es 可显式注入(测试或生产接真实依赖),缺省按环境变量构建;
-    model 可选 LLM 模型;注入时启用检索→处理→验证 Agent Loop,
-    未注入时回退零 LLM 直调(DirectRetrievalSubAgent);
+    model 可显式注入(单测注入 mock),缺省按 config.yaml 构建真实大模型
+    (失败回退 ScriptedChatModel)——服务始终走检索→处理→验证 Agent Loop;
     base_path 为业务路由前缀,缺省取环境变量 RETRIEVAL_SERVICE_BASE_PATH,
     再缺省为 DEFAULT_BASE_PATH(/api/retrieval-service/prod)。
     """
@@ -163,11 +204,11 @@ def create_app(es: Any = None,
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.es = es or _default_es()
-        app.state.model = model
+        app.state.model = model or _default_model()
         app.state.timeout_s = timeout_s
-        logger.info("retrieval 服务就绪 base=%s es=%s model=%s",
+        logger.info("retrieval 服务就绪 base=%s es=%s model=%s timeout=%ss",
                     base, type(app.state.es).__name__,
-                    type(model).__name__ if model is not None else "none")
+                    type(app.state.model).__name__, timeout_s)
         yield
 
     app = FastAPI(title="retrieval-service", version="1.0.0", lifespan=lifespan)
@@ -191,7 +232,20 @@ def _register_routes(app: FastAPI, base: str) -> None:
     @app.get("/health")
     async def health(request: Request) -> dict:
         return {"status": "ok",
-                "backend": type(request.app.state.es).__name__}
+                "backend": type(request.app.state.es).__name__,
+                "model": type(request.app.state.model).__name__}
+
+    # 排障端点:确认容器内实际生效的模型/后端/超时与代码加载路径
+    # (kbagent_path 可快速识破"镜像内新旧代码混装"类问题)
+    @app.get("/diag")
+    async def diag(request: Request) -> dict:
+        import kbagent
+        return {
+            "model_class": type(request.app.state.model).__name__,
+            "es_class": type(request.app.state.es).__name__,
+            "timeout_s": request.app.state.timeout_s,
+            "kbagent_path": getattr(kbagent, "__file__", "?"),
+        }
 
     @app.post(f"{base}/retrieve", response_model=RetrievalResponse)
     async def retrieve(payload: RetrievalRequest, request: Request):

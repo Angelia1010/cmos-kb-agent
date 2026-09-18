@@ -6,7 +6,8 @@
 
 响应:灵犀返回信封
   rtnCode / rtnMsg / object
-  object 内容面向纯检索场景(召回明细 + 降级标记),不含答案生成字段。
+  object 内容面向检索场景(召回明细 + 降级标记 + Agent Loop 验证结论),
+  不含答案生成字段。
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ class RetrievalChunk(BaseModel):
 
 
 class RetrievalResponseObject(BaseModel):
-    """object 层 — 纯检索业务载荷。"""
+    """object 层 — 检索业务载荷(召回明细 + Agent Loop 验证结论)。"""
     request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
     trace_id: str = Field(description="检索智能体内部trace ID")
     outcome: Literal["success", "no_results", "degraded"] = Field(
@@ -60,6 +61,16 @@ class RetrievalResponseObject(BaseModel):
     region_code: str = Field(description="本次检索使用的区域编码")
     keywords: list[str] = Field(default_factory=list, description="检索关键词(槽位提取结果)")
     chunks: list[RetrievalChunk] = Field(description="召回片段列表")
+    # ── Agent Loop 验证结论(检索→处理→Top3 充分性验证) ──
+    verified: bool = Field(default=False, description="Top3 充分性验证是否通过")
+    verification_status: Literal["passed", "failed", "unknown", "not_run"] = Field(
+        default="not_run",
+        description="验证器结论:passed 通过;failed 未通过(已按反馈重试到轮次上限);"
+                    "unknown 验证器技术异常;not_run 未走 Agent Loop(零 LLM 直调)")
+    verification_reason_codes: list[str] = Field(
+        default_factory=list,
+        description="未通过原因码(off_topic/partial_intent_coverage/missing_key_fact/conflicting_evidence)")
+    loop_iterations: int = Field(default=0, description="GoalLoop 实际迭代轮数")
 
 
 class RetrievalResponse(BaseModel):
