@@ -172,11 +172,11 @@ const rtEvents = [
   ev('run', 'start', { query: 'q', region_code: '350' }),
   ev('cache', 'miss', {}),
   ev('retrieval.round1', 'recall', { channel: 'intergrate_all', region_code: '350', keywords: ['异地', '补卡', '手机卡'], keyword_count: 8, vector_count: 6, merged_count: 12, titles: ['补卡手册'], scores: [9.9] }),
-  ev('retrieval.verify', 'done', { status: 'failed', reason_codes: ['insufficient_evidence'], evidence_count: 0, summary: '候选不足以回答' }),
-  ev('retrieval.verify', 'feedback', { suggested_query: '异地补卡需要什么材料', suggested_keywords: ['异地补卡', '材料'], missing_aspects: ['办理材料'], retry_strategy: '改写关键词' }),
+  ev('retrieval.verify', 'done', { round: 1, status: 'failed', reason_codes: ['insufficient_evidence'], evidence_count: 0, summary: '候选不足以回答', top_titles: ['补卡手册'] }),
+  ev('retrieval.verify', 'feedback', { round: 1, suggested_query: '异地补卡需要什么材料', suggested_keywords: ['异地补卡', '材料'], missing_aspects: ['办理材料'], retry_strategy: '改写关键词' }),
   ev('retrieval.round1', 'query_rewrite', { last_keywords: ['异地', '补卡'], rewritten_keywords: ['异地补卡', '材料'] }),
   ev('retrieval.round2', 'recall', { channel: 'intergrate_all', region_code: '350', keywords: ['异地补卡', '材料'], keyword_count: 5, vector_count: 5, merged_count: 9, titles: ['补卡材料清单'], scores: [11.2] }),
-  ev('retrieval.verify', 'done', { status: 'passed', reason_codes: [], evidence_count: 2, summary: 'Top3 可回答' }),
+  ev('retrieval.verify', 'done', { round: 2, status: 'passed', reason_codes: [], evidence_count: 2, summary: 'Top3 可回答', top_titles: ['补卡材料清单', '补卡手册'] }),
   ev('retrieval', 'loop_result', { success: true, iterations: 2, reason: 'verified' }),
   ev('retrieval', 'done', { count: 9 })
 ];
@@ -184,14 +184,19 @@ api.renderPipeline(rtEvents, null, { live: true });
 st = segs();
 expect(st[2].seg.includes('异地 / 补卡 / 手机卡'), 'N2 第1轮提取关键词 chip');
 expect(st[2].seg.includes('关键词 <b>8</b> 条 · 向量 <b>6</b> 条 → 去重 <b>12</b> 条'), 'N2 双路召回条数 chip');
-expect(st[2].seg.includes('⚠ 验证器未通过'), 'N2 验证器未通过 chip');
+expect(st[2].seg.includes('第 1 轮验证:⚠ 未通过'), 'N2 第1轮验证器未通过 chip');
 expect(st[2].seg.includes('insufficient_evidence'), 'N2 验证器原因码');
 expect(st[2].seg.includes('查询改写') && st[2].seg.includes('异地补卡 / 材料'), 'N2 查询改写 chip');
-expect(st[2].seg.includes('✓ 验证器通过') && st[2].seg.includes('证据 <b>2</b> 篇'), 'N2 第2轮验证器通过 chip');
+expect(st[2].seg.includes('第 2 轮验证:✓ 通过') && st[2].seg.includes('证据 <b>2</b> 篇'), 'N2 第2轮验证器通过 chip');
 expect(st[2].seg.includes('共 <b>2</b> 轮'), 'N2 GoalLoop 汇总 chip');
 expect(st[2].seg.includes('建议检索语句') && st[2].seg.includes('异地补卡需要什么材料'), 'N2 明细含验证器建议');
 expect(st[2].seg.includes('缺失方面') && st[2].seg.includes('办理材料'), 'N2 明细含缺失方面');
 expect(st[2].seg.includes('候选不足以回答') && st[2].seg.includes('Top3 可回答'), 'N2 明细含验证器 summary');
+expect(st[2].seg.includes('被验证的 Top3') && st[2].seg.includes('《补卡材料清单》'), 'N2 明细含被验证 Top3 标题');
+// 时间序:第1轮召回 → 第1轮验证 → 改写 → 第2轮召回 → 第2轮验证
+const segOrder = ['第 <b>1</b> 轮召回', '第 1 轮验证:⚠ 未通过', '第 1 轮后查询改写', '第 <b>2</b> 轮召回', '第 2 轮验证:✓ 通过']
+  .map(s => st[2].seg.indexOf(s));
+expect(segOrder.every((x, i) => x >= 0 && (i === 0 || x > segOrder[i - 1])), 'N2 chips 按召回→验证→改写时间序排列');
 
 // ── O. doQuery 流式全流程:主区占位切换 + 右侧栏链路点亮 + final 渲染 ──
 // 用假 fetch 返回一段 SSE 流,验证 welcome→searching→results 的显隐编排
@@ -211,6 +216,7 @@ const doQueryTest = (function testDoQueryStream() {
     { ts_ms: 2, stage: 'cache', event: 'miss', payload: {} },
     { ts_ms: 3, stage: 'retrieval.round1', event: 'recall', payload: { channel: 'intergrate_all', titles: ['补卡手册'], scores: [9.9] } },
     { ts_ms: 4, stage: 'retrieval', event: 'done', payload: { count: 1 } },
+    { ts_ms: 4.5, stage: 'processing.knowledge', event: 'rerank', payload: { input_count: 3, top_count: 1, degraded: false, top_titles: ['补卡手册'] } },
     { ts_ms: 5, stage: 'processing.knowledge', event: 'processed_chunks_adapted', payload: { count: 1 } },
     { ts_ms: 6, stage: 'answer', event: 'materials', payload: { chunk_ids: ['kb_1#p1'] } },
     { ts_ms: 7, stage: 'answer', event: 'consistency_check', payload: { consistent: true, issue_count: 0, issues: [] } },
@@ -249,6 +255,8 @@ const doQueryTest = (function testDoQueryStream() {
     expect(els['submitBtn'].disabled === false, 'O 完成后按钮恢复');
     expect(!flow().includes('进行中'), 'O final 后链路图无进行中残留');
     expect(flow().includes('✓ 检索完成'), 'O final 后链路图完整态');
+    expect(flow().includes('Top3:《补卡手册》'), 'O ④阶段 Top3 标题 chip');
+    expect(flow().includes('重排后 Top3 文档标题'), 'O ④阶段 Top3 标题明细');
     expect(els['statDocs'].textContent === 1, 'O 结果概览已渲染(1 篇文档)');
     expect(els['statTopRel'].textContent === '100%', 'O 最高相关度 100%');
   }).finally(() => { global.fetch = realFetch; });

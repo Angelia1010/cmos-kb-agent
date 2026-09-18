@@ -308,7 +308,8 @@ async def _rerank_knowledge_candidates(
     meta.warning_count = len(ws.data.get("processing_warnings", []))
     meta.stage_order = ["analyze", "filter", "build_markdown", "rerank"]
     ws.data["processing_meta"] = meta
-    _trace("rerank", input_count=len(processed), top_count=len(result.candidates), degraded=result.degraded)
+    _trace("rerank", input_count=len(processed), top_count=len(result.candidates), degraded=result.degraded,
+           top_titles=[getattr(c, "name", "") or "" for c in result.candidates])
     return _obs(top=len(result.candidates), degraded=result.degraded, warnings=len(result.warnings))
 
 

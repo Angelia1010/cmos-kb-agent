@@ -1048,7 +1048,7 @@ var PIPE_STAGES = [
   { key: "cache", no: "2", color: "#8b5cf6", name: "缓存快速通道",
     desc: "查高频问题缓存:命中则直接返回已校验的缓存答案,不再走检索与生成" },
   { key: "retrieval", no: "3", color: "#2563eb", name: "检索子智能体 · 混合召回 + 目标循环",
-    desc: "生产一体化流水线:槽位提取 → 知识主索引召回 → 原子表拼接;关键词 + 向量双路召回 → 融合排序去重;每轮召回后跑 Top3 可回答性验证,未通过则自主改写关键词重召(GoalLoop 护栏,轮次耗尽携最优退出)" },
+    desc: "生产一体化流水线:大模型关键词提取 → 知识主索引召回 → 原子表拼接;关键词 + 向量双路召回 → 融合排序去重;每轮召回后跑 Top3 可回答性验证,未通过则自主改写关键词重召(GoalLoop 护栏,轮次耗尽携最优退出)" },
   { key: "processing", no: "4", color: "#d97706", name: "知识处理子智能体 · 固定流水线",
     desc: "规范化 → 适用性过滤 → 结构化清洗(Markdown)→ 两阶段重排,从全部候选中精选 Top3 知识" },
   { key: "answer", no: "5", color: "#059669", name: "答案子智能体 · 生成与锚定校验",
@@ -1064,7 +1064,8 @@ function buildPipelineModel(events) {
     cache: "",                       // "hit" | "miss" | ""(未记录)
     rounds: [],                      // 每轮召回:{round, channel, region, keywords, counts, titles, scores, dsl}
     rewrites: [],                    // 每轮查询改写:{round, last_keywords, rewritten_keywords}
-    verifies: [],                    // Top3 可回答性验证事件:{event, payload}
+    verifies: [],                    // Top3 可回答性验证事件:{event, round, payload}
+    retrievalSeq: [],                // 检索子事件时间序:{type, round, data}(召回→验证→改写→再召回)
     loop: null,                      // GoalLoop 汇总 {success, iterations, reason}
     exitBest: null,                  // 轮次耗尽携最优退出 {reason, count}
     retrievalFallback: "",           // 一体化流水线失败原因(触发关键词兜底)
@@ -1078,6 +1079,7 @@ function buildPipelineModel(events) {
     finalizeMs: null,
     degrade: null                    // {error, reason, hit_count}
   };
+  var lastRound = null;   // 验证事件未带 round 时,归属到最近一次召回轮
   (events || []).forEach(function (e) {
     var st = e.stage || "", ev = e.event || "", p = e.payload || {};
     var rm = st.match(/^retrieval\.round(\d+)$/);
@@ -1086,7 +1088,8 @@ function buildPipelineModel(events) {
     } else if (st === "cache") {
       m.cache = ev;
     } else if (rm && ev === "recall") {
-      m.rounds.push({
+      lastRound = rm[1];
+      var rd = {
         round: rm[1],
         channel: p.channel || (p.dsl ? "hybrid" : "intergrate_all"),
         region: p.region_code || "",
@@ -1094,15 +1097,22 @@ function buildPipelineModel(events) {
         keyword_count: p.keyword_count, vector_count: p.vector_count,
         merged_count: p.merged_count,
         titles: p.titles || [], scores: p.scores || [], dsl: p.dsl || null
-      });
+      };
+      m.rounds.push(rd);
+      m.retrievalSeq.push({ type: "recall", round: rm[1], data: rd });
     } else if (rm && ev === "query_rewrite") {
-      m.rewrites.push({
+      var rw = {
         round: rm[1],
         last_keywords: p.last_keywords || [],
         rewritten_keywords: p.rewritten_keywords || []
-      });
+      };
+      m.rewrites.push(rw);
+      m.retrievalSeq.push({ type: "rewrite", round: rm[1], data: rw });
     } else if (st === "retrieval.verify") {
-      m.verifies.push({ event: ev, payload: p });
+      var vr = (p.round != null ? String(p.round) : lastRound) || "?";
+      var vf = { event: ev, round: vr, payload: p };
+      m.verifies.push(vf);
+      m.retrievalSeq.push({ type: "verify", round: vr, data: vf });
     } else if (st === "retrieval" && ev === "loop_result") {
       m.loop = p;
     } else if (st === "retrieval" && ev === "exit_with_best") {
@@ -1236,89 +1246,95 @@ function renderPipeline(events, obj, opts) {
   else if (m.cache === "miss") cacheChips.push(chip("", "未命中 → 进入完整检索链路"));
   content.cache = { hasData: !!m.cache, chips: cacheChips, detail: "" };
 
-  // ── ③ 检索子智能体 ──
+  // ── ③ 检索子智能体(按时间序渲染:召回 → 验证 → 改写 → 再召回…) ──
   var rChips = [], rDetail = "";
-  m.rounds.forEach(function (r) {
-    var cnt = r.merged_count != null ? r.merged_count : r.titles.length;
-    rChips.push(chip("info", "第 <b>" + esc(r.round) + "</b> 轮召回:" +
-      (r.channel === "intergrate_all"
-        ? "一体化流水线 intergrate_all"
-        : r.channel === "vector_recall" ? "向量召回"
-        : r.channel === "keyword_recall" ? "关键词召回"
-        : "混合召回(BM25 关键词 + 向量 + RRF 融合)")));
-    var cntTxt = (r.keyword_count != null || r.vector_count != null)
-      ? "关键词 <b>" + esc(r.keyword_count || 0) + "</b> 条 · 向量 <b>" +
-        esc(r.vector_count || 0) + "</b> 条 → 去重 <b>" + cnt + "</b> 条"
-      : "召回候选 <b>" + cnt + "</b> 条";
-    rChips.push(chip("", cntTxt + (r.region ? " · 区域 " + esc(r.region) : "")));
-    if (r.keywords && r.keywords.length)
-      rChips.push(chip("info", "第 " + esc(r.round) + " 轮提取关键词:" +
-        esc(r.keywords.join(" / "))));
-    rDetail += '<div class="sub-title">第 ' + esc(r.round) + " 轮 · 召回 " +
-      cnt + ' 条(标题 / 得分):</div>';
-    if (r.keywords && r.keywords.length)
-      rDetail += '<div class="row-line">提取关键词:' +
-        esc(r.keywords.join(" / ")) + "</div>";
-    rDetail += r.titles.slice(0, 10).map(function (t, i) {
-      return '<div class="row-line">' + (i + 1) + ". 《" + esc(t) + "》" +
-        (r.scores[i] != null ? " · 得分 " + esc(fmtScore(r.scores[i])) : "") + "</div>";
-    }).join("");
-    if (r.titles.length > 10)
-      rDetail += '<div class="row-line">… 其余 ' + (r.titles.length - 10) + " 条见原始事件</div>";
-    if (r.dsl)
-      rDetail += '<div class="sub-title">召回 DSL(第 ' + esc(r.round) + ' 轮):</div>' +
-        '<div class="row-line">' + esc(JSON.stringify(r.dsl)).slice(0, 500) + "</div>";
-  });
-
-  // 查询改写(验证未通过后由 LLM 自主改写关键词重召)
-  m.rewrites.forEach(function (w) {
-    rChips.push(chip("warn", "第 " + esc(w.round) + " 轮查询改写 → " +
-      esc((w.rewritten_keywords || []).join(" / "))));
-    rDetail += '<div class="sub-title">第 ' + esc(w.round) + " 轮 · 查询改写:</div>" +
-      '<div class="row-line">原关键词:' +
-      esc((w.last_keywords || []).join(" / ") || "(无)") + "</div>" +
-      '<div class="row-line">改写后:<b>' +
-      esc((w.rewritten_keywords || []).join(" / ")) + "</b></div>";
-  });
-
-  // Top3 可回答性验证器(GoalLoop 每轮验证)
-  m.verifies.forEach(function (v) {
-    var p = v.payload || {};
-    if (v.event === "done") {
-      if (p.status === "passed") {
-        rChips.push(chip("ok", "✓ 验证器通过" +
-          (p.evidence_count != null ? " · 证据 <b>" + esc(p.evidence_count) + "</b> 篇" : "")));
-      } else {
-        rChips.push(chip("warn", "⚠ 验证器未通过" +
+  function channelName(ch) {
+    return ch === "intergrate_all" ? "一体化流水线 intergrate_all"
+         : ch === "vector_recall" ? "向量召回"
+         : ch === "keyword_recall" ? "关键词召回"
+         : "混合召回(BM25 关键词 + 向量 + RRF 融合)";
+  }
+  m.retrievalSeq.forEach(function (item) {
+    var rnd = item.round || "?";
+    if (item.type === "recall") {
+      var r = item.data;
+      var cnt = r.merged_count != null ? r.merged_count : r.titles.length;
+      rChips.push(chip("info", "第 <b>" + esc(rnd) + "</b> 轮召回:" +
+        channelName(r.channel)));
+      var cntTxt = (r.keyword_count != null || r.vector_count != null)
+        ? "关键词 <b>" + esc(r.keyword_count || 0) + "</b> 条 · 向量 <b>" +
+          esc(r.vector_count || 0) + "</b> 条 → 去重 <b>" + cnt + "</b> 条"
+        : "召回候选 <b>" + cnt + "</b> 条";
+      rChips.push(chip("", cntTxt + (r.region ? " · 区域 " + esc(r.region) : "")));
+      if (r.keywords && r.keywords.length)
+        rChips.push(chip("info", "第 " + esc(rnd) + " 轮提取关键词:" +
+          esc(r.keywords.join(" / "))));
+      rDetail += '<div class="sub-title">第 ' + esc(rnd) + " 轮 · 召回 " +
+        cnt + ' 条(标题 / 得分):</div>';
+      if (r.keywords && r.keywords.length)
+        rDetail += '<div class="row-line">提取关键词:' +
+          esc(r.keywords.join(" / ")) + "</div>";
+      rDetail += r.titles.slice(0, 10).map(function (t, i) {
+        return '<div class="row-line">' + (i + 1) + ". 《" + esc(t) + "》" +
+          (r.scores[i] != null ? " · 得分 " + esc(fmtScore(r.scores[i])) : "") + "</div>";
+      }).join("");
+      if (r.titles.length > 10)
+        rDetail += '<div class="row-line">… 其余 ' + (r.titles.length - 10) + " 条见原始事件</div>";
+      if (r.dsl)
+        rDetail += '<div class="sub-title">召回 DSL(第 ' + esc(rnd) + ' 轮):</div>' +
+          '<div class="row-line">' + esc(JSON.stringify(r.dsl)).slice(0, 500) + "</div>";
+    } else if (item.type === "rewrite") {
+      var w = item.data;
+      rChips.push(chip("warn", "第 " + esc(rnd) + " 轮后查询改写 → " +
+        esc((w.rewritten_keywords || []).join(" / "))));
+      rDetail += '<div class="sub-title">第 ' + esc(rnd) + " 轮后 · 查询改写:</div>" +
+        '<div class="row-line">原关键词:' +
+        esc((w.last_keywords || []).join(" / ") || "(无)") + "</div>" +
+        '<div class="row-line">改写后:<b>' +
+        esc((w.rewritten_keywords || []).join(" / ")) + "</b></div>";
+    } else if (item.type === "verify") {
+      var v = item.data, p = v.payload || {};
+      if (v.event === "done") {
+        if (p.status === "passed") {
+          rChips.push(chip("ok", "第 " + esc(rnd) + " 轮验证:✓ 通过" +
+            (p.evidence_count != null ? " · 证据 <b>" + esc(p.evidence_count) + "</b> 篇" : "")));
+        } else {
+          rChips.push(chip("warn", "第 " + esc(rnd) + " 轮验证:⚠ 未通过" +
+            ((p.reason_codes || []).length
+              ? "(" + esc((p.reason_codes || []).join(", ")) + ")" : "") +
+            " → 改写重召"));
+        }
+        rDetail += '<div class="sub-title">第 ' + esc(rnd) + " 轮 · 验证器结果(" +
+          esc(p.status || "?") + '):</div>' +
+          (p.summary ? '<div class="row-line">' + esc(p.summary) + "</div>" : "") +
+          ((p.top_titles || []).length
+            ? '<div class="row-line">被验证的 Top3:' +
+              p.top_titles.map(function (t) { return "《" + esc(t) + "》"; }).join(" ") +
+              "</div>" : "") +
           ((p.reason_codes || []).length
-            ? "(" + esc((p.reason_codes || []).join(", ")) + ")" : "") +
-          " → 改写重召"));
+            ? '<div class="row-line">原因码:' + esc(p.reason_codes.join(", ")) + "</div>" : "");
+      } else if (v.event === "feedback") {
+        rDetail += '<div class="sub-title">第 ' + esc(rnd) + " 轮 · 验证器改写建议:</div>" +
+          (p.suggested_query
+            ? '<div class="row-line">建议检索语句:<b>' + esc(p.suggested_query) + "</b></div>" : "") +
+          ((p.suggested_keywords || []).length
+            ? '<div class="row-line">建议关键词:' + esc(p.suggested_keywords.join(" / ")) + "</div>" : "") +
+          ((p.missing_aspects || []).length
+            ? '<div class="row-line">缺失方面:' + esc(p.missing_aspects.join(" / ")) + "</div>" : "") +
+          (p.retry_strategy
+            ? '<div class="row-line">调整策略:' + esc(p.retry_strategy) + "</div>" : "");
+      } else if (v.event === "zero_chunks") {
+        rChips.push(chip("warn", "第 " + esc(rnd) + " 轮验证:⚠ 零召回,需改写重试"));
+      } else if (v.event === "empty_top3") {
+        rChips.push(chip("warn", "第 " + esc(rnd) + " 轮验证:⚠ 处理后无有效 Top3 候选"));
+      } else if (v.event === "processing_error" || v.event === "verifier_exception") {
+        rChips.push(chip("bad", "第 " + esc(rnd) + " 轮验证:✗ 异常(" + esc(v.event) + ")"));
+        if (p.error)
+          rDetail += '<div class="sub-title">第 ' + esc(rnd) + " 轮 · " + esc(v.event) + ':</div>' +
+            '<div class="row-line">' + esc(p.error) + "</div>";
+      } else if (v.event === "unknown_degrade") {
+        rChips.push(chip("warn", "第 " + esc(rnd) + " 轮验证:⚠ 技术异常 → 不重试,沿用当前结果"));
       }
-      rDetail += '<div class="sub-title">验证器结果(' + esc(p.status || "?") + '):</div>' +
-        (p.summary ? '<div class="row-line">' + esc(p.summary) + "</div>" : "") +
-        ((p.reason_codes || []).length
-          ? '<div class="row-line">原因码:' + esc(p.reason_codes.join(", ")) + "</div>" : "");
-    } else if (v.event === "feedback") {
-      rDetail += '<div class="sub-title">验证器改写建议:</div>' +
-        (p.suggested_query
-          ? '<div class="row-line">建议检索语句:<b>' + esc(p.suggested_query) + "</b></div>" : "") +
-        ((p.suggested_keywords || []).length
-          ? '<div class="row-line">建议关键词:' + esc(p.suggested_keywords.join(" / ")) + "</div>" : "") +
-        ((p.missing_aspects || []).length
-          ? '<div class="row-line">缺失方面:' + esc(p.missing_aspects.join(" / ")) + "</div>" : "") +
-        (p.retry_strategy
-          ? '<div class="row-line">调整策略:' + esc(p.retry_strategy) + "</div>" : "");
-    } else if (v.event === "zero_chunks") {
-      rChips.push(chip("warn", "⚠ 验证器:本轮零召回,需改写重试"));
-    } else if (v.event === "empty_top3") {
-      rChips.push(chip("warn", "⚠ 验证器:处理后无有效 Top3 候选"));
-    } else if (v.event === "processing_error" || v.event === "verifier_exception") {
-      rChips.push(chip("bad", "✗ 验证环节异常:" + esc(v.event)));
-      if (p.error)
-        rDetail += '<div class="sub-title">' + esc(v.event) + ':</div>' +
-          '<div class="row-line">' + esc(p.error) + "</div>";
-    } else if (v.event === "unknown_degrade") {
-      rChips.push(chip("warn", "⚠ 验证器技术异常 → 不重试,沿用当前结果"));
     }
   });
 
@@ -1364,6 +1380,15 @@ function renderPipeline(events, obj, opts) {
     pChips.push(chip("", "④ 两阶段重排 <b>" + esc(m.proc.rerank.input_count) + " → Top" +
       esc(m.proc.rerank.top_count) + "</b>"));
     if (m.proc.rerank.degraded) pChips.push(chip("warn", "⚠ 重排降级(规则序兜底)"));
+    var topTitles = m.proc.rerank.top_titles || [];
+    if (topTitles.length) {
+      pChips.push(chip("info", "Top3:" + topTitles.map(function (t) {
+        return "《" + esc(t) + "》"; }).join(" ")));
+      pDetail += '<div class="sub-title">重排后 Top3 文档标题(依序):</div>' +
+        topTitles.map(function (t, i) {
+          return '<div class="row-line">' + (i + 1) + ". 《" + esc(t) + "》</div>";
+        }).join("");
+    }
   }
   if (m.adapted != null)
     pChips.push(chip("ok", "✓ 精选输出 <b>" + esc(m.adapted) + "</b> 条知识"));

@@ -88,9 +88,12 @@ class ProcessingVerifier:
         ws = get_workspace()
         chunks: List[Chunk] = ws.data.get("chunks", [])
 
+        # 验证事件带上当前召回轮次,前端按轮展示"第 N 轮验证结果"
+        rnd = ws.data.get("recall_round", 0)
+
         # ── 零召回 → 直接 failed ──
         if not chunks:
-            self._tracer.log("retrieval.verify", "zero_chunks")
+            self._tracer.log("retrieval.verify", "zero_chunks", round=rnd)
             return VerificationResult(
                 passed=False,
                 evidence="本轮未召回任何候选知识。请尝试改写问题、使用不同关键词、或放宽过滤条件(relax_filters=true)。",
@@ -112,7 +115,7 @@ class ProcessingVerifier:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Processing 流水线异常")
             self._tracer.log("retrieval.verify", "processing_error",
-                             error=str(exc))
+                             round=rnd, error=str(exc))
             return VerificationResult(
                 passed=False,
                 evidence=f"知识处理流水线异常: {exc}。请尝试不同检索策略。",
@@ -123,7 +126,7 @@ class ProcessingVerifier:
             ws.stage = prev_stage
 
         if not top3:
-            self._tracer.log("retrieval.verify", "empty_top3")
+            self._tracer.log("retrieval.verify", "empty_top3", round=rnd)
             return VerificationResult(
                 passed=False,
                 evidence="处理后无有效 Top3 候选。请扩大检索范围或使用不同检索词。",
@@ -148,7 +151,7 @@ class ProcessingVerifier:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Top3 Verifier 调用异常")
             self._tracer.log("retrieval.verify", "verifier_exception",
-                             error=str(exc))
+                             round=rnd, error=str(exc))
             return VerificationResult(
                 passed=False,
                 evidence=f"验证器调用异常: {exc}。请尝试不同检索策略。",
@@ -158,10 +161,12 @@ class ProcessingVerifier:
 
         self._tracer.log(
             "retrieval.verify", "done",
+            round=rnd,
             status=result.status,
             reason_codes=result.reason_codes,
             evidence_count=len(result.evidence_chunk_ids),
             summary=result.summary,
+            top_titles=[getattr(c, "name", "") or "" for c in top3],
         )
 
         # ── ③ 映射到 VerificationResult ──
@@ -185,7 +190,7 @@ class ProcessingVerifier:
                 "retry_strategy": fb.retry_strategy,
             }
             # 前端「检索关键信息」面板需要看到验证器失败后的改写建议
-            self._tracer.log("retrieval.verify", "feedback",
+            self._tracer.log("retrieval.verify", "feedback", round=rnd,
                              **ws.data["retrieval_feedback"])
             evidence_lines = [
                 f"验证未通过: {result.summary}",
@@ -206,7 +211,7 @@ class ProcessingVerifier:
         # unknown: 记录告警,不消耗普通检索重试,携现有结果结束
         self._tracer.log(
             "retrieval.verify", "unknown_degrade",
-            reason_codes=result.reason_codes,
+            round=rnd, reason_codes=result.reason_codes,
         )
         return VerificationResult(
             passed=False,
