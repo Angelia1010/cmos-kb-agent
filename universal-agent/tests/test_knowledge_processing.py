@@ -54,7 +54,7 @@ from kbagent.shared.knowledge_processing.richtext import (
     render_richtext_with_warnings,
 )
 from kbagent.shared.workspace import RunWorkspace, set_workspace
-from tests.processing_mock_data import make_top100_candidates
+from tests.processing_mock_data import bind_candidate_chunks, make_top100_candidates
 
 
 class _CapturingModel:
@@ -1002,8 +1002,10 @@ class TestRerank(unittest.TestCase):
     def test_standard_contract_preserves_filter_markdown_and_top3_baseline(self):
         raw = make_top100_candidates()
         original = copy.deepcopy(raw)
+        candidates, chunks = bind_candidate_chunks(raw)
         ws = RunWorkspace(query="5G流量套餐")
         ws.data.update({
+            "chunks": chunks,
             "processing_context": {
                 "region_id": "0755",
                 "region_name": "深圳",
@@ -1012,7 +1014,7 @@ class TestRerank(unittest.TestCase):
                 "audience": "agent",
             },
             "retrieval_query": "5G 套餐 流量",
-            "knowledge_candidates": raw,
+            "knowledge_candidates": candidates,
         })
         set_workspace(ws)
         result = asyncio.run(KnowledgeProcessingOrchestrator(ScriptedChatModel()).run())
@@ -1197,6 +1199,8 @@ class TestToolsAndOrchestrator(unittest.TestCase):
             ],
         })
         set_workspace(ws)
+        candidates, chunks = bind_candidate_chunks(ws.data["knowledge_candidates"])
+        ws.data.update({"chunks": chunks, "knowledge_candidates": candidates})
         asyncio.run(KnowledgeProcessingOrchestrator(_CapturingModel()).run())
         warnings = ws.data["processing_warnings"]
         codes = [warning.code for warning in warnings]
@@ -1215,11 +1219,13 @@ class TestToolsAndOrchestrator(unittest.TestCase):
 
     def test_workspace_degradation_reasons_come_from_authoritative_rerank_details(self):
         async def run_case(model, options, count=8):
+            candidates, chunks = bind_candidate_chunks(make_top100_candidates()[:count])
             ws = RunWorkspace(query="套餐")
             ws.data.update({
+                "chunks": chunks,
                 "processing_context": {"audience": "agent"},
                 "retrieval_query": "套餐",
-                "knowledge_candidates": make_top100_candidates()[:count],
+                "knowledge_candidates": candidates,
             })
             set_workspace(ws)
             await KnowledgeProcessingOrchestrator(model, options).run()
@@ -1271,11 +1277,13 @@ class TestToolsAndOrchestrator(unittest.TestCase):
     def test_repeated_run_overwrites_outputs_and_keeps_input(self):
         raw = make_top100_candidates()[:8]
         original = copy.deepcopy(raw)
+        candidates, chunks = bind_candidate_chunks(raw)
         ws = RunWorkspace(query="5G流量套餐")
         ws.data.update({
+            "chunks": chunks,
             "processing_context": {"region_name": "河南"},
             "retrieval_query": "5G 流量",
-            "knowledge_candidates": raw,
+            "knowledge_candidates": candidates,
         })
         set_workspace(ws)
         orchestrator = KnowledgeProcessingOrchestrator(ScriptedChatModel())

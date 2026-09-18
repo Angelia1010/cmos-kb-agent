@@ -18,6 +18,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "services"))
 
 from kbagent.processing.agent import KnowledgeProcessingOrchestrator  # noqa: E402
 from kbagent.scripted_model import ScriptedChatModel  # noqa: E402
+from kbagent.shared.knowledge_processing.bridge import (  # noqa: E402
+    retrieval_to_candidates,
+)
 from kbagent.shared.models import Chunk  # noqa: E402
 from kbagent.shared.workspace import RunWorkspace, get_workspace, workspace_scope  # noqa: E402
 from processing_service.models import ProcessingRequest  # noqa: E402
@@ -34,32 +37,36 @@ except ModuleNotFoundError:
 SENSITIVE_MARKER = "SYNTHETIC_SECRET_DO_NOT_EXPOSE"
 
 
-def _candidate(prefix: str, index: int, topic: str) -> dict:
+def _chunk(prefix: str, index: int, topic: str) -> dict:
     return {
-        "knowledge_id": f"{prefix}-{index:03d}",
-        "knowledge_name": f"{topic}知识{index}",
-        "content": "",
-        "retrieval_rank": index,
-        "retrieval_score": round(1 - index / 100, 2),
-        "matched_atom_ids": [f"{prefix}-A-{index:03d}"],
-        "source_routes": ["synthetic"],
-        "applicability": {"status": "1"},
-        "atoms": [{
-            "atom_id": f"{prefix}-A-{index:03d}",
-            "group_id": "G001",
-            "param_name": "业务内容",
-            "param_type": "text",
-            "content": f"{topic}办理说明第{index}条",
-            "except_rules": [],
-            "annotation": None,
-            "arrange_seq_number": index,
-            "wkuntt": None,
-            "applicability": {"status": "1"},
-            "metadata": {"private_atom_marker": SENSITIVE_MARKER},
-            "raw": {"private_atom_raw": SENSITIVE_MARKER},
-        }],
-        "metadata": {"private_candidate_marker": SENSITIVE_MARKER},
-        "raw": {"private_candidate_raw": SENSITIVE_MARKER},
+        "chunk_id": f"chunk-{prefix}-{index:03d}",
+        "doc_id": f"{prefix}-{index:03d}",
+        "doc_title": f"{topic}知识{index}",
+        "content": f"检索原文-{topic}-{index}",
+        "category": topic,
+        "position": {"index": index},
+        "version": f"v{index}",
+        "updated_at": f"2026-09-{index:02d}",
+        "score": round(1 - index / 100, 2),
+        "source_chunk_ids": [f"source-{prefix}-{index:03d}"],
+        "extra": {
+            "status": "1",
+            "matched_atom_ids": [f"{prefix}-A-{index:03d}"],
+            "source_routes": ["synthetic"],
+            "private_marker": SENSITIVE_MARKER,
+            "atoms": [{
+                "atom_id": f"{prefix}-A-{index:03d}",
+                "group_id": "G001",
+                "param_name": "业务内容",
+                "param_type": "text",
+                "content": f"{topic}办理说明第{index}条",
+                "except_rules": [],
+                "annotation": None,
+                "arrange_seq_number": index,
+                "wkuntt": None,
+                "applicability": {"status": "1"},
+            }],
+        },
     }
 
 
@@ -75,7 +82,7 @@ def _request(prefix: str = "A", topic: str = "流量") -> ProcessingRequest:
             "audience": "agent",
             "customer_type": "个人客户",
         },
-        "candidates": [_candidate(prefix, index, topic) for index in range(1, 5)],
+        "chunks": [_chunk(prefix, index, topic) for index in range(1, 5)],
     })
 
 
@@ -85,20 +92,43 @@ class _BrokenScriptedModel(ScriptedChatModel):
 
 
 class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
+    async def test_retrieval_query_is_optional(self):
+        request = ProcessingRequest.model_validate({
+            "query": "流量查询",
+            "processing_context": {},
+            "chunks": [],
+        })
+
+        self.assertIsNone(request.retrieval_query)
+        result = await run_processing_request(
+            request,
+            model=ScriptedChatModel(),
+            request_id="request-without-retrieval-query",
+        )
+        self.assertEqual("no_valid_candidates", result.outcome)
+
+        explicit_null = ProcessingRequest.model_validate({
+            "query": "流量查询",
+            "retrieval_query": None,
+            "processing_context": {},
+            "chunks": [],
+        })
+        self.assertIsNone(explicit_null.retrieval_query)
+
     async def test_request_validation_and_empty_context_defaults(self):
         with self.assertRaises(ValidationError):
             ProcessingRequest.model_validate({
                 "query": "",
                 "retrieval_query": "有效检索问题",
                 "processing_context": {},
-                "candidates": [],
+                "chunks": [],
             })
 
         request = ProcessingRequest.model_validate({
             "query": "流量查询",
             "retrieval_query": "查询流量",
             "processing_context": {},
-            "candidates": [],
+            "chunks": [],
         })
         result = await run_processing_request(
             request,
@@ -124,7 +154,7 @@ class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([1, 2, 3], [item.rerank_rank for item in result.top3_candidates])
         self.assertTrue(all(item.content_md for item in result.top3_candidates))
         self.assertEqual(
-            [item.knowledge_id for item in result.top3_candidates],
+            [item.chunk_id for item in result.top3_candidates],
             [item.chunk_id for item in result.processed_chunks],
         )
         self.assertEqual(
@@ -140,8 +170,8 @@ class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("metadata", serialized)
         self.assertNotIn(SENSITIVE_MARKER, serialized)
 
-    async def test_empty_candidates_are_normal_degradation(self):
-        request = _request().model_copy(update={"candidates": []})
+    async def test_empty_chunks_are_normal_degradation(self):
+        request = _request().model_copy(update={"chunks": []})
         result = await run_processing_request(
             request,
             model=ScriptedChatModel(),
@@ -185,8 +215,8 @@ class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first.trace_id, second.trace_id)
         self.assertTrue(all(item.knowledge_id.startswith("FLOW-") for item in first.top3_candidates))
         self.assertTrue(all(item.knowledge_id.startswith("BROADBAND-") for item in second.top3_candidates))
-        self.assertTrue(all(item.chunk_id.startswith("FLOW-") for item in first.processed_chunks))
-        self.assertTrue(all(item.chunk_id.startswith("BROADBAND-") for item in second.processed_chunks))
+        self.assertTrue(all(item.chunk_id.startswith("chunk-FLOW-") for item in first.processed_chunks))
+        self.assertTrue(all(item.chunk_id.startswith("chunk-BROADBAND-") for item in second.processed_chunks))
         with self.assertRaises(RuntimeError):
             get_workspace()
 
@@ -224,12 +254,14 @@ class TestProcessingServiceCore(unittest.IsolatedAsyncioTestCase):
             request_id="request-service",
         )
 
+        chunks = [Chunk(**item.model_dump()) for item in request.chunks]
         ws = RunWorkspace(
             query=request.query,
             data={
+                "chunks": chunks,
                 "retrieval_query": request.retrieval_query,
                 "processing_context": request.processing_context.model_dump(),
-                "knowledge_candidates": copy.deepcopy(request.candidates),
+                "knowledge_candidates": retrieval_to_candidates(chunks=chunks),
             },
         )
         with workspace_scope(ws):
@@ -304,7 +336,7 @@ class TestProcessingServiceHttp(unittest.TestCase):
         self.assertEqual("scripted", body["object"]["model_mode"])
         self.assertEqual(3, len(body["object"]["processed_chunks"]))
         self.assertEqual(
-            [item["knowledge_id"] for item in body["object"]["top3_candidates"]],
+            [item["chunk_id"] for item in body["object"]["top3_candidates"]],
             [item["chunk_id"] for item in body["object"]["processed_chunks"]],
         )
         self.assertTrue(all(

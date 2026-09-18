@@ -1,6 +1,34 @@
 """独立知识处理流水线的确定性 Mock 候选。"""
 from __future__ import annotations
 
+import copy
+from typing import Any, Sequence
+
+from kbagent.shared.models import Chunk
+
+
+def bind_candidate_chunks(candidates: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[Chunk]]:
+    """为 Processing 独立测试数据补齐 chunk_id，并生成对应的 Retrieval Chunk。"""
+    bound_candidates = copy.deepcopy(list(candidates))
+    chunks: list[Chunk] = []
+    for index, candidate in enumerate(bound_candidates, start=1):
+        knowledge_id = str(candidate.get("knowledge_id") or f"CANDIDATE-{index:03d}")
+        chunk_id = str(candidate.get("chunk_id") or f"PROCESSING-{index:03d}")
+        candidate["chunk_id"] = chunk_id
+        try:
+            score = float(candidate.get("retrieval_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        chunks.append(Chunk(
+            chunk_id=chunk_id,
+            doc_id=knowledge_id,
+            doc_title=str(candidate.get("knowledge_name") or knowledge_id),
+            content="",
+            category="",
+            score=score,
+        ))
+    return bound_candidates, chunks
+
 
 def make_top100_candidates(count: int = 100) -> list[dict]:
     """生成指定数量的稳定候选；默认保持原 Top100 契约。"""

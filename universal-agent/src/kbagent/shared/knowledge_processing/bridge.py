@@ -16,6 +16,14 @@ def _text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _raw_text(value: Any) -> Optional[str]:
+    """raw 来源会混用 null 和字符串 "null"，在桥接边界统一视为缺失。"""
+    text = _text(value)
+    if text is None or text.casefold() in {"null", "none"}:
+        return None
+    return text
+
+
 def _applicability_of(raw: Dict[str, Any]) -> Dict[str, Any]:
     """从 ngkm 条目/原子映射适用性字段;只映射明确存在的字段,不猜测。"""
     nested = raw.get("applicability")
@@ -30,6 +38,39 @@ def _applicability_of(raw: Dict[str, Any]) -> Dict[str, Any]:
     if channels not in (None, ""):
         applicability["channel_codes"] = channels
     return applicability
+
+
+def _raw_applicability(raw: Dict[str, Any]) -> Dict[str, Any]:
+    applicability: Dict[str, Any] = {}
+    start = _raw_text(raw.get("startTime"))
+    end = _raw_text(raw.get("endTime"))
+    province_id = _raw_text(raw.get("provinceId"))
+    channels = raw.get("channelCode")
+    if start:
+        applicability["effective_start"] = start
+    if end:
+        applicability["effective_end"] = end
+    if province_id:
+        applicability["region_ids"] = [province_id]
+    if isinstance(channels, (list, tuple, set)):
+        channel_codes = [
+            text for item in channels if (text := _raw_text(item)) is not None
+        ]
+        if channel_codes:
+            applicability["channel_codes"] = channel_codes
+    else:
+        channel_text = _raw_text(channels)
+        if channel_text:
+            applicability["channel_codes"] = channel_text
+    return applicability
+
+
+def _is_raw_vector_chunk(extra: Dict[str, Any], raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    source = (_text(extra.get("source")) or "").casefold()
+    vector_channel = (_text(extra.get("vector_channel")) or "").casefold()
+    return source == "vector" or vector_channel == "vector"
 
 
 def _merged_atom_to_dict(knowledge_id: str, position: int,
@@ -64,11 +105,19 @@ def _chunk_to_candidate(index: int, chunk: Chunk) -> Dict[str, Any]:
             if not isinstance(atom, dict) or atom.get("error"):
                 continue
             atoms.append(_merged_atom_to_dict(chunk.doc_id, len(atoms), atom))
+    raw = extra.get("raw")
+    raw_vector = not atoms and _is_raw_vector_chunk(extra, raw)
+    applicability = _applicability_of(extra)
+    if raw_vector:
+        applicability = {**_raw_applicability(raw), **applicability}
     return {
         "chunk_id": chunk.chunk_id,
         "knowledge_id": chunk.doc_id,
         "knowledge_name": chunk.doc_title,
-        "content": "",
+        "content": copy.deepcopy(chunk.content) if raw_vector else "",
+        "content_group_name": (
+            _raw_text(raw.get("groupName")) or "" if raw_vector else None
+        ),
         "retrieval_rank": index + 1,
         "source_index": index,
         "retrieval_score": chunk.score,
@@ -84,7 +133,7 @@ def _chunk_to_candidate(index: int, chunk: Chunk) -> Dict[str, Any]:
         "template_id": _text(
             extra.get("template_id", extra.get("templateId"))
         ),
-        "applicability": _applicability_of(extra),
+        "applicability": applicability,
         "atoms": atoms,
     }
 

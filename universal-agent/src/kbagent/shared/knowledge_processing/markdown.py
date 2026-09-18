@@ -15,7 +15,11 @@ from .models import (
     ProcessingContext,
     ProcessingWarning,
 )
-from .richtext import render_richtext
+from .richtext import (
+    normalize_flattened_table_text,
+    render_richtext,
+    sanitize_title_text,
+)
 
 
 def _without_duplicate_title(text: str, title: str) -> str:
@@ -23,6 +27,27 @@ def _without_duplicate_title(text: str, title: str) -> str:
     if lines and re.sub(r"^#+\s*", "", lines[0]).strip() == title.strip():
         return "\n".join(lines[1:]).strip()
     return text
+
+
+def _without_known_prefix(text: str, prefix: str) -> str:
+    """仅删除正文开头完整匹配的已知标题前缀，不拆分任意冒号内容。"""
+    prefix = prefix.strip()
+    if not text or not prefix:
+        return text
+    matched = re.match(rf"^{re.escape(prefix)}\s*[：:]\s*", text)
+    return text[matched.end():].lstrip() if matched else text
+
+
+def _effective_period_section(candidate: KnowledgeCandidate) -> str:
+    applicability = candidate.applicability
+    start = applicability.effective_start or candidate.start_at
+    end = applicability.effective_end or candidate.end_at
+    lines = []
+    if start:
+        lines.append(f"- 生效时间：{start}")
+    if end:
+        lines.append(f"- 失效时间：{end}")
+    return "## 有效期\n\n" + "\n".join(lines) if lines else ""
 
 
 def build_candidate_markdown(
@@ -38,11 +63,36 @@ def build_candidate_markdown(
     warnings: List[ProcessingWarning] = []
     atoms, atom_warnings = process_atoms(candidate.atoms, context)
     warnings.extend(atom_warnings)
-    sections = [f"# {candidate.name}"]
+    display_name = sanitize_title_text(candidate.name) or (
+        f"未命名知识-{candidate.source_index + 1:03d}"
+    )
+    raw_content_path = candidate.content_group_name is not None
+    group_name = (
+        sanitize_title_text(candidate.content_group_name)
+        if raw_content_path else ""
+    )
+    sections = [f"# {display_name}"]
     main_text = render_richtext(candidate.content, warnings, "content")
-    main_text = _without_duplicate_title(main_text, candidate.name)
+    main_text = _without_duplicate_title(main_text, display_name)
+    if raw_content_path and main_text:
+        main_text = _without_known_prefix(main_text, display_name)
+        main_text = _without_known_prefix(main_text, group_name)
+        normalized_table, table_detected, table_converted = (
+            normalize_flattened_table_text(main_text)
+        )
+        main_text = normalized_table
+        if table_detected and not table_converted:
+            warnings.append(ProcessingWarning(
+                code="flattened_table_unparsed",
+                message="检测到压平表格但无法可靠恢复，已保留原文",
+                source_index=candidate.source_index,
+                knowledge_id=candidate.knowledge_id,
+                field="content",
+            ))
     if main_text:
-        sections.append(main_text)
+        sections.append(
+            f"## {group_name}\n\n{main_text}" if group_name else main_text
+        )
     for group, grouped_atoms in group_atoms(atoms):
         sections.append(f"## {group}")
         for atom in grouped_atoms:
@@ -66,12 +116,17 @@ def build_candidate_markdown(
                 if annotation:
                     lines.append(f"- 备注：{annotation}")
             sections.append("\n\n".join(lines))
+    # 有效期是业务正文的附加信息，不能单独让空候选变为可重排候选。
+    if raw_content_path and main_text:
+        period = _effective_period_section(candidate)
+        if period:
+            sections.append(period)
     content_md = "\n\n".join(section.strip() for section in sections if section.strip()).strip()
     base = copy.deepcopy(candidate)
     result = ProcessedKnowledge(
         knowledge_id=base.knowledge_id,
         chunk_id=base.chunk_id,
-        name=base.name,
+        name=display_name,
         content=base.content,
         atoms=atoms,
         retrieval_rank=base.retrieval_rank,
@@ -91,6 +146,7 @@ def build_candidate_markdown(
         source_index=base.source_index,
         metadata=strip_annotation_fields(base.metadata),
         raw=strip_annotation_fields(base.raw),
+        content_group_name=group_name if raw_content_path else None,
         content_md=content_md,
         included_atom_count=len(atoms),
         processing_warnings=warnings,
