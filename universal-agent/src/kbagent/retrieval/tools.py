@@ -109,7 +109,7 @@ def _invoke_json(model: Any, system: str, user: str) -> Dict[str, Any]:
 #     ws.data["rewritten_queries"] = rewrites
 #     ws.data["original_query"] = query
 #     rnd = ws.data.get("recall_round", 0)
-#     ws.tracer.log(f"{ws.stage}.round{rnd}", "query_rewrite",
+#     ws.tracer.log(f"retrieval.round{rnd}", "query_rewrite",
 #                   original=query, last_query=last_query,
 #                   last_keywords=last_keywords, rewrites=rewrites)
 #     # logger.info("query_rewrite 完成: query=%r last_query=%r → rewrites=%s",
@@ -163,7 +163,7 @@ def query_rewrite(last_query: str = "",
     rewritten_keywords = [str(k) for k in rewritten_keywords if k]
     ws.data["rewritten_keywords"] = rewritten_keywords
     rnd = ws.data.get("recall_round", 0)
-    ws.tracer.log(f"{ws.stage}.round{rnd}", "query_rewrite",
+    ws.tracer.log(f"retrieval.round{rnd}", "query_rewrite",
                   last_query=last_query,
                   last_keywords=last_keywords, rewritten_keywords=rewritten_keywords)
     logger.info("[TOOL_RETURN] query_rewrite 返回: rewritten_keywords=%s", rewritten_keywords)
@@ -259,8 +259,9 @@ def intergrate_all(query: str = "", region_code: str = "000",
     ws.data["example"] = kresult.get("example", {}) if isinstance(kresult, dict) else {}
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
-    ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
+    ws.tracer.log(f"retrieval.round{rnd}", "recall",
                   channel="intergrate_all", region_code=region_code,
+                  keywords=ws.data["keywords"],
                   keyword_count=len(kchunks), vector_count=len(vchunks),
                   merged_count=len(chunks),
                   titles=[c.doc_title for c in chunks],
@@ -309,8 +310,9 @@ def vector_recall(query: str = "", region_code: str = "000", vector_mode: str = 
     ws.data["vector_results"] = result
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
-    ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
+    ws.tracer.log(f"retrieval.round{rnd}", "recall",
                   channel="vector_recall", region_code=region_code,
+                  recalled=len(chunks),
                   titles=[c.doc_title for c in chunks],
                   scores=[c.score for c in chunks])
     # logger.info("vector_recall 完成: query=%r region=%s size=%d → chunks=%d",
@@ -358,8 +360,10 @@ def keyword_recall(query: str = "", region_code: str = "000",
     ws.data["example"] = result.get("example", {})
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
-    ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",
+    ws.data["keywords"] = list((result.get("keywords") if isinstance(result, dict) else []) or [])
+    ws.tracer.log(f"retrieval.round{rnd}", "recall",
                   channel="keyword_recall", region_code=region_code,
+                  keywords=ws.data["keywords"],
                   titles=[c.doc_title for c in chunks],
                   scores=[c.score for c in chunks])
     # logger.info("keyword_recall 完成: query=%r region=%s merged=%d → chunks=%d",

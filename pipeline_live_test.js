@@ -167,6 +167,32 @@ expect(els['loadingText'].textContent.includes('知识处理'), 'N processing.kn
 api.setLoadingStage('answer');
 expect(els['loadingText'].textContent.includes('答案生成'), 'N answer → 答案生成');
 
+// ── N2. 检索关键信息:关键词提取 / 双路条数 / 查询改写 / 验证器 / 循环汇总 ──
+const rtEvents = [
+  ev('run', 'start', { query: 'q', region_code: '350' }),
+  ev('cache', 'miss', {}),
+  ev('retrieval.round1', 'recall', { channel: 'intergrate_all', region_code: '350', keywords: ['异地', '补卡', '手机卡'], keyword_count: 8, vector_count: 6, merged_count: 12, titles: ['补卡手册'], scores: [9.9] }),
+  ev('retrieval.verify', 'done', { status: 'failed', reason_codes: ['insufficient_evidence'], evidence_count: 0, summary: '候选不足以回答' }),
+  ev('retrieval.verify', 'feedback', { suggested_query: '异地补卡需要什么材料', suggested_keywords: ['异地补卡', '材料'], missing_aspects: ['办理材料'], retry_strategy: '改写关键词' }),
+  ev('retrieval.round1', 'query_rewrite', { last_keywords: ['异地', '补卡'], rewritten_keywords: ['异地补卡', '材料'] }),
+  ev('retrieval.round2', 'recall', { channel: 'intergrate_all', region_code: '350', keywords: ['异地补卡', '材料'], keyword_count: 5, vector_count: 5, merged_count: 9, titles: ['补卡材料清单'], scores: [11.2] }),
+  ev('retrieval.verify', 'done', { status: 'passed', reason_codes: [], evidence_count: 2, summary: 'Top3 可回答' }),
+  ev('retrieval', 'loop_result', { success: true, iterations: 2, reason: 'verified' }),
+  ev('retrieval', 'done', { count: 9 })
+];
+api.renderPipeline(rtEvents, null, { live: true });
+st = segs();
+expect(st[2].seg.includes('异地 / 补卡 / 手机卡'), 'N2 第1轮提取关键词 chip');
+expect(st[2].seg.includes('关键词 <b>8</b> 条 · 向量 <b>6</b> 条 → 去重 <b>12</b> 条'), 'N2 双路召回条数 chip');
+expect(st[2].seg.includes('⚠ 验证器未通过'), 'N2 验证器未通过 chip');
+expect(st[2].seg.includes('insufficient_evidence'), 'N2 验证器原因码');
+expect(st[2].seg.includes('查询改写') && st[2].seg.includes('异地补卡 / 材料'), 'N2 查询改写 chip');
+expect(st[2].seg.includes('✓ 验证器通过') && st[2].seg.includes('证据 <b>2</b> 篇'), 'N2 第2轮验证器通过 chip');
+expect(st[2].seg.includes('共 <b>2</b> 轮'), 'N2 GoalLoop 汇总 chip');
+expect(st[2].seg.includes('建议检索语句') && st[2].seg.includes('异地补卡需要什么材料'), 'N2 明细含验证器建议');
+expect(st[2].seg.includes('缺失方面') && st[2].seg.includes('办理材料'), 'N2 明细含缺失方面');
+expect(st[2].seg.includes('候选不足以回答') && st[2].seg.includes('Top3 可回答'), 'N2 明细含验证器 summary');
+
 // ── O. doQuery 流式全流程:主区占位切换 + 右侧栏链路点亮 + final 渲染 ──
 // 用假 fetch 返回一段 SSE 流,验证 welcome→searching→results 的显隐编排
 const doQueryTest = (function testDoQueryStream() {

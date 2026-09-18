@@ -99,6 +99,10 @@ class ProcessingVerifier:
             )
 
         # ── ① Processing ──
+        # ProcessingSubAgent.run() 会把 ws.stage 覆写为 "processing";
+        # 验证结束后必须还原,否则后续检索工具的 trace 会被记到
+        # processing.roundN 下(前端链路图按 retrieval.roundN 归组)。
+        prev_stage = ws.stage
         try:
             ws.data["knowledge_candidates"] = retrieval_to_candidates(
                 chunks=chunks)
@@ -115,6 +119,8 @@ class ProcessingVerifier:
                 layer="processing",
                 confidence=1.0,
             )
+        finally:
+            ws.stage = prev_stage
 
         if not top3:
             self._tracer.log("retrieval.verify", "empty_top3")
@@ -155,6 +161,7 @@ class ProcessingVerifier:
             status=result.status,
             reason_codes=result.reason_codes,
             evidence_count=len(result.evidence_chunk_ids),
+            summary=result.summary,
         )
 
         # ── ③ 映射到 VerificationResult ──
@@ -177,6 +184,9 @@ class ProcessingVerifier:
                 "missing_aspects": fb.missing_aspects,
                 "retry_strategy": fb.retry_strategy,
             }
+            # 前端「检索关键信息」面板需要看到验证器失败后的改写建议
+            self._tracer.log("retrieval.verify", "feedback",
+                             **ws.data["retrieval_feedback"])
             evidence_lines = [
                 f"验证未通过: {result.summary}",
                 f"建议检索语句: {fb.suggested_query}",
