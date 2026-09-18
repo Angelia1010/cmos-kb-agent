@@ -14,6 +14,7 @@ from .models import (
     ProcessingContext,
     ProcessingWarning,
 )
+from .richtext import sanitize_title_text
 
 
 def _mapping(raw: Any) -> Dict[str, Any]:
@@ -378,6 +379,17 @@ def _normalize_candidate(
     if isinstance(raw, KnowledgeCandidate):
         candidate = copy.deepcopy(raw)
         candidate.source_index = source_index
+        candidate.name = sanitize_title_text(candidate.name)
+        if not candidate.name:
+            candidate.name = f"未命名知识-{source_index + 1:03d}"
+            _warn(
+                warnings, "missing_name", "缺少知识名称，已生成稳定占位标题",
+                source_index, "name", candidate.knowledge_id,
+            )
+        if candidate.content_group_name is not None:
+            candidate.content_group_name = sanitize_title_text(
+                candidate.content_group_name
+            )
         if not candidate.retrieval_rank:
             candidate.retrieval_rank = source_index + 1
         if isinstance(candidate.atoms, (list, tuple)):
@@ -401,7 +413,11 @@ def _normalize_candidate(
     data = _mapping(raw)
     knowledge_id = _text(data.get("knowledge_id"))
     chunk_id = _text(data.get("chunk_id")) or ""
-    name = _text(data.get("knowledge_name"))
+    name = sanitize_title_text(data.get("knowledge_name"))
+    group_raw = data.get("content_group_name")
+    content_group_name = (
+        None if group_raw is None else sanitize_title_text(group_raw)
+    )
     rank_raw = data.get("retrieval_rank")
     rank = _int(rank_raw, source_index + 1)
     if rank_raw is None or rank <= 0:
@@ -453,7 +469,7 @@ def _normalize_candidate(
         "chunk_id", "knowledge_id", "knowledge_name", "content", "retrieval_rank", "source_index",
         "retrieval_score",
         "matched_atom_ids", "source_routes", "knowledge_type", "template_id",
-        "applicability", "atoms",
+        "applicability", "atoms", "content_group_name",
     }
     candidate = KnowledgeCandidate(
         knowledge_id=knowledge_id,
@@ -478,6 +494,7 @@ def _normalize_candidate(
         source_index=source_index,
         metadata={k: copy.deepcopy(v) for k, v in data.items() if k not in known},
         raw=copy.deepcopy(raw),
+        content_group_name=content_group_name,
     )
     return normalize_candidate_applicability(candidate, warnings)
 

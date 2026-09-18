@@ -169,6 +169,8 @@ class KnowledgeCandidate(Serializable):
     channel_codes: List[str] = dc_field(default_factory=list)
     # Retrieval Chunk 的稳定关联键；放在旧字段后保持位置参数兼容。
     chunk_id: str = ""
+    # 非结构化正文的展示分组；None 表示非 raw/vector 正文路径。
+    content_group_name: Optional[str] = None
 
 
 @dataclass

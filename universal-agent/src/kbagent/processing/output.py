@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Mapping
 
 from ..shared.knowledge_processing.models import ProcessedKnowledge
+from ..shared.knowledge_processing.richtext import sanitize_title_text
 from ..shared.models import Chunk
 
 
@@ -23,6 +24,7 @@ def top3_to_processed_chunks(
             raise ValueError(f"找不到 chunk_id={candidate.chunk_id} 对应的原 Retrieval Chunk")
         chunks.append(replace(
             source_chunk,
+            doc_title=sanitize_title_text(candidate.name),
             content=candidate.content_md,
             extra={
                 "processing": {

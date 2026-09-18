@@ -14,6 +14,10 @@ _HTML_RE = re.compile(r"<\s*/?\s*[A-Za-z][^>]*>")
 _SPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_RE = re.compile(r"\n{3,}")
 _INDENTED_LIST_RE = re.compile(r"^(?P<indent>[ \t]+)(?P<body>(?:[-+*]|\d+\.)\s+.*)$")
+_TITLE_SPACE_RE = re.compile(r"\s+")
+_FLATTENED_TABLE_MARKER_RE = re.compile(r"(?:\|\s*-+\s*){2,}\|")
+_MARKDOWN_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_UNESCAPED_PIPE_RE = re.compile(r"(?<!\\)\|")
 _TEXT_KEYS = ("text", "content", "value")
 _CHILD_KEYS = ("children", "nodes", "data", "blocks", "paragraph", "tables", "items")
 _IGNORED_KEYS = {
@@ -22,6 +26,65 @@ _IGNORED_KEYS = {
     "className", "target", "rel",
 }
 _SUPPORTED_CONTENT_TYPES = (str, dict, list, tuple, int, float, bool, type(None))
+
+
+class _HTMLToPlainText(HTMLParser):
+    """把标题类 HTML 转成单行可见文本，不保留 Markdown 样式。"""
+
+    _SEPARATOR_TAGS = {
+        "br", "p", "div", "section", "article", "header", "footer",
+        "li", "ul", "ol", "table", "tr", "td", "th",
+    }
+    _IGNORED_TAGS = {"script", "style", "noscript"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: List[str] = []
+        self.in_ignored = 0
+
+    def handle_starttag(self, tag: str, attrs: List[tuple[str, str | None]]) -> None:
+        del attrs
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS:
+            self.in_ignored += 1
+            return
+        if not self.in_ignored and tag in self._SEPARATOR_TAGS:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._IGNORED_TAGS:
+            self.in_ignored = max(0, self.in_ignored - 1)
+            return
+        if not self.in_ignored and tag in self._SEPARATOR_TAGS:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self.in_ignored:
+            self.parts.append(data)
+
+    def result(self) -> str:
+        return "".join(self.parts)
+
+
+def sanitize_title_text(value: Any) -> str:
+    """将知识标题/分组标题规范为无 HTML 的单行纯文本。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if _HTML_RE.search(text):
+        try:
+            parser = _HTMLToPlainText()
+            parser.feed(text)
+            parser.close()
+            text = parser.result()
+        except (ValueError, AssertionError):
+            # HTMLParser 极少失败；兜底仍保证标签本身不会进入标题。
+            text = _HTML_RE.sub(" ", text)
+    text = html.unescape(text).replace("\u00a0", " ")
+    return _TITLE_SPACE_RE.sub(" ", text).strip()
 
 
 def _clean(text: str) -> str:
@@ -148,6 +211,70 @@ def _markdown_table(rows: Sequence[Sequence[Any]]) -> str:
     lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
     lines.extend("| " + " | ".join(row) + " |" for row in normalized[1:])
     return "\n".join(lines)
+
+
+def _markdown_row_cells(line: str) -> List[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in _UNESCAPED_PIPE_RE.split(stripped)]
+
+
+def _has_valid_markdown_table(text: str) -> bool:
+    lines = text.splitlines()
+    for index in range(len(lines) - 1):
+        header = _markdown_row_cells(lines[index])
+        separator = _markdown_row_cells(lines[index + 1])
+        if (
+            len(header) >= 2
+            and len(header) == len(separator)
+            and all(_MARKDOWN_SEPARATOR_CELL_RE.fullmatch(cell) for cell in separator)
+        ):
+            return True
+    return False
+
+
+def normalize_flattened_table_text(text: str) -> tuple[str, bool, bool]:
+    """尝试把知识库压平 pipe 表格恢复为标准 Markdown。
+
+    返回 ``(结果, 是否检测到压平表格标记, 是否成功转换)``。解析失败时原文不变。
+    第一版只处理一个结构完整的压平表格块，避免对普通 pipe 文本做宽松猜测。
+    """
+    if not text or _has_valid_markdown_table(text):
+        return text, False, False
+    marker = _FLATTENED_TABLE_MARKER_RE.search(text)
+    if marker is None:
+        return text, False, False
+
+    prefix = text[:marker.start()].strip()
+    payload = text[marker.end():].strip()
+    if not payload:
+        return text, True, False
+
+    groups: List[List[str]] = []
+    current: List[str] = []
+    for raw_token in payload.split("|"):
+        token = raw_token.strip()
+        if token:
+            current.append(token)
+        elif current:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+
+    if len(groups) < 2:
+        return text, True, False
+    width = len(groups[0])
+    if width < 2 or width > 20 or any(len(row) != width for row in groups[1:]):
+        return text, True, False
+
+    table = _markdown_table(groups)
+    if not table:
+        return text, True, False
+    return (f"{prefix}\n\n{table}" if prefix else table), True, True
 
 
 def _plain_value(value: Any) -> str:

@@ -43,7 +43,7 @@ class ProcessingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = Field(min_length=1)
-    retrieval_query: str = Field(min_length=1)
+    retrieval_query: str | None = Field(default=None, min_length=1)
     processing_context: ProcessingContextInput
     chunks: list[RetrievalChunk]
 

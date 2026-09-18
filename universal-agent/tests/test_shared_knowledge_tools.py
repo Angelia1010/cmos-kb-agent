@@ -45,10 +45,7 @@ from kbagent.shared.tools import (  # noqa: E402
     filter_knowledge_candidates,
 )
 from kbagent.shared.workspace import RunWorkspace, set_workspace  # noqa: E402
-from tests.processing_mock_data import (  # noqa: E402
-    build_source_chunks,
-    make_top100_candidates,
-)
+from tests.processing_mock_data import bind_candidate_chunks, make_top100_candidates  # noqa: E402
 from uniagent.agents.factory import create_agent  # noqa: E402
 from uniagent.config.app_config import AppConfig  # noqa: E402
 from uniagent.tools.registry import get_available_tools  # noqa: E402
@@ -507,6 +504,7 @@ class TestSharedKnowledgeTools(unittest.TestCase):
     def test_public_tools_match_fixed_processing_orchestrator_artifacts(self):
         raw = make_top100_candidates()
         original = copy.deepcopy(raw)
+        candidates, chunks = bind_candidate_chunks(raw)
         context = {
             "region_id": "0755",
             "region_name": "深圳",
@@ -525,10 +523,10 @@ class TestSharedKnowledgeTools(unittest.TestCase):
 
         ws = RunWorkspace(query="5G流量套餐")
         ws.data.update({
+            "chunks": chunks,
             "processing_context": copy.deepcopy(context),
             "retrieval_query": "5G 流量套餐",
-            "chunks": build_source_chunks(raw),
-            "knowledge_candidates": raw,
+            "knowledge_candidates": candidates,
         })
         set_workspace(ws)
         top3 = asyncio.run(KnowledgeProcessingOrchestrator(ScriptedChatModel()).run())
