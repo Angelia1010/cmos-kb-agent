@@ -134,8 +134,14 @@ def query_rewrite(last_query: str = "",
         logger.info("[TOOL_RETURN] query_rewrite 返回: error=workspace 未注入 model")
         return _obs(error="workspace 未注入 model,无法执行 query_rewrite")
     last_query = last_query or str(ws.data.get("original_query", ""))
-    last_keywords = last_keywords or ", ".join(
-        ws.data.get("keywords", []) or [])
+    # 原 last_keywords 直接读 ws.data["keywords"],上一步改为 history 累积后该键已不存在,
+    # 改为从 keywords_history 末尾取上一轮关键词,空时回退兼容旧键
+    # last_keywords = last_keywords or ", ".join(
+    #     ws.data.get("keywords", []) or [])
+    if not last_keywords:
+        kw_hist = ws.data.get("keywords_history") or []
+        last_kw_list = kw_hist[-1] if kw_hist else (ws.data.get("keywords", []) or [])
+        last_keywords = ", ".join(last_kw_list)
     if not last_recall_summary:
         prev_chunks = ws.data.get("chunks", []) or []
         if prev_chunks:
@@ -245,8 +251,10 @@ def intergrate_all(query: str = "", region_code: str = "000",
     ws.data["chunks"] = chunks
     ws.data["original_query"] = query
     ws.data["region_code"] = region_code
-    ws.data["keywords"] = list((kresult.get("keywords") if isinstance(kresult, dict) else []) or [])
-    ws.data["ranked_kids"] = sorted_kids
+    # ws.data["keywords"] = list((kresult.get("keywords") if isinstance(kresult, dict) else []) or [])
+    # ws.data["ranked_kids"] = sorted_kids
+    ws.data.setdefault("keywords_history", []).append(list((kresult.get("keywords") if isinstance(kresult, dict) else []) or []))
+    ws.data.setdefault("ranked_kids_history", []).append(sorted_kids)
     rnd = ws.data.get("recall_round", 0) + 1
     ws.data["recall_round"] = rnd
     ws.tracer.log(f"{ws.stage}.round{rnd}", "recall",

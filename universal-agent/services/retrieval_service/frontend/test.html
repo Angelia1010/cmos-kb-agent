@@ -11,87 +11,84 @@
     background: #f5f6f8; color: #1f2329; font-size: 14px; line-height: 1.5;
   }
   h1 { margin: 0 0 12px; font-size: 18px; }
-  .nav { margin-bottom: 12px; }
-  .nav a { color: #165dff; text-decoration: none; font-size: 13px; margin-right: 12px; }
-  .nav a:hover { text-decoration: underline; }
   .card {
     background: #fff; border: 1px solid #e5e6eb; border-radius: 6px;
     padding: 14px 16px; margin-bottom: 14px;
   }
   .card h2 { margin: 0 0 10px; font-size: 14px; color: #4e5969; font-weight: 600; }
   .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
-  .form-row .field { display: flex; flex-direction: column; gap: 4px; }
-  .form-row .field .lbl { color: #4e5969; font-size: 13px; }
-  .form-row .field.mode { flex: 1; min-width: 180px; }
-  .form-row .field.vmode { flex: 1; min-width: 160px; }
-  .form-row .field.region { flex: 1; min-width: 140px; }
-  .form-row .field.action { flex: 0 0 auto; }
-  select {
-    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
-    font-family: inherit; font-size: 13px; background: #fff;
-  }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field .lbl { color: #4e5969; font-size: 13px; }
   input[type=text] {
-    width: 100%; padding: 6px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
+    width: 110px; padding: 7px 8px; border: 1px solid #c9cdd4; border-radius: 4px;
     font-family: inherit; font-size: 13px; background: #fff;
   }
   button {
     background: #165dff; color: #fff; border: none; border-radius: 4px;
-    padding: 8px 16px; cursor: pointer; font-size: 13px;
+    padding: 8px 18px; cursor: pointer; font-size: 13px;
   }
   button:hover { background: #0e42d2; }
   button:disabled { background: #94bfff; cursor: not-allowed; }
   .row { display: flex; gap: 8px; align-items: center; }
-  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 12px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 12px; white-space: nowrap; }
   .badge.ok { background: #e8ffea; color: #00b42a; }
   .badge.err { background: #ffece8; color: #f53f3f; }
-  .hint { color: #86909c; font-size: 12px; margin-top: 4px; }
-  .empty { color: #86909c; text-align: center; padding: 20px; }
-  details summary { cursor: pointer; color: #4e5969; margin: 6px 0; }
+  .hint { color: #86909c; font-size: 12px; }
+  .empty { color: #86909c; text-align: center; padding: 24px; }
+  /* ── 汇总统计 ── */
+  .summary-bar { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  .progress-track { flex:1; min-width:160px; background:#f2f3f5; border-radius:4px; height:18px; overflow:hidden; }
+  .progress-fill { height:100%; background:#165dff; transition:width .2s; width:0; }
+  .stat { font-size:13px; color:#4e5969; white-space:nowrap; }
+  .stat b { color:#165dff; }
+  /* ── 单条结果卡片 ── */
+  .item-card { border:1px solid #e5e6eb; border-radius:6px; padding:10px 12px; margin-bottom:10px; background:#fff; }
+  .item-card.hit { border-color:#b7eb8f; background:#f6ffed; }
+  .item-header { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:8px; font-size:13px; }
+  .item-header .q { font-weight:600; }
+  .round-block { border-left:3px solid #165dff; padding:6px 0 6px 10px; margin:6px 0; background:#fafbfc; border-radius:0 4px 4px 0; }
+  .round-block.rewrite { border-left-color:#ff7d00; }
+  .round-label { color:#165dff; font-weight:600; font-size:12px; margin-bottom:4px; }
+  .round-block.rewrite .round-label { color:#ff7d00; }
+  .round-section { margin:4px 0; display:flex; align-items:center; flex-wrap:wrap; gap:4px; }
+  .section-label { color:#4e5969; font-size:12px; min-width:90px; }
+  .chip { display:inline-block; padding:2px 8px; border-radius:10px; background:#e8f3ff; color:#165dff; font-size:12px; }
+  .chip-new { background:#fff3e0; color:#ff7d00; border:1px dashed #ffb877; }
+  .kid { display:inline-block; padding:2px 6px; border-radius:3px; background:#f7f8fa; color:#4e5969; font-size:12px; font-family:Consolas,Monaco,monospace; }
+  .kid-new { background:#fff3e0; color:#ff7d00; }
+  .kid-hit { background:#e8ffea; color:#00b42a; font-weight:600; }
+  .kid-expected-hit { background:#e8ffea; color:#00b42a; font-weight:600; }
+  .kid-expected-miss { background:#ffece8; color:#f53f3f; text-decoration:line-through; }
 </style>
 </head>
 <body>
-<div class="nav">
-  <a href="/test">召回率测试</a>
-</div>
 <h1>召回率测试</h1>
+
 <div class="card">
   <h2>测试参数</h2>
   <div class="form-row">
-    <div class="field mode">
-      <span class="lbl">mode(召回路径)</span>
-      <select id="mode">
-        <option value="keyword">keyword — 关键词召回</option>
-        <option value="vector">vector — 纯向量召回</option>
-        <option value="integrate" selected>integrate — 双路去重</option>
-      </select>
+    <div class="field">
+      <span class="lbl">count(条目数,0=测试集全部)</span>
+      <input type="text" id="count" value="10" />
     </div>
-    <div class="field vmode" id="vmodeField">
-      <span class="lbl">vector_mode(向量模板)</span>
-      <select id="vector_mode">
-        <option value="new">new — 新模板</option>
-        <option value="old">old — 旧模板</option>
-        <option value="both">both — 双模板混合</option>
-      </select>
-    </div>
-    <div class="field region">
-      <span class="lbl">全国召回</span>
-      <div class="row" style="gap:4px">
-        <button type="button" id="regionToggle" style="padding:6px 12px">✓ 使用全国(000)</button>
-      </div>
-    </div>
-    <div class="field action">
+    <div class="field">
       <span class="lbl">&nbsp;</span>
-      <div class="row">
-        <button id="startTest">开始测试</button>
-        <span id="status" class="hint"></span>
-      </div>
+      <button id="startTest">开始测试</button>
     </div>
+    <span id="status" class="hint"></span>
   </div>
-  <div class="hint" style="margin-top:10px">请求路径:GET <span id="basePath"></span>/test-recall/stream</div>
+  <div class="hint" style="margin-top:10px">POST <span id="basePath"></span>/retrieve/batch/stream(NDJSON 流;query/region 由后端按测试集自动提取,固定 integrate+both)</div>
 </div>
+
 <div class="card">
   <h2>测试结果</h2>
-  <div id="result"><div class="empty">尚未开始测试</div></div>
+  <div id="summary" class="summary-bar" style="display:none">
+    <div class="progress-track"><div id="progressFill" class="progress-fill"></div></div>
+    <span class="stat">进度 <b id="stDone">0</b>/<b id="stTotal">0</b></span>
+    <span class="stat">命中 <b id="stHit">0</b></span>
+    <span class="stat">召回率 <b id="stRate">0.0%</b></span>
+  </div>
+  <div id="result" style="margin-top:12px"><div class="empty">尚未开始测试</div></div>
 </div>
 
 <script>
@@ -100,145 +97,200 @@ document.getElementById("basePath").textContent = BASE;
 
 var startBtn = document.getElementById("startTest");
 var statusEl = document.getElementById("status");
-var ev = null;
-var useNational = true;
+var countInput = document.getElementById("count");
+var resultEl = document.getElementById("result");
+var summaryEl = document.getElementById("summary");
+var abortCtrl = null;
 
-var modeSel = document.getElementById("mode");
-var vmodeField = document.getElementById("vmodeField");
-var regionToggle = document.getElementById("regionToggle");
+startBtn.addEventListener("click", async function() {
+  var raw = parseInt(countInput.value, 10);
+  var count = isNaN(raw) ? 10 : raw;
 
-function toggleVmodeVisibility() {
-  vmodeField.style.display = modeSel.value === "keyword" ? "none" : "";
-}
-modeSel.addEventListener("change", toggleVmodeVisibility);
-toggleVmodeVisibility();
-
-regionToggle.addEventListener("click", function() {
-  useNational = !useNational;
-  if (useNational) {
-    regionToggle.textContent = "✓ 使用全国(000)";
-    regionToggle.style.background = "#165dff";
-    regionToggle.style.color = "#fff";
-  } else {
-    regionToggle.textContent = "✗ 禁用全国(用测试集省份)";
-    regionToggle.style.background = "#ffece8";
-    regionToggle.style.color = "#f53f3f";
-  }
-});
-regionToggle.click();
-
-startBtn.addEventListener("click", function() {
-  var mode = document.getElementById("mode").value;
-  var vector_mode = document.getElementById("vector_mode").value;
-  var region_code = useNational ? "000" : "__province__";
   startBtn.disabled = true;
   statusEl.textContent = "测试中...";
-  document.getElementById("result").innerHTML = '<div class="empty">启动测试...</div>';
+  summaryEl.style.display = "none";
+  resultEl.innerHTML = '<div class="empty">启动测试...</div>';
 
-  if (ev) ev.close();
-  var url = BASE + "/test-recall/stream?mode=" + encodeURIComponent(mode)
-           + "&region_code=" + encodeURIComponent(region_code);
-  if (mode !== "keyword") {
-    url += "&vector_mode=" + encodeURIComponent(vector_mode);
-  }
-  ev = new EventSource(url);
   var details = [];
-  var total = 0, hit = 0, rate = 0;
+  var total = 0, hitCount = 0;
 
-  ev.addEventListener("start", function(e) {
-    var d = JSON.parse(e.data);
-    total = d.total;
-    document.getElementById("result").innerHTML = renderTestProgress(0, total, 0, 0, mode, vector_mode, []);
-  });
+  if (abortCtrl) { try { abortCtrl.abort(); } catch(_) {} }
+  abortCtrl = new AbortController();
 
-  ev.addEventListener("progress", function(e) {
-    var d = JSON.parse(e.data);
-    total = d.total; hit = d.hit; rate = d.rate;
-    if (d.detail) details.push(d.detail);
-    document.getElementById("result").innerHTML =
-      renderTestProgress(d.done, total, hit, rate, mode, vector_mode, details);
-  });
-
-  ev.addEventListener("done", function(e) {
-    var d = JSON.parse(e.data);
-    statusEl.textContent = "完成: " + d.hit + "/" + d.total + " · 召回率 " + (d.rate * 100).toFixed(1) + "%";
-    document.getElementById("result").innerHTML =
-      renderTestProgress(d.total, d.total, d.hit, d.rate, mode, vector_mode, d.details || details);
-    ev.close();
-    ev = null;
-    startBtn.disabled = false;
-  });
-
-  ev.onerror = function() {
-    statusEl.textContent = "测试连接中断";
-    if (ev) { ev.close(); ev = null; }
-    startBtn.disabled = false;
-  };
-});
-
-function escapeHtml(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
-
-function renderTestProgress(done, total, hit, rate, mode, vector_mode, details) {
-  var pct = total ? Math.round(done / total * 100) : 0;
-  var html = '<div class="card" style="margin-bottom:10px;padding:10px 14px">';
-  html += '<h2>召回率测试 · mode=' + escapeHtml(mode) + ' · vector_mode=' + escapeHtml(vector_mode) + '</h2>';
-  html += '<div style="background:#f7f8fa;border-radius:4px;overflow:hidden;height:20px;margin:8px 0">';
-  html += '<div style="width:' + pct + '%;height:100%;background:#165dff;transition:width .2s"></div></div>';
-  html += '<div class="row" style="justify-content:space-between">';
-  html += '<span class="hint">进度 ' + done + '/' + total + ' (' + pct + '%)</span>';
-  html += '<span class="hint">命中 ' + hit + '</span>';
-  html += '<span class="hint">召回率 <b style="color:#165dff">' + (rate * 100).toFixed(1) + '%</b></span>';
-  html += '</div></div>';
-
-  if (details.length) {
-    var hitDetails = details.filter(function(d) { return d.hit; });
-    if (hitDetails.length) {
-      html += '<details open style="margin-top:10px"><summary>命中列表(' + hitDetails.length + ')</summary>';
-      html += '<div style="max-height:300px;overflow:auto;border:1px solid #e8ffea;border-radius:4px">';
-      html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
-      html += '<tr style="background:#f0fff0;position:sticky;top:0">'
-           + '<th style="padding:6px;text-align:left">#</th>'
-           + '<th style="padding:6px;text-align:left">用户问</th>'
-           + '<th style="padding:6px;text-align:left">命中kid</th>'
-           + '</tr>';
-      hitDetails.forEach(function(d) {
-        var expectedHit = (d.actual || []).filter(function(x){ return (d.expected || []).indexOf(x) >= 0; });
-        html += '<tr style="border-top:1px solid #e8ffea">'
-              + '<td style="padding:6px;color:#00b42a;font-weight:600">#' + (d.index || '-') + '</td>'
-              + '<td style="padding:6px">' + escapeHtml(d.user_query || '') + '</td>'
-              + '<td style="padding:6px"><span style="color:#00b42a;font-weight:600">' + escapeHtml(expectedHit.join('、')) + '</span></td>'
-              + '</tr>';
-      });
-      html += '</table></div></details>';
+  try {
+    var resp = await fetch(BASE + "/retrieve/batch/stream", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ count: count }),
+      signal: abortCtrl.signal
+    });
+    if (!resp.ok || !resp.body || !resp.body.getReader) {
+      var errText = await resp.text().catch(function() { return ""; });
+      throw new Error("HTTP " + resp.status + " " + errText.slice(0, 300));
     }
 
-    html += '<details open style="margin-top:8px"><summary>全部明细(' + details.length + ')</summary>';
-    html += '<div style="max-height:400px;overflow:auto;border:1px solid #e5e6eb;border-radius:4px">';
-    html += '<table style="width:100%;border-collapse:collapse;font-size:12px">';
-    html += '<tr style="background:#f7f8fa;position:sticky;top:0">'
-         + '<th style="padding:6px;text-align:left">#</th>'
-         + '<th style="padding:6px;text-align:left">用户问</th>'
-         + '<th style="padding:6px;text-align:left">省份</th>'
-         + '<th style="padding:6px;text-align:center">命中</th>'
-         + '<th style="padding:6px;text-align:left">期望ID</th>'
-         + '<th style="padding:6px;text-align:left">实际命中ID</th>'
-         + '</tr>';
-    details.forEach(function(d) {
-      var hitMark = d.hit ? '<span class="badge ok">✓</span>' : '<span class="badge err">✗</span>';
-      var expectedHit = (d.actual || []).filter(function(x){ return (d.expected || []).indexOf(x) >= 0; });
-      html += '<tr style="border-top:1px solid #e5e6eb">'
-            + '<td style="padding:6px">' + (d.index || '-') + '</td>'
-            + '<td style="padding:6px">' + escapeHtml(d.user_query || '') + '</td>'
-            + '<td style="padding:6px">' + escapeHtml(d.province || '') + '</td>'
-            + '<td style="padding:6px;text-align:center">' + hitMark + '</td>'
-            + '<td style="padding:6px;color:#86909c">' + escapeHtml((d.expected || []).join(', ')) + '</td>'
-            + '<td style="padding:6px;color:#00b42a">' + escapeHtml(expectedHit.join(', ')) + '</td>'
-            + '</tr>';
-    });
-    html += '</table></div></details>';
+    var reader = resp.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = "";
+
+    while (true) {
+      var chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      var lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line) continue;
+        var d;
+        try { d = JSON.parse(line); }
+        catch (e) { continue; }
+        // 后端错误信封(如测试集为空)非 NDJSON 流,直接提示
+        if (d.rtnCode && d.rtnCode !== "0") {
+          throw new Error(d.rtnMsg || ("rtnCode=" + d.rtnCode));
+        }
+        if (d.type === "start") {
+          // start 行结构: {"type":"start","total":N,"request_id":"..."}
+          total = d.total;
+          updateSummary(0, total, 0);
+          summaryEl.style.display = "flex";
+        } else if (d.type === "item") {
+          details.push(d.data);
+          hitCount = details.filter(function(x) { return x.hit; }).length;
+          updateSummary(details.length, total, hitCount);
+          renderItems(details);
+        } else if (d.type === "summary") {
+          hitCount = d.data.hit_count;
+          updateSummary(details.length, total, hitCount);
+          renderItems(details);
+        }
+      }
+    }
+    if (total === 0) {
+      statusEl.textContent = "完成: 0/0";
+    } else {
+      statusEl.textContent = "完成: " + hitCount + "/" + total
+        + " · 召回率 " + (total ? (hitCount / total * 100).toFixed(1) : "0.0") + "%";
+    }
+  } catch (e) {
+    statusEl.textContent = e.name === "AbortError" ? "已取消" : ("测试失败: " + (e.message || e));
+    if (details.length) renderItems(details);
+  } finally {
+    startBtn.disabled = false;
+    abortCtrl = null;
   }
+});
+
+function updateSummary(done, total, hit) {
+  var rate = total ? (hit / total * 100) : 0;
+  document.getElementById("progressFill").style.width = (total ? Math.round(done / total * 100) : 0) + "%";
+  document.getElementById("stDone").textContent = done;
+  document.getElementById("stTotal").textContent = total;
+  document.getElementById("stHit").textContent = hit;
+  document.getElementById("stRate").textContent = rate.toFixed(1) + "%";
+}
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderItems(details) {
+  if (!details.length) {
+    resultEl.innerHTML = '<div class="empty">无结果</div>';
+    return;
+  }
+  var html = "";
+  details.forEach(function(d) { html += renderItemCard(d); });
+  resultEl.innerHTML = html;
+}
+
+function renderItemCard(d) {
+  var expected = d.expected_kids || [];
+  var recalled = d.recalled_kids || [];
+  var kwHistory = d.keywords_history || [];
+  var kidHistory = d.ranked_kids_history || [];
+
+  var html = '<div class="item-card ' + (d.hit ? "hit" : "") + '">';
+  html += '<div class="item-header">';
+  html += '<span class="badge ' + (d.hit ? 'ok' : 'err') + '">' + (d.hit ? '命中' : '未命中') + '</span>';
+  html += '<span style="color:#86909c">#' + (d.index != null ? d.index : '-') + '</span>';
+  html += '<span class="q">' + escapeHtml(d.user_query || '') + '</span>';
+  html += '<span style="color:#86909c">[' + escapeHtml(d.region_code || '') + ']</span>';
+  html += '<span style="color:#86909c">' + escapeHtml(d.outcome || '') + '</span>';
+  html += '<span style="color:#86909c">' + (d.recalled_count || 0) + '片段</span>';
+  html += '<span style="color:#86909c">' + (d.elapsed_ms || 0) + 'ms</span>';
+  html += '</div>';
+
+  // 期望 kid:末轮召回到的标绿,未召回到的标红删除线
+  html += '<div class="round-section">';
+  html += '<span class="section-label">期望kid(' + expected.length + '):</span>';
+  if (!expected.length) {
+    html += '<span class="hint">(无标注)</span>';
+  } else {
+    expected.forEach(function(k) {
+      var isHit = recalled.indexOf(k) >= 0;
+      html += '<span class="kid ' + (isHit ? 'kid-expected-hit' : 'kid-expected-miss') + '">' + escapeHtml(k) + '</span>';
+    });
+  }
+  html += '</div>';
+
+  // 每轮关键词与 kid(与上一轮对比,新增项标橙;命中期望 kid 标绿)
+  var maxRounds = Math.max(kwHistory.length, kidHistory.length);
+  if (maxRounds === 0) {
+    html += '<div class="hint" style="margin:6px 0">(无分轮检索历史)</div>';
+  } else {
+    for (var r = 0; r < maxRounds; r++) {
+      var kws = kwHistory[r] || [];
+      var kids = kidHistory[r] || [];
+      var prevKwSet = {};
+      var prevKidSet = {};
+      if (r > 0) {
+        (kwHistory[r - 1] || []).forEach(function(k) { prevKwSet[k] = true; });
+        (kidHistory[r - 1] || []).forEach(function(k) { prevKidSet[k] = true; });
+      }
+
+      html += '<div class="round-block' + (r > 0 ? ' rewrite' : '') + '">';
+      html += '<div class="round-label">第' + (r + 1) + '轮 '
+           + (r === 0 ? '(原始查询 intergrate_all)' : '(query_rewrite 改写后 intergrate_all)')
+           + '</div>';
+
+      html += '<div class="round-section">';
+      html += '<span class="section-label">关键词(' + kws.length + '):</span>';
+      if (!kws.length) {
+        html += '<span class="hint">(空)</span>';
+      } else {
+        kws.forEach(function(k) {
+          var isNew = r > 0 && !prevKwSet[k];
+          html += '<span class="chip ' + (isNew ? 'chip-new' : '') + '"'
+               + (isNew ? ' title="本轮新增/改写关键词"' : '') + '>'
+               + escapeHtml(k) + '</span>';
+        });
+      }
+      html += '</div>';
+
+      html += '<div class="round-section">';
+      html += '<span class="section-label">kid(' + kids.length + '):</span>';
+      if (!kids.length) {
+        html += '<span class="hint">(空)</span>';
+      } else {
+        kids.forEach(function(k) {
+          var isNew = r > 0 && !prevKidSet[k];
+          var isExpHit = expected.indexOf(k) >= 0;
+          var cls = "kid";
+          if (isExpHit) cls += " kid-hit";
+          else if (isNew) cls += " kid-new";
+          var title = isExpHit ? "命中期望kid" : (isNew ? "本轮新增kid" : "");
+          html += '<span class="' + cls + '"' + (title ? ' title="' + title + '"' : '') + '>'
+               + escapeHtml(k) + '</span>';
+        });
+      }
+      html += '</div>';
+
+      html += '</div>';
+    }
+  }
+
+  html += '</div>';
   return html;
 }
 </script>

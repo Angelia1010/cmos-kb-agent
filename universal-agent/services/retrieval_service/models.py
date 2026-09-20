@@ -141,6 +141,8 @@ class RetrievalResponseObject(BaseModel):
     keywords:关键词召回为 LLM 提取结果。
     # rewritten_queries:query_rewrite 工具产出的改写查询列表。
     rewritten_keywords:query_rewrite 工具产出的改写关键词列表。
+    keywords_history/ranked_kids_history:每轮 intergrate_all 累积的关键词与 kid 排序列表,
+    按轮次顺序追加而非覆盖,便于前端展示每轮重写关键词与对应 kid 差异。
     degraded:true 时表示未经主路径召回(走兜底降级),请人工核实。
     """
     request_id: str = Field(description="回传请求ID(优先取 X-Request-ID 头,缺省服务端生成)")
@@ -151,10 +153,16 @@ class RetrievalResponseObject(BaseModel):
     recalled_count: int = Field(description="召回片段数")
     elapsed_ms: int = Field(description="端到端耗时(毫秒)")
     region_code: str = Field(description="本次检索使用的区域编码")
-    keywords: list[str] = Field(default_factory=list, description="检索关键词(LLM 提取结果)")
+    keywords: list[str] = Field(default_factory=list, description="检索关键词(末轮 LLM 提取结果)")
     # rewritten_queries: list[str] = Field(default_factory=list, description="query_rewrite 产出的改写查询列表")
     rewritten_keywords: list[str] = Field(default_factory=list, description="query_rewrite 产出的改写关键词列表")
-    kids: list[str] = Field(default_factory=list, description="召回的知识ID(kid)列表,按得分降序排列")
+    kids: list[str] = Field(default_factory=list, description="召回的知识ID(kid)列表,末轮按得分降序排列")
+    keywords_history: list[list[str]] = Field(
+        default_factory=list,
+        description="每轮 intergrate_all 提取的关键词列表(按轮次顺序累积)")
+    ranked_kids_history: list[list[str]] = Field(
+        default_factory=list,
+        description="每轮 intergrate_all 召回的 kid 列表(按轮次顺序累积,内部已按得分降序)")
     chunks: list[RetrievalChunk] = Field(description="召回片段列表")
     example: dict[str, Any] = Field(default_factory=dict, description="检索各阶段示例数据(info_resp/atom_resp原始响应、parsed解析结果、infos/atoms条目列表)")
 
@@ -190,12 +198,18 @@ class BatchRetrievalItem(BaseModel):
         description="测试集标注的期望知识ID列表(knowledge_ids)")
     recalled_kids: list[str] = Field(
         default_factory=list,
-        description="后端实际召回的kid列表(ranked_kids,按得分降序)")
+        description="后端实际召回的kid列表(末轮 ranked_kids,按得分降序)")
     hit: bool = Field(
         description="是否命中(recalled_kids 至少包含一个 expected_kid)")
     hit_kids: list[str] = Field(
         default_factory=list,
         description="命中的 expected_kid 子集(便于前端高亮)")
+    keywords_history: list[list[str]] = Field(
+        default_factory=list,
+        description="每轮 intergrate_all 提取的关键词列表(按轮次顺序累积)")
+    ranked_kids_history: list[list[str]] = Field(
+        default_factory=list,
+        description="每轮 intergrate_all 召回的 kid 列表(按轮次顺序累积)")
     outcome: str = Field(description="单条检索结果状态(success/no_results/degraded/error)")
     elapsed_ms: int = Field(description="单条检索耗时(毫秒)")
     recalled_count: int = Field(description="召回片段数")

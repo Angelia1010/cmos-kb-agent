@@ -105,6 +105,18 @@ async def run_retrieval_request(
         # rewritten_queries: list[str] = list(ws.data.get("rewritten_queries") or [])
         rewritten_keywords: list[str] = list(ws.data.get("rewritten_keywords") or [])
         kids: list[str] = list(ws.data.get("ranked_kids") or [])
+        # 新增:每轮 intergrate_all 累积的关键词与 kid 历史,供前端按轮次展示差异
+        keywords_history: list[list[str]] = [
+            list(k) for k in (ws.data.get("keywords_history") or [])
+        ]
+        ranked_kids_history: list[list[str]] = [
+            list(k) for k in (ws.data.get("ranked_kids_history") or [])
+        ]
+        # 末轮 keywords/kids 兼容字段:从 history 末尾取,空时回退到原键(单路直调场景)
+        if keywords_history:
+            keywords = list(keywords_history[-1])
+        if ranked_kids_history:
+            kids = list(ranked_kids_history[-1])
 
     chunk_rows = [_chunk_row(c) for c in chunks]
     if not chunk_rows:
@@ -126,6 +138,8 @@ async def run_retrieval_request(
         # rewritten_queries=rewritten_queries,
         rewritten_keywords=rewritten_keywords,
         kids=kids,
+        keywords_history=keywords_history,
+        ranked_kids_history=ranked_kids_history,
         chunks=chunk_rows,
     )
 

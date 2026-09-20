@@ -90,7 +90,12 @@ class RetrievalSubAgent:
         # for c in chunks:
         #     if c.doc_id and c.doc_id != "unknown" and c.doc_id not in retrieved_kids:
         #         retrieved_kids.append(c.doc_id)
-        retrieved_kids: List[str] = list(ws.data.get("ranked_kids") or [])
+        # 原 retrieved_kids 直接读 ws.data["ranked_kids"],上一步改为 history 累积后该键已不存在,
+        # 改为从 ranked_kids_history 末尾取最后一轮的 kid 列表,空时回退兼容旧键
+        # retrieved_kids: List[str] = list(ws.data.get("ranked_kids") or [])
+        rk_hist = ws.data.get("ranked_kids_history") or []
+        retrieved_kids: List[str] = list(
+            rk_hist[-1] if rk_hist else (ws.data.get("ranked_kids") or []))
         expected_set = set(EXPECTED_KIDS)
         hit_kids = [k for k in retrieved_kids if k in expected_set]
         missed_kids = [k for k in EXPECTED_KIDS if k not in set(retrieved_kids)]
