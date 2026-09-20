@@ -31,6 +31,7 @@ RETRIEVAL_SYSTEM_PROMPT = """[ROLE:retrieval_subagent]
        第2步:当验证器反馈首轮召回不满足条件时,调用 query_rewrite 工具重写上一轮关键词,工具返回后本轮结束。
        第3步:使用 query_rewrite 返回的改写关键词作为 keywords 参数,调用 intergrate_all 工具再次召回知识片段,工具返回后本轮结束。
     5. 重试受 GoalLoop 预算约束,达到上限即返回当前最佳结果。
+    6. 严禁使用相同参数重复调用 intergrate_all(同参数重复调用只会命中缓存,不会产生任何新结果);工具返回后立即结束本轮,等待验证器反馈后再决定是否改写关键词重召。
 
 # 输入
 

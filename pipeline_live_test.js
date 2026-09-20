@@ -198,6 +198,21 @@ const segOrder = ['第 <b>1</b> 轮召回', '第 1 轮验证:⚠ 未通过', '�
   .map(s => st[2].seg.indexOf(s));
 expect(segOrder.every((x, i) => x >= 0 && (i === 0 || x > segOrder[i - 1])), 'N2 chips 按召回→验证→改写时间序排列');
 
+// ── N3. 同参数重复召回去重:recall_cached → 缓存复用 chip ──
+api.renderPipeline([
+  ev('run', 'start', { query: '销户怎么办理', region_code: '福建' }),
+  ev('cache', 'miss', {}),
+  ev('retrieval.round1', 'recall', { channel: 'intergrate_all', region_code: '福建', keywords: ['销户'], keyword_count: 88, vector_count: 110, merged_count: 178, titles: ['销户办理指南'], scores: [9] }),
+  ev('retrieval.round1', 'recall_cached', { channel: 'intergrate_all', region_code: '福建', keywords: ['销户'], recalled: 178 }),
+  ev('retrieval.verify', 'done', { round: 1, status: 'passed', reason_codes: [], evidence_count: 1, summary: '可回答', top_titles: ['销户办理指南'] }),
+  ev('retrieval', 'loop_result', { success: true, iterations: 1, reason: '目标验证通过' })
+], null, { live: true });
+st = segs();
+expect(st[2].seg.includes('重复调用(同参数)') && st[2].seg.includes('复用缓存结果'), 'N3 同参数重复调用 → 缓存 chip');
+expect(st[2].seg.includes('命中请求级缓存,复用上次 178 条结果'), 'N3 缓存明细含复用条数');
+expect(st[2].seg.includes('第 1 轮验证:✓ 通过') && st[2].seg.includes('共 <b>1</b> 轮'), 'N3 单轮验证通过 + 循环汇总');
+expect(st[2].seg.includes('《销户办理指南》'), 'N3 被验证 Top3 标题');
+
 // ── O. doQuery 流式全流程:主区占位切换 + 右侧栏链路点亮 + final 渲染 ──
 // 用假 fetch 返回一段 SSE 流,验证 welcome→searching→results 的显隐编排
 const doQueryTest = (function testDoQueryStream() {

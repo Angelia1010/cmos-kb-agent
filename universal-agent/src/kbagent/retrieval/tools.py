@@ -184,6 +184,25 @@ def intergrate_all(query: str = "", region_code: str = "000",
         keywords = []
     ws = get_workspace()
     query = query or ws.query
+
+    # 请求级同参数去重:LLM 在同一迭代里用相同参数重复调用 intergrate_all 时
+    # (实测会发生),直接复用上次成功结果 — 不再打 ES、不推进召回轮次,
+    # trace 记一条 recall_cached 供前端展示。零召回/报错不缓存,
+    # 给瞬时故障留重试机会。
+    cache_key = json.dumps(
+        [query, region_code, vector_mode, list(keywords or [])],
+        ensure_ascii=False, default=str)
+    recall_cache: Dict[str, Any] = ws.data.setdefault("recall_cache", {})
+    hit = recall_cache.get(cache_key)
+    if hit is not None:
+        rnd = ws.data.get("recall_round", 0)
+        ws.tracer.log(f"retrieval.round{rnd}", "recall_cached",
+                      channel="intergrate_all", region_code=region_code,
+                      keywords=list(keywords or []), recalled=hit["recalled"])
+        logger.info("[TOOL_RETURN] intergrate_all 同参数重复调用,返回缓存: recalled=%d",
+                    hit["recalled"])
+        return hit["obs"]
+
     keyword_search = getattr(ws.es, "keyword_search", None)
     vector_search = getattr(ws.es, "vector_search", None)
 
@@ -273,10 +292,12 @@ def intergrate_all(query: str = "", region_code: str = "000",
         errors = [e for e in (kerror, verror) if e]
         logger.info("[TOOL_RETURN] intergrate_all 返回: 零召回 errors=%s", errors)
         return _obs(error="keyword+vector 双路零召回" + (f"(原因: {'; '.join(errors)})" if errors else ""))
+    obs = _obs(recalled=len(chunks), titles=[c.doc_title for c in chunks],
+               scores=[c.score for c in chunks])
+    recall_cache[cache_key] = {"obs": obs, "recalled": len(chunks)}
     logger.info("[TOOL_RETURN] intergrate_all 返回: recalled=%d titles=%s",
                 len(chunks), [c.doc_title for c in chunks])
-    return _obs(recalled=len(chunks), titles=[c.doc_title for c in chunks],
-                scores=[c.score for c in chunks])
+    return obs
 
 @tool
 def vector_recall(query: str = "", region_code: str = "000", vector_mode: str = "both") -> str:

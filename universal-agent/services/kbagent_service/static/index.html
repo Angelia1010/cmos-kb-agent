@@ -1100,6 +1100,9 @@ function buildPipelineModel(events) {
       };
       m.rounds.push(rd);
       m.retrievalSeq.push({ type: "recall", round: rm[1], data: rd });
+    } else if (rm && ev === "recall_cached") {
+      m.retrievalSeq.push({ type: "cached", round: rm[1],
+        data: { recalled: p.recalled, keywords: p.keywords || [] } });
     } else if (rm && ev === "query_rewrite") {
       var rw = {
         round: rm[1],
@@ -1283,6 +1286,14 @@ function renderPipeline(events, obj, opts) {
       if (r.dsl)
         rDetail += '<div class="sub-title">召回 DSL(第 ' + esc(rnd) + ' 轮):</div>' +
           '<div class="row-line">' + esc(JSON.stringify(r.dsl)).slice(0, 500) + "</div>";
+    } else if (item.type === "cached") {
+      rChips.push(chip("warn", "第 " + esc(rnd) +
+        " 轮重复调用(同参数)→ 直接复用缓存结果,未再请求检索后端"));
+      rDetail += '<div class="sub-title">第 ' + esc(rnd) +
+        " 轮 · 同参数重复调用去重:</div>" +
+        '<div class="row-line">LLM 用相同参数再次调用召回工具,命中请求级缓存,复用上次 ' +
+        esc(item.data.recalled != null ? item.data.recalled : "?") +
+        ' 条结果(零额外耗时)</div>';
     } else if (item.type === "rewrite") {
       var w = item.data;
       rChips.push(chip("warn", "第 " + esc(rnd) + " 轮后查询改写 → " +

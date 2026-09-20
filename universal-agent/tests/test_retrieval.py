@@ -259,10 +259,53 @@ class TestRetrievalTools(unittest.TestCase):
         self.assertEqual([], ws.data["chunks"])
 
     def test_intergrate_all_round_counter_increments(self):
+        """不同参数推进轮次;同参数重复调用命中缓存不推进。"""
         from kbagent.retrieval.tools import intergrate_all
         intergrate_all.func(query="流量套餐")
-        intergrate_all.func(query="流量套餐")
+        intergrate_all.func(query="流量套餐", keywords=["宽带"])
         self.assertEqual(2, self.ws.data["recall_round"])
+
+    def test_intergrate_all_same_params_deduped(self):
+        """同参数重复调用:返回相同观测、ES 不再被调、trace 记 recall_cached。"""
+        from kbagent.retrieval.tools import intergrate_all
+        calls = {"n": 0}
+        orig = self.ws.es.keyword_search
+
+        def counting(*a, **k):
+            calls["n"] += 1
+            return orig(*a, **k)
+
+        self.ws.es.keyword_search = counting
+        first = intergrate_all.func(query="流量套餐")
+        second = intergrate_all.func(query="流量套餐")
+        self.assertEqual(first, second)
+        self.assertEqual(1, calls["n"], "同参数第二次调用不应再打 ES")
+        self.assertEqual(1, self.ws.data["recall_round"], "缓存命中不推进轮次")
+        events = [(e.stage, e.event) for e in self.ws.tracer.events]
+        self.assertIn(("retrieval.round1", "recall_cached"), events)
+
+    def test_intergrate_all_zero_recall_not_cached(self):
+        """零召回不缓存:同参数再次调用仍真实请求 ES(瞬时故障可重试)。"""
+        class _EmptyES:
+            def __init__(self):
+                self.calls = 0
+
+            def keyword_search(self, query, region_code="", keywords=None,
+                               timeout=30):
+                self.calls += 1
+                return {"merged": [], "keywords": [], "knowledge_ids": [],
+                        "message": "未提取到有效关键词"}
+
+            def vector_search(self, query_text, region_code="",
+                              vector_mode="both"):
+                return None
+
+        ws = _ws("量子隐形传态")
+        ws.es = _EmptyES()
+        from kbagent.retrieval.tools import intergrate_all
+        intergrate_all.func(query="量子隐形传态资费")
+        intergrate_all.func(query="量子隐形传态资费")
+        self.assertEqual(2, ws.es.calls, "零召回结果不应进缓存")
 
     # ── keyword_recall / vector_recall ──────────────────────────────────── #
 
