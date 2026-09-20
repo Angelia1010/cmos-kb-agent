@@ -175,7 +175,8 @@ def intergrate_all(query: str = "", region_code: str = "000",
                    keywords: list = None) -> str:
     """生产一体化检索流水线:同时调 keyword(槽位提取→知识主索引→原子表)与
     vector(在线 embedding)两路召回,跨路去重后产出最终候选片段。
-    region_code 支持区号或省份名(如 000/福建)。
+    region_code 支持省份/地市编码或名称(如 000/591/福建/怀柔),名称经全量
+    省份地市编码表换算为编码,已是编码或未知值原样透传。
     可选传入 keywords 列表直接用于检索,跳过关键词提取。
     """
     logger.info("[TOOL_CALL] intergrate_all 参数: query=%r region_code=%s timeout=%s vector_mode=%s keywords=%s",
@@ -302,8 +303,9 @@ def intergrate_all(query: str = "", region_code: str = "000",
 @tool
 def vector_recall(query: str = "", region_code: str = "000", vector_mode: str = "both") -> str:
     """纯向量召回:直接走在线知识 embedding 向量检索服务,按语义相似度返回候选片段,
-    不经过关键词/槽位提取。region_code 支持区号或省份名(如 000/福建),经 provinceId
-    下推到向量服务。后端不支持向量检索时返回 error,由 agent 走兜底降级。
+    不经过关键词/槽位提取。region_code 支持省份/地市编码或名称(如 000/591/福建/怀柔),
+    名称经全量省份地市编码表换算,已是编码或未知值原样透传,经 provinceId 下推到向量服务。
+    后端不支持向量检索时返回 error,由 agent 走兜底降级。
     """
     logger.info("[TOOL_CALL] vector_recall 参数: query=%r region_code=%s vector_mode=%s",
                 query, region_code, vector_mode)
@@ -351,7 +353,8 @@ def vector_recall(query: str = "", region_code: str = "000", vector_mode: str = 
 def keyword_recall(query: str = "", region_code: str = "000",
                    timeout: int = 30) -> str:
     """关键词一体化召回:走 keyword_search 流水线(槽位提取→知识主索引→原子表拼接)。
-    region_code 支持区号或省份名(如 000/福建)。
+    region_code 支持省份/地市编码或名称(如 000/591/福建/怀柔),名称经全量
+    省份地市编码表换算为编码,已是编码或未知值原样透传。
     """
     logger.info("[TOOL_CALL] keyword_recall 参数: query=%r region_code=%s timeout=%s",
                 query, region_code, timeout)

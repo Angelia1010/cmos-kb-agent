@@ -257,7 +257,8 @@ class RetrievalSubAgent:
     ) -> List[Chunk]:
         """GoalLoop 驱动的检索→处理→验证。
 
-        region_code 传省份名或区号(如 福建/591),缺省 "000" 全国。
+        region_code 传省份/地市编码或名称(如 591/010A/福建/怀柔),名称经
+        全量省份地市编码表换算为编码,已是编码或未知值原样透传;缺省 "000" 全国。
         """
         ws = get_workspace()
         ws.stage = "retrieval"

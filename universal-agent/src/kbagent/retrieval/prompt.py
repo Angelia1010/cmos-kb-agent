@@ -36,7 +36,7 @@ RETRIEVAL_SYSTEM_PROMPT = """[ROLE:retrieval_subagent]
 # 输入
 
 - query:用户原始问题或改写后的检索词,必填。
-- region_code:省份名(如 福建)或区号(如 591)或 "000"(全国,缺省)。
+- region_code:省份/地市编码(如 591/010A)或名称(如 福建/怀柔)或 "000"(全国,缺省);名称按全量省份地市编码表换算,编码原样透传。
 - vector_mode:"both"(双模板混合,缺省)、"new"(新模板)或 "old"(旧模板)。
 
 # 输出

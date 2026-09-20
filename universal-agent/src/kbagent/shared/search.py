@@ -30,7 +30,11 @@ from .search_config import (
     _VECTOR_TITLE_FIELD, #vector 搜索标题字段
 )
 def _region_code(value: str) -> str:
-    """省份名 → 区号;已是区号(或其他值)原样返回。"""
+    """省份/地市名 → 区号;已是区号(或其他未知值)原样返回(检索阶段透传)。
+
+    映射表为全量省份地市编码(见 region_codes.py, 源自统一检索接口文档 §6);
+    一名多码的歧义地市名不自动换算, 按原值透传。
+    """
     return _PROVINCE_TO_REGION.get(value, value)
 
 def _preview(value: Any, limit: int = 800) -> str:
