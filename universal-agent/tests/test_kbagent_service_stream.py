@@ -112,6 +112,35 @@ class TestRetrieveStream(unittest.TestCase):
         self.assertEqual(100, max(s["relevance"] for s in obj["sources"]),
                          "最相关一篇的 relevance 应归一化为 100")
 
+    # ── retrievedDocs:重排前原始召回(id+title) ────────────────────────
+    def test_retrieved_docs_contract(self):
+        resp = self.client.post(f"{BASE}/retrieve", json=_body()).json()
+        self.assertEqual("0", resp["rtnCode"])
+        obj = resp["object"]
+        docs = obj["retrievedDocs"]
+        self.assertGreater(len(docs), 0, "正常链路应输出重排前原始召回列表")
+        for d in docs:
+            self.assertIsInstance(d["id"], str)
+            self.assertTrue(d["id"], "retrievedDocs.id 不应为空")
+            self.assertIsInstance(d["title"], str)
+        # 按 doc_id 去重(保召回顺序)
+        ids = [d["id"] for d in docs]
+        self.assertEqual(len(ids), len(set(ids)), "retrievedDocs 应去重")
+        # Top3(sources)必须来自原始召回,供召回/Top3 双准确率评估
+        src_doc_ids = {s["docId"] for s in obj["sources"] if s["docId"]}
+        self.assertTrue(src_doc_ids, "sources 应带 docId")
+        self.assertTrue(src_doc_ids.issubset(set(ids)),
+                        "sources 的 docId 应全部包含在 retrievedDocs 中")
+        # trace 中应有对应事件
+        self.assertTrue(any(e["stage"] == "retrieval"
+                            and e["event"] == "retrieved_docs"
+                            for e in obj["processTrace"]))
+
+    def test_retrieved_docs_absent_when_degraded_still_listed(self):
+        """降级兜底同样透出 retrievedDocs(空列表或降级召回,不允许缺字段)。"""
+        resp = self.client.post(f"{BASE}/retrieve", json=_body()).json()
+        self.assertIn("retrievedDocs", resp["object"])
+
     # ── 与同步 /retrieve 的一致性 ───────────────────────────────────────
     def test_stream_final_matches_plain_retrieve(self):
         plain = self.client.post(f"{BASE}/retrieve", json=_body()).json()
@@ -125,6 +154,8 @@ class TestRetrieveStream(unittest.TestCase):
         self.assertEqual([s["chunkId"] for s in po["sources"]],
                          [s["chunkId"] for s in so["sources"]])
         self.assertEqual(po["usability"]["level"], so["usability"]["level"])
+        self.assertEqual([d["id"] for d in po["retrievedDocs"]],
+                         [d["id"] for d in so["retrievedDocs"]])
 
     # ── 参数校验:JSON 错误信封而非 SSE ─────────────────────────────────
     def test_no_user_message_returns_json_error(self):

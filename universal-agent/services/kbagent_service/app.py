@@ -49,6 +49,7 @@ from .models import (
     AskParams,
     AskRequest,
     AskResponse,
+    RetrievedDocItem,
     SourceItem,
     UsabilityInfo,
     error_body,
@@ -583,6 +584,11 @@ def _to_object(ans: FinalAnswer, p: AskParams, arrived: str,
                        updatedAt=getattr(s, 'updated_at', ''),
                        stale=getattr(s, 'stale', False))
             for s in ans.sources
+        ],
+        retrievedDocs=[
+            RetrievedDocItem(id=getattr(d, "id", ""),
+                             title=getattr(d, "title", ""))
+            for d in (getattr(ans, "retrieved_docs", None) or [])
         ],
         processTrace=trace_events or [],
     )

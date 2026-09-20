@@ -23,12 +23,27 @@ from .shared.config import Config, DEFAULT_CONFIG
 from .shared.models import (
     USABILITY_NOT,
     FinalAnswer,
+    RetrievedDoc,
     SourceRef,
     Usability,
 )
 from .shared.search import ESClient, kresult_to_chunks
 from .shared.tracing import Tracer
 from .shared.workspace import RunWorkspace, set_workspace
+
+
+def _retrieved_docs(chunks: Any) -> List[RetrievedDoc]:
+    """重排前原始召回列表 → 去重(按 doc_id,保召回顺序)的 id+title 列表。"""
+    seen: set = set()
+    docs: List[RetrievedDoc] = []
+    for c in chunks or []:
+        did = getattr(c, "doc_id", "") or getattr(c, "chunk_id", "")
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        docs.append(RetrievedDoc(id=did,
+                                 title=getattr(c, "doc_title", "") or ""))
+    return docs
 
 
 class MainAgent:
@@ -107,9 +122,16 @@ class MainAgent:
             # 取 processing 后的 chunks(已包含 Markdown 内容和 rerank 排名)
             processed = ws.data.get("processed_chunks") or chunks
 
+            # 重排前原始召回(id+title,去重保序):ws.data["chunks"] 由
+            # intergrate_all 写入且 processing 流水线不覆盖,供评估召回准确率
+            retrieved_docs = _retrieved_docs(ws.data.get("chunks"))
+            self.tracer.log("retrieval", "retrieved_docs",
+                            count=len(retrieved_docs))
+
             # ---- ② 答案生成子智能体(自主组织 + 确定性锚定) ----
             ans = AnswerSubAgent(self.model, self.cfg, self.tracer).run(
                 query, processed, self.tracer.trace_id)
+            ans.retrieved_docs = retrieved_docs
             ans.elapsed_ms = self.tracer.elapsed_ms()
             self.cache.put(nq, ans)
             self.tracer.log("finalize", "done", elapsed_ms=ans.elapsed_ms)
@@ -141,6 +163,7 @@ class MainAgent:
             trace_id=self.tracer.trace_id, query=query,
             script="", handling_suggestion="",
             sources=sources,
+            retrieved_docs=_retrieved_docs(hits),
             degraded=True, elapsed_ms=self.tracer.elapsed_ms(),
             usability=Usability(
                 level=USABILITY_NOT,

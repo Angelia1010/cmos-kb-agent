@@ -83,6 +83,12 @@ class SourceItem(BaseModel):
     stale: bool = Field(description="是否疑似过旧(超溯源天数)")
 
 
+class RetrievedDocItem(BaseModel):
+    """检索原始召回文档(重排取 Top3 之前),仅 id+title,供准确率评估。"""
+    id: str = Field(default="", description="文档/知识ID")
+    title: str = Field(default="", description="文档标题")
+
+
 class UsabilityInfo(BaseModel):
     """坐席视角的话术可用性判定(LLM 自评 + 确定性规则纠偏)。"""
     level: str = Field(
@@ -107,6 +113,11 @@ class AnswerObject(BaseModel):
     usability: Optional[UsabilityInfo] = Field(
         default=None, description="话术可用性判定")
     sources: List[SourceItem] = Field(description="引用文档列表(按相关度降序)")
+    # 重排取 Top3 之前的检索原始召回列表(按召回顺序去重,仅 id+title):
+    # 与 sources 对比可分别评估召回准确率与 Top3 准确率
+    retrievedDocs: List[RetrievedDocItem] = Field(
+        default_factory=list,
+        description="检索原始召回列表(重排取Top3前,仅id+title,按召回顺序)")
     # 智能体内部执行 trace 事件列表(ts_ms/stage/event/payload),
     # 供前端演示页渲染"检索处理过程"时间线;
     # KB_SERVICE_EXPOSE_TRACE=0 时为空列表,灵犀老调用方不受影响

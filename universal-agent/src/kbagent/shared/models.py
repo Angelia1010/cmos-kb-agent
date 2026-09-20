@@ -169,6 +169,13 @@ class DocFragments:
 
 
 @dataclass
+class RetrievedDoc:
+    """检索原始召回文档(重排取 Top3 之前),仅 id+title,供召回准确率评估。"""
+    id: str = ""
+    title: str = ""
+
+
+@dataclass
 class FinalAnswer:
     trace_id: str
     query: str
@@ -179,6 +186,9 @@ class FinalAnswer:
     from_cache: bool = False
     elapsed_ms: int = 0
     usability: Usability = field(default_factory=Usability)      # 可用性判定
+    # 重排前的原始召回列表(按召回顺序去重,仅 id+title):
+    # 服务端对比 sources(Top3)可分别评估召回准确率与 Top3 准确率
+    retrieved_docs: List[RetrievedDoc] = field(default_factory=list)
 
     def render(self) -> str:
         """渲染为坐席可读文本。"""
