@@ -5,7 +5,7 @@
 use: "langchain_anthropic:ChatAnthropic"   # Anthropic 兼容接口
 model: "deepseek-v4-flash"                 # DeepSeek 模型名
 
-api_key: "sk-1f9e66cf5dd744a3b4c25335799bb263"                          # 填写你的 DeepSeek API Key
+api_key: ""                          # 填写你的 DeepSeek API Key
                                            # （映射到 anthropic_api_key）
 
 base_url: "https://api.deepseek.com/anthropic"   # DeepSeek Anthropic 兼容端点
