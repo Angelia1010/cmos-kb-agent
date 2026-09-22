@@ -90,11 +90,26 @@ def create_app(
     async def lifespan(app: FastAPI):
         app.state.model = model if model is not None else _default_model()
         app.state.timeout_s = timeout_s
-        logger.info("Processing 服务就绪 base=%s model=%s",
-                    base, type(app.state.model).__name__)
+        logger.info(
+            "Processing 服务就绪 base=%s model=%s",
+            base,
+            type(app.state.model).__name__,
+        )
         yield
 
     app = FastAPI(title="processing-service", version="1.0.0", lifespan=lifespan)
+
+    from fastapi.staticfiles import StaticFiles
+
+    from .debug_ui import STATIC_ROOT, create_debug_router
+
+    processing_path = f"{base}/process"
+    app.mount(
+        f"{processing_path}/ui/assets",
+        StaticFiles(directory=STATIC_ROOT),
+        name="processing-debug-assets",
+    )
+    app.include_router(create_debug_router(processing_path))
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
@@ -109,7 +124,7 @@ def create_app(
         return {"status": "ok",
                 "model_class": type(request.app.state.model).__name__}
 
-    @app.post(f"{base}/process", response_model=ProcessingResponse)
+    @app.post(processing_path, response_model=ProcessingResponse)
     async def process(payload: ProcessingRequest, request: Request):
         request_id = _request_id(request)
         try:

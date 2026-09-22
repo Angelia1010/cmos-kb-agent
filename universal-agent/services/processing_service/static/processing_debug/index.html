@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Processing生产内部单次请求执行回放页面">
+  <title>Processing 执行回放台</title>
+  <link rel="stylesheet" href="__PROCESSING_UI_BASE__/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">P</div>
+      <div>
+        <p class="eyebrow">PROCESSING TRACE</p>
+        <h1>Processing 执行回放台</h1>
+        <p class="subtitle">从候选知识到 Top3，按真实执行顺序查看数据如何流转</p>
+      </div>
+    </div>
+    <div class="status" id="status"><span></span>等待请求</div>
+  </header>
+
+  <main>
+    <section class="card control-bar">
+      <div class="field search-field">
+        <label for="searchInput">定位某条知识</label>
+        <input id="searchInput" autocomplete="off" placeholder="knowledge_id / chunk_id / Evidence ID">
+      </div>
+      <div class="field mode-field">
+        <label for="rerankMode">本次重排输入模式</label>
+        <select id="rerankMode">
+          <option value="title_then_content" selected>title_then_content（推荐）</option>
+          <option value="title_only">title_only（低输入量）</option>
+          <option value="headings_and_intro">headings_and_intro（标题大纲+简介）</option>
+          <option value="title_and_content">title_and_content（高输入量）</option>
+        </select>
+        <small id="rerankModeHint">Batch只发送标题，Global发送标题和精简正文</small>
+      </div>
+      <div class="actions">
+        <button id="downloadButton" type="button" disabled>下载脱敏 Trace</button>
+        <button id="runButton" class="primary" type="button">执行一次 Processing</button>
+      </div>
+    </section>
+
+    <details class="card request-panel" open>
+      <summary>
+        <span><strong>请求输入</strong><small>粘贴完整 Processing JSON，执行后可收起</small></span>
+        <span class="summary-actions">
+          <button class="small" data-copy-target="requestEditor" type="button">复制</button>
+          <button class="small" id="formatButton" type="button">格式化</button>
+        </span>
+      </summary>
+      <div class="request-body">
+        <textarea id="requestEditor" spellcheck="false">{
+  "query": "流量套餐怎么办理",
+  "retrieval_query": "流量套餐 办理规则",
+  "processing_context": {
+    "region_id": "200",
+    "region_name": "广东",
+    "channel_code": "1",
+    "audience": "agent",
+    "customer_type": "个人客户"
+  },
+  "chunks": []
+}</textarea>
+        <p class="error" id="requestError"></p>
+      </div>
+    </details>
+
+    <section id="resultLayout" hidden>
+      <section class="summary-grid" id="summary" aria-label="本次执行摘要"></section>
+
+      <section class="card pipeline-card">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">EXECUTION FLOW</p>
+            <h2>本次数据流</h2>
+          </div>
+          <p>点击节点查看该阶段如何处理上一步的结果</p>
+        </div>
+        <div class="pipeline" id="pipeline"></div>
+      </section>
+
+      <section class="workspace-layout">
+        <nav class="stage-nav card" id="stageNav" aria-label="Processing执行视图"></nav>
+        <section class="trace-workspace">
+          <div class="toolbar card">
+            <div>
+              <p class="eyebrow" id="viewEyebrow">FLOW VIEW</p>
+              <h2 id="viewTitle">执行总览</h2>
+            </div>
+            <div class="inline-actions">
+              <button class="small" id="expandButton" type="button">展开当前详情</button>
+              <button class="small" id="collapseButton" type="button">折叠当前详情</button>
+              <button class="small" id="copyStageButton" type="button">复制当前数据</button>
+            </div>
+          </div>
+          <div id="traceViewer" class="trace-viewer"></div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="__PROCESSING_UI_BASE__/assets/app.js" defer></script>
+</body>
+</html>

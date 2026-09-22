@@ -224,7 +224,14 @@ class KnowledgeProcessingOptions(Serializable):
     batch_top_k: int = 5
     global_pool_size: int = 25
     final_top_k: int = 3
+    rerank_input_mode: Literal[
+        "title_only", "headings_and_intro", "title_then_content", "title_and_content"
+    ] = "title_then_content"
+    prompt_max_chars_per_title: int = 200
+    batch_prompt_max_chars: int = 10000
     prompt_max_chars_per_candidate: int = 6000
+    global_prompt_max_chars_per_candidate: int = 1000
+    global_prompt_max_chars: int = 30000
     long_content_threshold: int = 12000
     include_annotations: bool = True
     include_except_rules: bool = True
@@ -236,7 +243,17 @@ class KnowledgeProcessingOptions(Serializable):
         self.batch_top_k = min(5, max(1, int(self.batch_top_k)))
         self.global_pool_size = min(25, max(1, int(self.global_pool_size)))
         self.final_top_k = min(3, max(1, int(self.final_top_k)))
+        if self.rerank_input_mode not in {
+            "title_only", "headings_and_intro", "title_then_content", "title_and_content",
+        }:
+            raise ValueError(f"非法 rerank_input_mode: {self.rerank_input_mode}")
+        self.prompt_max_chars_per_title = max(1, int(self.prompt_max_chars_per_title))
+        self.batch_prompt_max_chars = max(1, int(self.batch_prompt_max_chars))
         self.prompt_max_chars_per_candidate = max(1, int(self.prompt_max_chars_per_candidate))
+        self.global_prompt_max_chars_per_candidate = max(
+            1, int(self.global_prompt_max_chars_per_candidate)
+        )
+        self.global_prompt_max_chars = max(1, int(self.global_prompt_max_chars))
         self.long_content_threshold = max(1, int(self.long_content_threshold))
         self.rerank_timeout_seconds = max(0.001, float(self.rerank_timeout_seconds))
 
