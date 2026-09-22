@@ -93,11 +93,23 @@ class ProcessingSubAgent:
         self,
         model: Any,
         options: KnowledgeProcessingOptions | None = None,
+        trace_collector: Any | None = None,
     ) -> None:
         self.model = model
         self.options = options or KnowledgeProcessingOptions()
+        self.trace_collector = trace_collector
         tools = build_knowledge_processing_tools(model, self.options)
         self.tools = {tool.name: tool for tool in tools}
+
+    def _trace_hook(self, method: str, *args: Any, **kwargs: Any) -> None:
+        """调试 Trace 是旁路能力；采集异常不得改变 Processing 结果。"""
+        callback = getattr(self.trace_collector, method, None)
+        if not callable(callback):
+            return
+        try:
+            callback(*args, **kwargs)
+        except Exception:  # noqa: BLE001 - 可选诊断能力必须故障隔离
+            return
 
     async def run(self) -> List[ProcessedKnowledge]:
         ws = get_workspace()
@@ -112,7 +124,15 @@ class ProcessingSubAgent:
         source_chunks = index_source_chunks(raw_chunks)
         for tool_name, artifact_key in self._STEPS:
             tool = self.tools[tool_name]
-            await tool.ainvoke({})
+            self._trace_hook("before_stage", tool_name, ws)
+            try:
+                await tool.ainvoke({})
+            except Exception as exc:
+                self._trace_hook(
+                    "after_stage", tool_name, ws, error_type=type(exc).__name__
+                )
+                raise
+            self._trace_hook("after_stage", tool_name, ws)
             artifact = ws.data.get(artifact_key)
             if not isinstance(artifact, list):
                 raise RuntimeError(f"{tool_name} 未产生有效工作区产物 {artifact_key}")
