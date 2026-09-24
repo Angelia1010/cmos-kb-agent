@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,6 +22,21 @@ from ..shared.knowledge_processing.models import (
 from ..shared.knowledge_processing.eligibility import rerank_ineligibility_reason
 from ..shared.knowledge_processing.richtext import render_richtext
 from .prompts import RERANK_BATCH_SYSTEM_PROMPT, RERANK_GLOBAL_SYSTEM_PROMPT
+
+logger = logging.getLogger("kbagent.processing")
+
+# 日志预览长度:query/模型输出在 INFO 行只留单行摘要,完整原文走 DEBUG
+_QUERY_PREVIEW_CHARS = 60
+_RAW_PREVIEW_CHARS = 200
+
+
+def _log_preview(value: Any, limit: int) -> str:
+    """日志用单行预览:压平空白、截断超长文本并附原始长度。"""
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}…(len={len(text)})"
+
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -995,7 +1012,16 @@ eligible <= 3 ?
     """
     # 保留现有函数签名和上下游契约；两阶段精简 Prompt 明确只发送原始 Query。
     del context, retrieval_query
+    started_at = time.perf_counter()
     ordered = _stable_candidates(candidates)
+    logger.info(
+        "rerank 开始 query=%r 候选=%d mode=%s batch_size=%d batch_top_k=%d "
+        "pool<=%d final_top_k=%d timeout=%ss",
+        _log_preview(query, _QUERY_PREVIEW_CHARS), len(ordered),
+        options.rerank_input_mode, options.batch_size, options.batch_top_k,
+        options.global_pool_size, options.final_top_k,
+        options.rerank_timeout_seconds,
+    )
     warnings: List[ProcessingWarning] = []
     eligible: List[ProcessedKnowledge] = []
     for candidate in ordered:
@@ -1020,6 +1046,13 @@ eligible <= 3 ?
     evidence_pairs = [(f"E{index:03d}", candidate) for index, candidate in enumerate(eligible, 1)]
     evidence_map = {evidence_id: candidate.knowledge_id for evidence_id, candidate in evidence_pairs}
     by_evidence = dict(evidence_pairs)
+    if len(eligible) != len(ordered):
+        logger.info(
+            "rerank 资格过滤 %d→%d 排除=%s",
+            len(ordered), len(eligible),
+            [f"{w.code}(source_index={w.source_index})" for w in warnings] or "-",
+        )
+    logger.debug("rerank evidence 映射: %s", evidence_map)
     details: Dict[str, Any] = {
         "batches": [],
         "global": {},
@@ -1047,6 +1080,13 @@ eligible <= 3 ?
             **final_meta,
         }
         details["fallback_reasons"] = list(final_meta["fallback_reasons"])
+        logger.info(
+            "rerank 快速返回: 有效候选 %d ≤ final_top_k %d, 不调用模型 "
+            "selected=%s degraded=%s 耗时=%dms",
+            len(eligible), options.final_top_k,
+            [pair[0] for pair in evidence_pairs], final_meta["degraded"],
+            int((time.perf_counter() - started_at) * 1000),
+        )
         return RerankResult(
             _assign_rerank_ranks(eligible), evidence_map, details, warnings, final_meta["degraded"]
         )
@@ -1065,10 +1105,23 @@ eligible <= 3 ?
             stage=stage,
             system_prompt=RERANK_BATCH_SYSTEM_PROMPT,
         )
+        logger.info(
+            "rerank %s 输入=%s prompt=%s/%s字符 含正文=%s 期望Top%d",
+            stage, [item[0] for item in batch],
+            prompt_details.get("sent_chars")
+            or prompt_details.get("minimum_required_chars"),
+            prompt_details.get("budget_chars"),
+            prompt_details.get("content_included"), expected,
+        )
         valid: List[str] = []
         complete = False
         batch_stage_warnings: List[ProcessingWarning] = []
         if prompt is None:
+            logger.warning(
+                "rerank %s Prompt 超预算(最小 %s > %s 字符), 本批不调用模型, 按检索序降级",
+                stage, prompt_details.get("minimum_required_chars"),
+                prompt_details.get("budget_chars"),
+            )
             warning = ProcessingWarning(
                 code="rerank_prompt_budget_exceeded",
                 message=f"{stage} 最小必要载荷超过 {options.batch_prompt_max_chars} 字符，已降级",
@@ -1079,18 +1132,34 @@ eligible <= 3 ?
             batch_stage_warnings.append(warning)
         else:
             try:
+                invoke_started = time.perf_counter()
                 raw = await _invoke_ranker(
                     model,
                     RERANK_BATCH_SYSTEM_PROMPT,
                     prompt,
                     options.rerank_timeout_seconds,
                 )
+                logger.info(
+                    "rerank %s 模型返回 耗时=%dms raw=%r",
+                    stage, int((time.perf_counter() - invoke_started) * 1000),
+                    _log_preview(raw, _RAW_PREVIEW_CHARS),
+                )
+                logger.debug("rerank %s 模型完整输出: %s", stage, raw)
                 valid, parse_warnings, complete = _parse_ranked_ids(
                     raw, [item[0] for item in batch], expected, stage
                 )
+                if parse_warnings:
+                    logger.warning(
+                        "rerank %s 输出解析异常: %s",
+                        stage, [w.code for w in parse_warnings],
+                    )
                 warnings.extend(parse_warnings)
                 batch_stage_warnings.extend(parse_warnings)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "rerank %s 模型调用超时(%ss), 本批按检索序降级",
+                    stage, options.rerank_timeout_seconds,
+                )
                 warning = ProcessingWarning(
                     code="rerank_timeout",
                     message=f"{stage} 模型调用超过 {options.rerank_timeout_seconds:g} 秒，已降级",
@@ -1099,6 +1168,10 @@ eligible <= 3 ?
                 warnings.append(warning)
                 batch_stage_warnings.append(warning)
             except Exception as exc:  # noqa: BLE001 - 模型故障必须降级
+                logger.warning(
+                    "rerank %s 模型调用失败, 本批按检索序降级: %s",
+                    stage, exc, exc_info=True,
+                )
                 warning = ProcessingWarning(
                     code="rerank_model_error", message=f"{stage} 模型调用失败: {exc}", field=stage
                 )
@@ -1111,6 +1184,10 @@ eligible <= 3 ?
         batch_reasons = _stable_unique(batch_reasons)
         if not complete:
             batch_fallback_used = True
+        logger.info(
+            "rerank %s 选定=%s (模型=%s complete=%s 降级原因=%s)",
+            stage, selected, valid or "-", complete, batch_reasons or "-",
+        )
         pool_ids.extend(selected)
         details["batches"].append({
             "batch_index": batch_index,
@@ -1122,9 +1199,14 @@ eligible <= 3 ?
             "prompt": prompt_details,
         })
 
+    pool_before_truncate = len(pool_ids)
     pool_ids = pool_ids[:options.global_pool_size]
     pool = [(evidence_id, by_evidence[evidence_id]) for evidence_id in pool_ids]
     expected_global = min(options.final_top_k, len(pool))
+    logger.info(
+        "rerank 全局池 %d 条(各批汇总 %d, 截断至 pool<=%d) pool=%s",
+        len(pool_ids), pool_before_truncate, options.global_pool_size, pool_ids,
+    )
     global_prompt, global_prompt_details = _build_user_prompt(
         query,
         pool,
@@ -1133,10 +1215,23 @@ eligible <= 3 ?
         stage="global",
         system_prompt=RERANK_GLOBAL_SYSTEM_PROMPT,
     )
+    logger.info(
+        "rerank global 输入=%s prompt=%s/%s字符 含正文=%s 期望Top%d",
+        pool_ids,
+        global_prompt_details.get("sent_chars")
+        or global_prompt_details.get("minimum_required_chars"),
+        global_prompt_details.get("budget_chars"),
+        global_prompt_details.get("content_included"), expected_global,
+    )
     global_valid: List[str] = []
     global_complete = False
     global_stage_warnings: List[ProcessingWarning] = []
     if global_prompt is None:
+        logger.warning(
+            "rerank global Prompt 超预算(最小 %s > %s 字符), 不调用模型, 按检索序降级",
+            global_prompt_details.get("minimum_required_chars"),
+            global_prompt_details.get("budget_chars"),
+        )
         warning = ProcessingWarning(
             code="rerank_prompt_budget_exceeded",
             message=f"global 最小必要载荷超过 {options.global_prompt_max_chars} 字符，已降级",
@@ -1147,18 +1242,34 @@ eligible <= 3 ?
         global_stage_warnings.append(warning)
     else:
         try:
+            invoke_started = time.perf_counter()
             raw = await _invoke_ranker(
                 model,
                 RERANK_GLOBAL_SYSTEM_PROMPT,
                 global_prompt,
                 options.rerank_timeout_seconds,
             )
+            logger.info(
+                "rerank global 模型返回 耗时=%dms raw=%r",
+                int((time.perf_counter() - invoke_started) * 1000),
+                _log_preview(raw, _RAW_PREVIEW_CHARS),
+            )
+            logger.debug("rerank global 模型完整输出: %s", raw)
             global_valid, parse_warnings, global_complete = _parse_ranked_ids(
                 raw, pool_ids, expected_global, "global"
             )
+            if parse_warnings:
+                logger.warning(
+                    "rerank global 输出解析异常: %s",
+                    [w.code for w in parse_warnings],
+                )
             warnings.extend(parse_warnings)
             global_stage_warnings.extend(parse_warnings)
         except asyncio.TimeoutError:
+            logger.warning(
+                "rerank global 模型调用超时(%ss), 按检索序降级",
+                options.rerank_timeout_seconds,
+            )
             warning = ProcessingWarning(
                 code="rerank_timeout",
                 message=f"global 模型调用超过 {options.rerank_timeout_seconds:g} 秒，已降级",
@@ -1167,6 +1278,9 @@ eligible <= 3 ?
             warnings.append(warning)
             global_stage_warnings.append(warning)
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "rerank global 模型调用失败, 按检索序降级: %s", exc, exc_info=True,
+            )
             warning = ProcessingWarning(
                 code="rerank_model_error", message=f"global 模型调用失败: {exc}", field="global"
             )
@@ -1175,6 +1289,10 @@ eligible <= 3 ?
 
     if not global_valid:
         # 全局完全失败时必须从全部有效候选中降级，不只限于批内池。
+        logger.warning(
+            "rerank global 无任何有效模型结果, 从全部有效候选按检索序取前 %d 降级",
+            options.final_top_k,
+        )
         final_ids = [evidence_id for evidence_id, _ in evidence_pairs[:options.final_top_k]]
     else:
         final_ids = _fill_by_rank(global_valid, evidence_pairs, options.final_top_k)
@@ -1204,6 +1322,14 @@ eligible <= 3 ?
         ),
         *final_meta["fallback_reasons"],
     ])
+    logger.info(
+        "rerank 结束 总耗时=%dms final=%s degraded=%s warnings=%d 命中知识=%s",
+        int((time.perf_counter() - started_at) * 1000), final_ids,
+        final_meta["degraded"], len(warnings),
+        [evidence_map.get(evidence_id) for evidence_id in final_ids],
+    )
+    if final_meta.get("fallback_reasons"):
+        logger.info("rerank 降级原因汇总: %s", final_meta["fallback_reasons"])
     return RerankResult(
         candidates=_assign_rerank_ranks([
             by_evidence[evidence_id] for evidence_id in final_ids

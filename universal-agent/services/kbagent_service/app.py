@@ -38,6 +38,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from kbagent import MainAgent, MockESClient, ProduceESClient, ScriptedChatModel
+from kbagent.shared.knowledge_processing import KnowledgeProcessingOptions
 from kbagent.shared.models import FinalAnswer
 
 from .models import (
@@ -50,6 +51,7 @@ from .models import (
     AskRequest,
     AskResponse,
     RetrievedDocItem,
+    RerankParams,
     SourceItem,
     UsabilityInfo,
     error_body,
@@ -246,6 +248,37 @@ def _resolve_timeout_s(explicit: Optional[float] = None) -> float:
     return val if val > 0 else DEFAULT_TIMEOUT_S
 
 
+# extInfo.rerank 字段 → KnowledgeProcessingOptions 字段
+_RERANK_FIELD_MAP = {
+    "inputMode": "rerank_input_mode",
+    "finalTopK": "final_top_k",
+    "batchTopK": "batch_top_k",
+    "batchSize": "batch_size",
+    "globalPoolSize": "global_pool_size",
+    "timeoutSeconds": "rerank_timeout_seconds",
+}
+
+
+def _processing_options_from(p: AskParams) -> Optional[KnowledgeProcessingOptions]:
+    """请求携带 extInfo.rerank 时构造覆盖用 KnowledgeProcessingOptions。
+
+    - 未携带(老调用方)→ 返回 None,链路保持全局默认,行为零变化;
+    - 只覆盖显式给出的字段,其余取默认值;
+    - 非法值由 Pydantic(422)与 Options.__post_init__(夹紧)双重兜底。
+    """
+    rerank: Optional[RerankParams] = getattr(p.extInfo, "rerank", None)
+    if rerank is None:
+        return None
+    given = rerank.model_dump(exclude_none=True)
+    if not given:
+        return None
+    kwargs = {_RERANK_FIELD_MAP[k]: v for k, v in given.items()
+              if k in _RERANK_FIELD_MAP}
+    options = KnowledgeProcessingOptions(**kwargs)
+    logger.info("requestId=%s rerank 参数覆盖: %s", p.requestId, kwargs)
+    return options
+
+
 def _resolve_cfg() -> Any:
     """MainAgent 领域配置:默认 DEFAULT_CONFIG(GoalLoop 3 轮不变);
     仅当设置 KB_SERVICE_MAX_RETRIEVAL_ROUNDS 时收紧检索轮次上限。"""
@@ -415,7 +448,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
                               cfg=request.app.state.cfg,
-                              skill_dirs=[_SKILLS_DIR])
+                              skill_dirs=[_SKILLS_DIR],
+                              processing_options=_processing_options_from(p))
             # 省份信息经 region_code 下传:检索一体化流水线据此选省级索引
             ans = await asyncio.wait_for(
                 agent.arun(query, region_code=p.userInfo.province),
@@ -476,7 +510,8 @@ def _register_routes(app: FastAPI, base: str) -> None:
             agent = MainAgent(model=request.app.state.model,
                               es=request.app.state.es,
                               cfg=request.app.state.cfg,
-                              skill_dirs=[_SKILLS_DIR])
+                              skill_dirs=[_SKILLS_DIR],
+                              processing_options=_processing_options_from(p))
             task = asyncio.ensure_future(
                 agent.arun(query, region_code=p.userInfo.province))
             loop = asyncio.get_running_loop()

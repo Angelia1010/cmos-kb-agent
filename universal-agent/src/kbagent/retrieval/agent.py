@@ -32,6 +32,7 @@ from ..shared.config import Config
 from ..shared.knowledge_processing.adapter import normalize_processing_context
 from ..shared.knowledge_processing.bridge import retrieval_to_candidates
 from ..shared.knowledge_processing.models import (
+    KnowledgeProcessingOptions,
     ProcessedKnowledge,
     Top3VerificationResult,
 )
@@ -68,8 +69,9 @@ class ProcessingVerifier:
         tracer: Tracer,
         *,
         verifier_timeout: float = 15.0,
+        processing_options: KnowledgeProcessingOptions | None = None,
     ) -> None:
-        self._processing = ProcessingSubAgent(model)
+        self._processing = ProcessingSubAgent(model, options=processing_options)
         self._verifier = Top3AnswerabilityVerifier(
             model, timeout_seconds=verifier_timeout,
         )
@@ -246,11 +248,13 @@ class RetrievalSubAgent:
         *,
         judge_model: Any = None,
         verifier_timeout: float = 15.0,
+        processing_options: KnowledgeProcessingOptions | None = None,
     ) -> None:
         self.model = model
         self.cfg = cfg
         self.tracer = tracer
         self._verifier_timeout = verifier_timeout
+        self._processing_options = processing_options
 
     async def run(
         self, query: str, region_code: str = "000"
@@ -269,6 +273,7 @@ class RetrievalSubAgent:
             model=self.model,
             tracer=self.tracer,
             verifier_timeout=self._verifier_timeout,
+            processing_options=self._processing_options,
         )
 
         loop = create_agent(

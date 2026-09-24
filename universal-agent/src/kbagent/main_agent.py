@@ -57,9 +57,12 @@ class MainAgent:
                  cfg: Config = DEFAULT_CONFIG,
                  cache: Optional[AnswerCache] = None,
                  enable_skills: bool = True,
-                 skill_dirs: Optional[List[str]] = None):
+                 skill_dirs: Optional[List[str]] = None,
+                 processing_options: Optional[Any] = None):
         from .shared.llm_bridge import ensure_judge_interface
         self.model, self.es, self.cfg = model, es, cfg
+        # 请求级 rerank/处理参数覆盖(KnowledgeProcessingOptions);None=全局默认
+        self._processing_options = processing_options
         # 判据/答案接口适配:普通 BaseChatModel 自动包 LLMBridge(审查修复)
         self.judge_model = ensure_judge_interface(model)
         self.cache = cache or AnswerCache(sim_threshold=cfg.cache_sim_threshold)
@@ -100,9 +103,13 @@ class MainAgent:
         set_workspace(ws)
         try:
             # ---- 快速通道 ----
+            # 带自定义 rerank 参数时绕过缓存:缓存键只有 query,
+            # 命中会把"别的参数跑出的答案"当成当前参数的结果返回
+            use_cache = self._processing_options is None
             nq = normalize_query(query)
-            hit = self.cache.lookup(nq)
-            self.tracer.log("cache", "hit" if hit else "miss")
+            hit = self.cache.lookup(nq) if use_cache else None
+            self.tracer.log("cache", "hit" if hit
+                            else ("bypass" if not use_cache else "miss"))
             if hit:
                 hit.from_cache = True
                 hit.trace_id = self.tracer.trace_id
@@ -117,6 +124,7 @@ class MainAgent:
             chunks = await RetrievalSubAgent(
                 self.model, self.cfg, self.tracer,
                 judge_model=self.judge_model,
+                processing_options=self._processing_options,
             ).run(query, region_code)
 
             # 取 processing 后的 chunks(已包含 Markdown 内容和 rerank 排名)
@@ -133,7 +141,8 @@ class MainAgent:
                 query, processed, self.tracer.trace_id)
             ans.retrieved_docs = retrieved_docs
             ans.elapsed_ms = self.tracer.elapsed_ms()
-            self.cache.put(nq, ans)
+            if use_cache:
+                self.cache.put(nq, ans)
             self.tracer.log("finalize", "done", elapsed_ms=ans.elapsed_ms)
             return ans
         except Exception as exc:                        # noqa: BLE001

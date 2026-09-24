@@ -48,10 +48,36 @@ class Scene(BaseModel):
     pageTitle: Optional[str] = Field(default=None, description="页面标题")
 
 
+class RerankParams(BaseModel):
+    """重排(rerank)参数覆盖。全部可选,缺省字段用服务端默认值。
+
+    安全边界由 KnowledgeProcessingOptions.__post_init__ 强制:
+    batchSize≤20 / batchTopK≤5 / globalPoolSize≤25 / finalTopK≤3,
+    非法 inputMode 直接 422 拒绝。
+    """
+    inputMode: Optional[Literal[
+        "title_only", "headings_and_intro",
+        "title_then_content", "title_and_content",
+    ]] = Field(default=None,
+               description="重排模型输入形态:仅标题/标题+导语/标题后接正文/标题和正文")
+    finalTopK: Optional[int] = Field(default=None, ge=1, le=3,
+                                     description="最终取TopN(≤3)")
+    batchTopK: Optional[int] = Field(default=None, ge=1, le=5,
+                                     description="每批保留TopN(≤5)")
+    batchSize: Optional[int] = Field(default=None, ge=1, le=20,
+                                     description="每批候选数(≤20)")
+    globalPoolSize: Optional[int] = Field(default=None, ge=1, le=25,
+                                          description="全局精排池大小(≤25)")
+    timeoutSeconds: Optional[float] = Field(default=None, gt=0,
+                                            description="单次重排模型调用超时(秒)")
+
+
 class ExtInfo(BaseModel):
     """其他信息。对象本身必填,内部字段全部可选。"""
     device: Optional[Device] = None
     scene: Optional[Scene] = None
+    rerank: Optional[RerankParams] = Field(
+        default=None, description="重排参数覆盖(评测/调优用;缺省走服务端默认)")
 
 
 class AskParams(BaseModel):
