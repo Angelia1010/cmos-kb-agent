@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import time
 from typing import Any
 
 from kbagent.processing.agent import KnowledgeProcessingOrchestrator
@@ -23,6 +25,7 @@ from .models import (
     ProcessingWarningItem,
     TopCandidate,
 )
+from .service_logging import ProcessingLogObserver, log_event
 
 
 _SAFE_WARNING_MESSAGES = {
@@ -67,6 +70,10 @@ async def run_processing_request(
     options: KnowledgeProcessingOptions | None = None,
 ) -> ProcessingResponseObject:
     """执行一次请求；不共享 Workspace，也不返回 raw/metadata 等内部字段。"""
+    started = time.perf_counter()
+    effective_options = options or KnowledgeProcessingOptions(
+        rerank_input_mode=request.rerank_input_mode
+    )
     chunks = [Chunk(**item.model_dump()) for item in request.chunks]
     ws = RunWorkspace(
         query=request.query,
@@ -77,34 +84,48 @@ async def run_processing_request(
             "knowledge_candidates": retrieval_to_candidates(chunks=chunks),
         },
     )
-    execution_model = model
-    if trace_collector is not None:
-        try:
-            execution_model = trace_collector.wrap_model(model)
-        except Exception:  # noqa: BLE001 - 可选 Trace 失败不得影响主处理
-            execution_model = model
-    with workspace_scope(ws):
-        top3 = await KnowledgeProcessingOrchestrator(
-            execution_model,
-            options=options,
-            trace_collector=trace_collector,
-        ).run()
-        meta = _stats(ws.data.get("processing_meta"))
-        warnings = [
-            _safe_warning(item)
-            for item in ws.data.get("processing_warnings", [])
-            if isinstance(item, ProcessingWarning)
-        ]
-        processed_chunks = ws.data.get("processed_chunks")
-        if not isinstance(processed_chunks, list) or not all(
-            isinstance(item, Chunk) for item in processed_chunks
-        ):
-            raise RuntimeError("Processing 未产生有效的 processed_chunks 工作区产物")
-        if trace_collector is not None:
-            try:
-                trace_collector.finish(ws)
-            except Exception:  # noqa: BLE001 - Trace 失败不触发重跑或改变结果
-                pass
+    log_observer = ProcessingLogObserver(request_id, trace_collector)
+    log_observer.trace_id = ws.tracer.trace_id
+    log_event(
+        logging.INFO,
+        "request_started",
+        request_id=request_id,
+        trace_id=ws.tracer.trace_id,
+        input_count=len(chunks),
+        rerank_input_mode=effective_options.rerank_input_mode,
+        model_mode=_model_mode(model),
+    )
+    execution_model = log_observer.wrap_model(model)
+    try:
+        with workspace_scope(ws):
+            top3 = await KnowledgeProcessingOrchestrator(
+                execution_model,
+                options=effective_options,
+                trace_collector=log_observer,
+            ).run()
+            meta = _stats(ws.data.get("processing_meta"))
+            warnings = [
+                _safe_warning(item)
+                for item in ws.data.get("processing_warnings", [])
+                if isinstance(item, ProcessingWarning)
+            ]
+            processed_chunks = ws.data.get("processed_chunks")
+            if not isinstance(processed_chunks, list) or not all(
+                isinstance(item, Chunk) for item in processed_chunks
+            ):
+                raise RuntimeError("Processing 未产生有效的 processed_chunks 工作区产物")
+            log_observer.finish(ws)
+    except Exception as exc:
+        log_event(
+            logging.ERROR,
+            "request_completed",
+            request_id=request_id,
+            trace_id=ws.tracer.trace_id,
+            status="error",
+            error_type=type(exc).__name__,
+            elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+        )
+        raise
 
     top_rows = [
         TopCandidate(
@@ -142,7 +163,7 @@ async def run_processing_request(
     else:
         outcome = "success"
 
-    return ProcessingResponseObject(
+    response = ProcessingResponseObject(
         request_id=request_id,
         trace_id=ws.tracer.trace_id,
         model_mode=_model_mode(model),
@@ -154,3 +175,22 @@ async def run_processing_request(
         processing_meta=meta,
         warnings=warnings,
     )
+    log_event(
+        logging.INFO if not response.degraded else logging.WARNING,
+        "request_completed",
+        request_id=request_id,
+        trace_id=response.trace_id,
+        status="success",
+        outcome=response.outcome,
+        degraded=response.degraded,
+        input_count=response.processing_meta.input_count,
+        normalized_count=response.processing_meta.normalized_count,
+        filtered_count=response.processing_meta.filtered_count,
+        processed_count=response.processing_meta.processed_count,
+        rerank_eligible_count=response.processing_meta.rerank_eligible_count,
+        top_count=len(response.top3_candidates),
+        warning_count=response.processing_meta.warning_count,
+        degradation_reasons=response.processing_meta.degradation_reasons,
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
+    return response

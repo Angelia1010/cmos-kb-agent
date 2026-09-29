@@ -230,12 +230,13 @@ class KnowledgeProcessingOptions(Serializable):
     prompt_max_chars_per_title: int = 200
     batch_prompt_max_chars: int = 10000
     prompt_max_chars_per_candidate: int = 6000
+    semifinal_prompt_max_chars: int = 30000
     global_prompt_max_chars_per_candidate: int = 1000
     global_prompt_max_chars: int = 30000
     long_content_threshold: int = 12000
     include_annotations: bool = True
     include_except_rules: bool = True
-    rerank_timeout_seconds: float = 15.0
+    rerank_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         # 第一版契约的上限是安全边界；测试可用更小值，但不可放大。
@@ -250,6 +251,7 @@ class KnowledgeProcessingOptions(Serializable):
         self.prompt_max_chars_per_title = max(1, int(self.prompt_max_chars_per_title))
         self.batch_prompt_max_chars = max(1, int(self.batch_prompt_max_chars))
         self.prompt_max_chars_per_candidate = max(1, int(self.prompt_max_chars_per_candidate))
+        self.semifinal_prompt_max_chars = max(1, int(self.semifinal_prompt_max_chars))
         self.global_prompt_max_chars_per_candidate = max(
             1, int(self.global_prompt_max_chars_per_candidate)
         )

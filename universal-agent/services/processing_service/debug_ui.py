@@ -6,28 +6,19 @@ import json
 import re
 import uuid
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from kbagent.shared.knowledge_processing.models import KnowledgeProcessingOptions
 
-from .debug_trace import MAX_TRACE_RESPONSE_BYTES, ProcessingTraceCollector
+from .debug_trace import ProcessingTraceCollector
 from .models import ProcessingRequest
 from .runner import run_processing_request
 
 
 STATIC_ROOT = Path(__file__).resolve().parent / "static" / "processing_debug"
-MAX_DEBUG_RESPONSE_BYTES = 6_000_000
+MAX_DEBUG_RESPONSE_BYTES = 50_000_000
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
-
-
-class DebugProcessingRequest(ProcessingRequest):
-    """调试接口扩展字段；不改变正式 /process 的请求契约。"""
-
-    rerank_input_mode: Literal[
-        "title_only", "headings_and_intro", "title_then_content", "title_and_content"
-    ] = "title_then_content"
 
 
 def create_debug_router(processing_path: str) -> APIRouter:
@@ -51,30 +42,23 @@ def create_debug_router(processing_path: str) -> APIRouter:
 
     @router.post("/ui/run")
     async def debug_run(
-        payload: DebugProcessingRequest,
+        payload: ProcessingRequest,
         request: Request,
     ) -> JSONResponse:
-        if len(payload.chunks) > 100:
-            raise HTTPException(status_code=413, detail="调试页面最多支持100条候选")
+        if len(payload.chunks) > 300:
+            raise HTTPException(status_code=413, detail="调试页面最多支持300条候选")
 
         request_id = request.headers.get("X-Request-ID", "").strip()
         if not _REQUEST_ID_PATTERN.fullmatch(request_id):
             request_id = f"processing-debug-{uuid.uuid4().hex}"
         collector = ProcessingTraceCollector(payload.model_dump())
-        processing_payload = ProcessingRequest.model_validate(
-            payload.model_dump(exclude={"rerank_input_mode"})
-        )
-        options = KnowledgeProcessingOptions(
-            rerank_input_mode=payload.rerank_input_mode
-        )
         try:
             result = await asyncio.wait_for(
                 run_processing_request(
-                    processing_payload,
+                    payload,
                     model=request.app.state.model,
                     request_id=request_id,
                     trace_collector=collector,
-                    options=options,
                 ),
                 timeout=request.app.state.timeout_s,
             )
@@ -92,12 +76,10 @@ def create_debug_router(processing_path: str) -> APIRouter:
         }
         encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_DEBUG_RESPONSE_BYTES:
-            body["trace"] = {
-                "trace_id": result.trace_id,
-                "trace_truncated": True,
-                "truncation_reason": "debug_response_size_limit",
-                "limits": {"max_trace_bytes": MAX_TRACE_RESPONSE_BYTES},
-            }
+            body["trace"] = collector.summary(
+                result.trace_id,
+                reason="debug_response_size_limit",
+            )
             encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_DEBUG_RESPONSE_BYTES:
             raise HTTPException(status_code=413, detail="调试响应超过大小上限")

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 import uuid
@@ -22,13 +21,12 @@ from .models import (
     ProcessingResponse,
 )
 from .runner import run_processing_request
+from .service_logging import logger
 
-
-logger = logging.getLogger("processing_service")
 
 ENV_BASE_PATH = "PROCESSING_SERVICE_BASE_PATH"
 DEFAULT_BASE_PATH = "/api/processing-service/prod"
-DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_TIMEOUT_S = 240.0
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -72,7 +70,10 @@ def _default_model() -> Any:
             return model_cls(model=mc.model, temperature=mc.temperature, **mc.kwargs)
         logger.warning("config.yaml 未配置 models,使用离线 ScriptedChatModel")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("加载模型配置失败(%r),使用离线 ScriptedChatModel", exc)
+        logger.warning(
+            "加载模型配置失败 error_type=%s,使用离线 ScriptedChatModel",
+            type(exc).__name__,
+        )
     from kbagent.scripted_model import ScriptedChatModel
     return ScriptedChatModel()
 
@@ -147,16 +148,6 @@ def create_app(
             )
             return _error(RTN_INTERNAL, "Processing 服务内部错误", request_id, 500)
 
-        logger.info(
-            "request_id=%s trace_id=%s outcome=%s degraded=%s input=%d top=%d elapsed_ms=%d",
-            request_id,
-            result.trace_id,
-            result.outcome,
-            result.degraded,
-            result.processing_meta.input_count,
-            len(result.top3_candidates),
-            result.elapsed_ms,
-        )
         return ProcessingResponse(object=result)
 
     return app

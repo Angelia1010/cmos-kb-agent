@@ -46,6 +46,12 @@ class ProcessingRequest(BaseModel):
     retrieval_query: str | None = Field(default=None, min_length=1)
     processing_context: ProcessingContextInput
     chunks: list[RetrievalChunk]
+    rerank_input_mode: Literal[
+        "title_only", "headings_and_intro", "title_then_content", "title_and_content"
+    ] = Field(
+        default="title_then_content",
+        description="重排模型输入模式；缺省保持标题粗排、精简正文终排",
+    )
 
 
 class TopCandidate(BaseModel):
