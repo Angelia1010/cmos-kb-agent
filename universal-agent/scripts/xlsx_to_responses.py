@@ -62,7 +62,9 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "retrieved_json": ["retrieveddocs", "retrieveddoc", "retrieveddocsjson",
                        "top100docs", "召回文档"],
     "gold_ids":   ["知识id列表", "知识id", "goldid", "goldids", "标准知识id"],
-    "gold_titles": ["知识标题列表", "知识标题", "goldtitle", "goldtitles", "标准知识标题"],
+    "gold_titles": ["知识标题列表", "知识标题", "goldtitle", "goldtitles", "标准知识标题",
+                    "客户问题涉及的知识标题"],
+    "gold_atoms": ["原子名称", "客户问题涉及的原子名称", "知识原子", "goldatom", "goldatoms"],
 }
 
 
@@ -194,6 +196,7 @@ def convert(rows: List[List[str]]) -> List[Dict[str, Any]]:
             "province": cell(row, "province"),
             "gold_ids": _split_cell(cell(row, "gold_ids")),
             "gold_titles": _split_cell(cell(row, "gold_titles")),
+            "gold_atoms": _split_cell(cell(row, "gold_atoms")),
             "object": obj,
             "error": None,
         })

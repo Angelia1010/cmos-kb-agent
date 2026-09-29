@@ -39,18 +39,29 @@ logger = logging.getLogger("kbagent.answer")
 _VALID_LEVELS = (USABILITY_DIRECT, USABILITY_VERIFY, USABILITY_NOT)
 
 _ANSWER_SYSTEM = (
-    "[TASK:answer] 你是10086坐席辅助助手。基于给定知识片段生成坐席答复内容,输出 JSON:"
+    "[TASK:answer] 你是10086坐席辅助助手。基于给定材料生成坐席答复内容,输出 JSON:"
     '{"script": str(可直接念给用户的口语化完整话术,以“您好”开头,自然流畅,'
     "把必要的注意事项/前提条件自然融入话术,不要遗漏资费、时限等关键数字), "
     '"handling_suggestion": str(给坐席的办理建议:怎么办、需要什么材料、'
     '需与客户确认什么、有什么限制条件), '
     '"usability": {"level": "directly_usable|verify_first|not_usable", '
-    '"reasons": [str](判定依据), "uncovered": [str](用户问题中知识片段未覆盖的方面)}}。'
-    "话术与建议中的每个事实必须能在知识片段中找到依据,禁止使用片段之外的信息。"
-    "只输出 JSON,不要输出 sentences/citations 等其他字段。"
-    "usability 必须诚实自评:片段足以完整回答且信息明确→directly_usable;"
-    "片段只覆盖部分问题、信息含糊或相互矛盾→verify_first 并在 uncovered 列出未覆盖方面;"
-    "片段与问题基本无关→not_usable。禁止为了好看而拔高 level。"
+    '"reasons": [str](判定依据), "uncovered": [str](用户问题中材料未覆盖的方面)}}。'
+    "\n\n材料分两层:"
+    "\n【关键依据片段】已从原文逐字校验,是生成话术的**首选依据**;"
+    "\n【全文参考】仅作兜底,若引用其中内容,必须确保能在原文精确定位。"
+    "\n\n[硬性规则]"
+    "\n1. 话术与建议中的每个事实(资费数字、时限、办理条件、渠道、流程)都必须来自材料"
+    "并能对应原文;禁止凭记忆改写、自行补全、引入材料之外的常识或推测。"
+    "\n2. 数字、金额、时限、生效日期必须与原文**逐字一致**,禁止改动、四舍五入或换算。"
+    "\n3. 原文未明确写出的前提、例外、办理时间,不要臆断;必要时写“具体请以最新政策为准”"
+    "或“需与客户核实”,不要编造确定值。"
+    "\n4. 若不同片段/文档相互矛盾,不要自选其一:usability 置 verify_first,"
+    "并在 reasons 中列出矛盾点。"
+    "\n5. 覆盖用户问题的每个子问;材料无法覆盖的方面写入 uncovered,usability 至少 verify_first。"
+    "\n\n只输出 JSON,不要输出 sentences/citations 等其他字段。"
+    "usability 必须诚实自评:材料足以完整回答且信息明确→directly_usable;"
+    "材料只覆盖部分问题、信息含糊或相互矛盾→verify_first 并在 uncovered 列出未覆盖方面;"
+    "材料与问题基本无关→not_usable。禁止为了好看而拔高 level。"
     "字符串值内禁止出现未转义的英文双引号:引用词语请改用中文引号“”,"
     '或写成 \\" ;值内禁止换行。'
 )
@@ -195,6 +206,34 @@ def select_fragments(query: str, chunks: List[Chunk], top_n: int = 4) -> List[Ch
     return selected
 
 
+def _build_material_text(materials: List[Chunk],
+                         matched: Optional[List[DocFragments]]) -> str:
+    """组装生成材料,分两层:
+
+    【关键依据片段】locate 阶段从原文逐字校验摘出的片段(首选依据,抗幻觉);
+    【全文参考】完整 chunk 正文(兜底,保完整性)。
+
+    matched 缺失、或某 chunk 无已验证片段时,该篇不进关键层,只进全文层;
+    两层都为空的极端情况退回纯全文拼接(兼容 locate 未运行的旧行为)。
+    """
+    frag_by_id = {d.chunk_id: d for d in (matched or [])}
+    key_blocks: List[str] = []
+    for c in materials:
+        df = frag_by_id.get(c.chunk_id)
+        if df and df.fragments:
+            lines = "\n".join(f"- {f.text}" for f in df.fragments)
+            key_blocks.append(f'<chunk id="{c.chunk_id}">\n{lines}\n</chunk>')
+    full_text = "\n".join(
+        f'<chunk id="{c.chunk_id}">{c.content}</chunk>' for c in materials)
+
+    parts: List[str] = []
+    if key_blocks:
+        parts.append("【关键依据片段】(已逐字校验,首选依据)\n"
+                     + "\n".join(key_blocks))
+    parts.append("【全文参考】(兜底,引用须能在原文定位)\n" + full_text)
+    return "\n\n".join(parts)
+
+
 def generate(model: Any, query: str, materials: List[Chunk],
              cfg: Config, tracer: Tracer, trace_id: str,
              matched: Optional[List[DocFragments]] = None) -> FinalAnswer:
@@ -207,10 +246,9 @@ def generate(model: Any, query: str, materials: List[Chunk],
     logger.info("answer 开始 query=%r 素材=%d条 ids=%s",
                 query, len(materials), [c.chunk_id for c in materials])
     tracer.log("answer", "materials", chunk_ids=[c.chunk_id for c in materials])
-    material_text = "\n".join(
-        f'<chunk id="{c.chunk_id}">{c.content}</chunk>' for c in materials)
+    material_text = _build_material_text(materials, matched)
     data = _invoke_json(model, _ANSWER_SYSTEM,
-                        f"用户问题:{query}\n知识片段:\n{material_text}")
+                        f"用户问题:{query}\n{material_text}")
     if not data:
         logger.warning("answer LLM 未产出有效 JSON → 最终答案将为空 "
                        "(耗时%.1fs, 原始输出见上一条日志)",
@@ -227,7 +265,7 @@ def generate(model: Any, query: str, materials: List[Chunk],
     if script and materials:
         check = _invoke_json(
             model, _CONSISTENCY_SYSTEM,
-            f"坐席话术:{script}\n知识片段:\n{material_text}")
+            f"坐席话术:{script}\n{material_text}")
         consistent = bool(check.get("consistent", False)) if check else False
         raw_issues = check.get("issues") if check else None
         if isinstance(raw_issues, list):

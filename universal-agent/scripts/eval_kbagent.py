@@ -5,18 +5,23 @@
 
 评测维度
 ────────
-A. 检索质量(对 kbagent_service 返回的 sources Top3):
-   A1  Top3命中率(核心)   : judge 逐篇判 yes/partial/no,≥1 篇 yes → 案例命中
-   A1' 客观Top3准确率     : gold 知识ID/标题 与 Top3 docId/docTitle 比对(不经 LLM)
-   A2  Precision@3        : (yes×1 + partial×0.5) / 3 的均值
-   A3  MRR@3              : 首个 yes 文档排名的倒数,无 yes 记 0
-   A4  召回命中率         : gold 与 retrievedDocs(重排前召回)比对,
+A. 检索质量(对 kbagent_service 返回的 sources Top3; judge 结合标题+正文):
+   A1  Top3准确率(核心)   : judge 逐篇语义判定是否命中标准答案(gold 标题/原子),
+                           ≥1 篇命中 → 案例算对(不要求字符串完全一致)
+   A2  问题相关率(核心)   : judge 逐篇判 yes/partial/no 与用户问题的相关性,
+                           ≥1 篇 yes → 案例相关
+   A3  Precision@3        : (yes×1 + partial×0.5) / 3 的均值
+   A4  MRR@3              : 首个 yes 文档排名的倒数,无 yes 记 0
+   A5  召回命中率         : gold 与 retrievedDocs(重排前召回)字符串比对,
                            用于区分"检索没捞到" vs "重排排掉了"
+   参考 客观Top3字符串匹配 : gold ID/标题 与 Top3 docId/docTitle 比对(不经 LLM)
 B. 话术质量(judge 按 0/1/2 打分):
    B1 回答相关性  B2 忠实性(幻觉检测)  B3 与原文一致性(矛盾一票否决)
    B4 完整性      B5 坐席可用性
    B6 自评校准    : judge 独立给出的 usability vs 系统 usability.level 一致率
-   话术通过线     : B1≥1 且 B2≥1 且 B3=2
+   话术通过线     : 可配置(--pass-b1/b2/b3-min)。默认宽松 = B1≥1 且 B2≥1 且 B3≥1
+                   (仅 B3=0 致命矛盾一票否决);严格口径 B3=2 始终并列输出对照。
+                   report 阶段改阈值会从原始分数重算,无需重新调 LLM。
 
 用法(两阶段,天然支持"实时采集"与"已有结果文件"两种版本)
 ────────────────────────────────────────────────────────
@@ -173,6 +178,8 @@ def _cases_from_xlsx_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
     i_ids = col("知识ID列表", "知识ID")
     i_titles = col("知识标题列表", "知识标题",
                    "客户问题涉及的知识标题", "涉及知识标题")
+    # 人工反馈表(格式2)的 gold 由"知识标题"与"原子名称"两列共同构成
+    i_atoms = col("客户问题涉及的原子名称", "原子名称", "涉及原子名称")
     if i_query < 0:
         raise ValueError(
             f"xlsx 缺少问题列(用户问/客户问题), 实际表头: {header}")
@@ -189,7 +196,8 @@ def _cases_from_xlsx_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
         case = merged.get(key)
         if case is None:
             case = {"case_id": f"c{cell(i_seq) or row_no}", "query": query,
-                    "province": province, "gold_ids": [], "gold_titles": []}
+                    "province": province, "gold_ids": [], "gold_titles": [],
+                    "gold_atoms": []}
             merged[key] = case
         for gold_id in _split_cell_list(cell(i_ids)):
             if gold_id not in case["gold_ids"]:
@@ -197,6 +205,9 @@ def _cases_from_xlsx_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
         for gold_title in _split_cell_list(cell(i_titles)):
             if gold_title not in case["gold_titles"]:
                 case["gold_titles"].append(gold_title)
+        for atom in _split_cell_list(cell(i_atoms)):
+            if atom not in case["gold_atoms"]:
+                case["gold_atoms"].append(atom)
     return list(merged.values())
 
 
@@ -221,6 +232,8 @@ def load_testset(path: str, province: Optional[str] = None,
                 "province": item.get("province", ""),
                 "gold_ids": list(item.get("knowledge_ids") or []),
                 "gold_titles": list(item.get("knowledge_titles") or []),
+                "gold_atoms": list(item.get("knowledge_atoms")
+                                   or item.get("gold_atoms") or []),
             })
         cases = [c for c in cases if c["query"]]
 
@@ -376,22 +389,32 @@ def run_collect(args: argparse.Namespace) -> None:
 # 阶段2: judge — LLM 评审
 # ═══════════════════════════════════════════════════════════════════════════
 
-RETRIEVAL_JUDGE_PROMPT = """你是10086客服知识库的检索评测专家。给定用户问题和检索系统返回的Top3文档,请逐篇独立判断该文档与问题的相关性。
+RETRIEVAL_JUDGE_PROMPT = """你是10086客服知识库的检索评测专家。给定用户问题、标准答案(gold:知识标题/原子名称)、以及检索系统返回的Top3文档(标题+正文摘录),请对每篇文档独立做两个判定。
+
+[判定1 gold_match — 是否命中标准答案]
+结合文档标题和正文,判断该文档与"标准答案"中的任一条是否指向同一个知识/业务:
+- yes: 就是标准答案对应的知识。标题语义一致即可(同义改写/简繁/标点/前后缀差异都算命中),或正文内容表明其与标准答案是同一业务知识点。不要求字符串完全一致
+- no: 与所有标准答案都不是同一知识,或只是相关背景/周边业务
+(标准答案标注为"(无)"时,gold_match 一律输出 "no")
+
+[判定2 query_relevant — 是否与用户问题相关]
+结合文档标题和正文:
+- yes: 该文档能回答用户问题的全部或核心部分
+- partial: 主题相关,但不足以回答问题(只有背景/周边信息)
+- no: 与问题无关,无法为回答提供有效信息
 
 [用户问题]
 {query}
 
+[标准答案]
+{golds}
+
 [候选文档]
 {docs}
 
-[判定标准]
-- yes: 文档内容与用户问题直接相关,且能回答问题的全部或核心部分
-- partial: 文档主题相关,但不足以回答问题(只有背景/周边信息)
-- no: 与问题无关,或无法为回答提供任何有效信息
-
 [输出要求]
 只输出一个JSON对象,不要任何解释文字,不要markdown代码块标记,格式:
-{{"judgments":[{{"doc":"D1","verdict":"yes","reason":"一句话理由"}}]}}
+{{"judgments":[{{"doc":"D1","gold_match":"yes","query_relevant":"yes","reason":"一句话理由"}}]}}
 judgments 必须按顺序包含全部候选文档。"""
 
 ANSWER_JUDGE_PROMPT = """你是10086客服话术质量评测专家。给定用户问题、系统检索到的参考文档、以及系统生成的坐席话术,请按以下5个维度独立打分(每维0/1/2分)。
@@ -430,12 +453,31 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"…(截断,原文{len(text)}字)"
 
 
-def _format_docs(sources: Sequence[Dict[str, Any]], doc_chars: int) -> str:
+def _format_golds(gold_titles: Sequence[str], gold_atoms: Sequence[str]) -> str:
+    """把 gold 标注(知识标题 + 原子名称)拼成 judge 用的标准答案块。"""
+    lines = [f"- {t}" for t in (gold_titles or []) if t]
+    atoms = [a for a in (gold_atoms or []) if a]
+    text = "\n".join(lines)
+    if atoms:
+        text += ("\n" if text else "") + f"(涉及知识原子: {'、'.join(atoms)})"
+    return text or "(无)"
+
+
+def _format_docs(sources: Sequence[Dict[str, Any]], doc_chars: int,
+                 title_only: bool = False) -> str:
+    """把 Top3 sources 拼成 judge 用的文档块。
+
+    title_only=True 时只输出文档标题;
+    否则输出标题+截断正文(检索评审结合正文判 gold 命中,话术评审核对忠实性)。
+    """
     blocks = []
     for i, s in enumerate(sources[:3], 1):
-        blocks.append(
-            f"<D{i}> 标题: {s.get('docTitle', '')}\n"
-            f"正文: {_clip(s.get('content', ''), doc_chars)}\n</D{i}>")
+        if title_only:
+            blocks.append(f"<D{i}> 标题: {s.get('docTitle', '')}</D{i}>")
+        else:
+            blocks.append(
+                f"<D{i}> 标题: {s.get('docTitle', '')}\n"
+                f"正文: {_clip(s.get('content', ''), doc_chars)}\n</D{i}>")
     return "\n\n".join(blocks) if blocks else "(无检索结果)"
 
 
@@ -493,10 +535,15 @@ def _validate_retrieval(data: Dict[str, Any], expect_n: int) -> List[Dict[str, s
         raise ValueError("缺少 judgments 列表")
     out = []
     for j in judgments[:expect_n]:
-        verdict = str(j.get("verdict", "")).lower().strip()
-        if verdict not in {"yes", "partial", "no"}:
-            raise ValueError(f"非法 verdict: {verdict!r}")
-        out.append({"doc": str(j.get("doc", "")), "verdict": verdict,
+        gold_match = str(j.get("gold_match", "")).lower().strip()
+        if gold_match not in {"yes", "no"}:
+            raise ValueError(f"非法 gold_match: {gold_match!r}")
+        query_relevant = str(j.get("query_relevant", "")).lower().strip()
+        if query_relevant not in {"yes", "partial", "no"}:
+            raise ValueError(f"非法 query_relevant: {query_relevant!r}")
+        out.append({"doc": str(j.get("doc", "")),
+                    "gold_match": gold_match,
+                    "query_relevant": query_relevant,
                     "reason": str(j.get("reason", ""))[:200]})
     if len(out) != expect_n:
         raise ValueError(f"judgments 数量 {len(out)} ≠ 候选数 {expect_n}")
@@ -522,6 +569,29 @@ def _validate_answer(data: Dict[str, Any]) -> Dict[str, Any]:
         "reasons": {k: str(v)[:200] for k, v in (data.get("reasons") or {}).items()},
         "judge_usability": level,
     }
+
+
+# ── 话术通过线(可配置;默认宽松: B1≥1 且 B2≥1 且 B3≥1,仅致命矛盾一票否决) ──
+
+PASS_B1_MIN_DEFAULT = 1
+PASS_B2_MIN_DEFAULT = 1
+PASS_B3_MIN_DEFAULT = 1   # 1=宽松(B3=0 才否决)  2=严格(零矛盾)
+
+
+def answer_pass(scores: Dict[str, Any], b1_min: int, b2_min: int,
+                b3_min: int) -> bool:
+    """按阈值判话术是否通过;任一维度缺分视为不通过。"""
+    try:
+        return (int(scores["b1_relevance"]) >= b1_min
+                and int(scores["b2_faithfulness"]) >= b2_min
+                and int(scores["b3_consistency"]) >= b3_min)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _strict_pass(scores: Dict[str, Any]) -> bool:
+    """严格口径(旧默认): B1≥1 且 B2≥1 且 B3=2(零矛盾)。"""
+    return answer_pass(scores, 1, 1, 2)
 
 
 # ── 客观指标:gold 匹配(ID 前缀匹配容忍截断;标题归一化后互含匹配) ──────────
@@ -581,6 +651,7 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
         "province": record.get("province", ""),
         "gold_ids": record.get("gold_ids") or [],
         "gold_titles": record.get("gold_titles") or [],
+        "gold_atoms": record.get("gold_atoms") or [],
         "degraded": bool(obj.get("degraded")),
         "collect_error": record.get("error"),
         "system_usability": str((obj.get("usability") or {}).get("level") or ""),
@@ -604,10 +675,13 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
         [str(d.get("title") or "") for d in retrieved],
     ) if retrieved else None
 
-    # ── A: 检索评审(有 Top3 才调 LLM) ──
+    # ── A: 检索评审(有 Top3 才调 LLM;结合标题+正文,双判定 gold命中/问题相关) ──
+    golds = _format_golds(verdict["gold_titles"], verdict["gold_atoms"])
+    has_gold = bool(verdict["gold_titles"] or verdict["gold_atoms"]
+                    or verdict["gold_ids"])
     if sources:
-        docs = _format_docs(sources, args.doc_chars)
-        prompt = RETRIEVAL_JUDGE_PROMPT.format(query=query, docs=docs)
+        docs = _format_docs(sources, args.doc_chars, title_only=False)
+        prompt = RETRIEVAL_JUDGE_PROMPT.format(query=query, golds=golds, docs=docs)
         n = min(3, len(sources))
         judgments, err = _judge_with_retry(
             args.llm_url, prompt, args.llm_timeout, args.insecure,
@@ -615,20 +689,26 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
         if err:
             verdict["retrieval"]["judge_error"] = err
         else:
-            verdicts_seq = [j["verdict"] for j in judgments]
-            first_yes = next((i for i, v in enumerate(verdicts_seq, 1)
+            gold_seq = [j["gold_match"] for j in judgments]
+            rel_seq = [j["query_relevant"] for j in judgments]
+            first_yes = next((i for i, v in enumerate(rel_seq, 1)
                               if v == "yes"), None)
             verdict["retrieval"] = {
                 "judgments": judgments,
-                "any_yes": any(v == "yes" for v in verdicts_seq),
-                "any_relevant": any(v in ("yes", "partial") for v in verdicts_seq),
+                # A1 Top3准确率: gold 任一命中即算对(无 gold 标注则不计入, 记 None)
+                "gold_hit": (any(v == "yes" for v in gold_seq)
+                             if has_gold else None),
+                # A2 问题相关率: ≥1 篇 yes
+                "any_yes": any(v == "yes" for v in rel_seq),
+                "any_relevant": any(v in ("yes", "partial") for v in rel_seq),
                 "precision_at_3": round(sum(
                     1.0 if v == "yes" else 0.5 if v == "partial" else 0.0
-                    for v in verdicts_seq) / 3.0, 4),
+                    for v in rel_seq) / 3.0, 4),
                 "rr": round(1.0 / first_yes, 4) if first_yes else 0.0,
             }
     else:
-        verdict["retrieval"] = {"any_yes": False, "any_relevant": False,
+        verdict["retrieval"] = {"gold_hit": (False if has_gold else None),
+                                "any_yes": False, "any_relevant": False,
                                 "precision_at_3": 0.0, "rr": 0.0,
                                 "judgments": [], "judge_error": None,
                                 "note": "sources 为空"}
@@ -647,9 +727,9 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
             verdict["answer"]["judge_error"] = err
         else:
             answer = dict(answer)
-            answer["pass"] = (answer["b1_relevance"] >= 1
-                              and answer["b2_faithfulness"] >= 1
-                              and answer["b3_consistency"] == 2)
+            answer["pass"] = answer_pass(
+                answer, args.pass_b1_min, args.pass_b2_min, args.pass_b3_min)
+            answer["pass_strict"] = _strict_pass(answer)
             verdict["answer"] = answer
     else:
         verdict["answer"] = {"pass": False, "note": "话术为空",
@@ -664,12 +744,17 @@ def run_judge(args: argparse.Namespace) -> None:
     # 可选:用测试集按 query 关联 gold 标注(版本2:自带响应文件无 gold 时)
     if args.testset:
         golds = {c["query"]: c for c in load_testset(args.testset)}
+        filled = 0
         for r in responses:
             g = golds.get(str(r.get("query") or ""))
-            if g and not r.get("gold_ids") and not r.get("gold_titles"):
+            if g and not r.get("gold_ids") and not r.get("gold_titles") \
+                    and not r.get("gold_atoms"):
                 r["gold_ids"] = g["gold_ids"]
                 r["gold_titles"] = g["gold_titles"]
+                r["gold_atoms"] = g.get("gold_atoms") or []
                 r.setdefault("province", g["province"])
+                filled += 1
+        _log(f"testset gold 补齐: {filled}/{len(responses)} 条按 query 关联到标注")
 
     out = Path(args.out)
     writer = JsonlWriter(out / "verdicts.jsonl")
@@ -701,7 +786,7 @@ def run_judge(args: argparse.Namespace) -> None:
             r = verdict.get("retrieval", {})
             a = verdict.get("answer", {})
             _log(f"[{counter['done']}/{len(todo)}] {verdict.get('case_id')} "
-                 f"any_yes={r.get('any_yes')} gold={verdict.get('objective', {}).get('top3_gold_hit')} "
+                 f"gold命中={r.get('gold_hit')} 问题相关={r.get('any_yes')} "
                  f"pass={a.get('pass')}" + (f" ⚠judge_err: {err}" if err else ""))
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -712,7 +797,8 @@ def run_judge(args: argparse.Namespace) -> None:
         _log("错误汇总(次数 × 错误):")
         for kind, n in sorted(counter["err_kinds"].items(), key=lambda x: -x[1]):
             _log(f"  {n:>4} × {kind}")
-    build_report(read_jsonl(out / "verdicts.jsonl"), out)
+    build_report(read_jsonl(out / "verdicts.jsonl"), out,
+                 (args.pass_b1_min, args.pass_b2_min, args.pass_b3_min))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -816,21 +902,31 @@ def write_xlsx(path: Path, sheets: List[Tuple[str, List[List[Any]]]]) -> None:
 
 _DETAIL_HEADER = [
     "case_id", "省份", "query", "失败原因", "degraded", "服务错误", "采集错误",
-    "gold_ID", "gold_标题", "Top3_ID", "Top3_标题", "Top3命中gold", "召回命中gold",
-    "D1判定", "D1理由", "D2判定", "D2理由", "D3判定", "D3理由",
-    "any_yes", "any_relevant", "precision@3", "rr", "检索评审错误",
-    "B1相关", "B2忠实", "B3一致", "B4完整", "B5可用", "话术通过",
+    "gold_ID", "gold_标题", "gold_原子", "Top3_ID", "Top3_标题",
+    "Top3命中gold(LLM)", "Top3命中gold(字符串)", "召回命中gold",
+    "D1命中gold", "D1问题相关", "D1理由",
+    "D2命中gold", "D2问题相关", "D2理由",
+    "D3命中gold", "D3问题相关", "D3理由",
+    "问题相关(any_yes)", "any_relevant", "precision@3", "rr", "检索评审错误",
+    "B1相关", "B2忠实", "B3一致", "B4完整", "B5可用",
+    "话术通过(当前口径)", "话术通过(严格B3=2)",
     "judge可用性", "系统可用性", "B6一致",
     "矛盾陈述", "遗漏点", "judge理由", "话术评审错误", "话术备注",
     "话术", "办理建议",
 ]
 
 
-def _detail_row(v: Dict[str, Any], fail_reasons: List[str]) -> List[Any]:
+def _detail_row(v: Dict[str, Any], fail_reasons: List[str],
+                pass_th: Tuple[int, int, int] = (
+                    PASS_B1_MIN_DEFAULT, PASS_B2_MIN_DEFAULT,
+                    PASS_B3_MIN_DEFAULT)) -> List[Any]:
     r = v.get("retrieval", {}) or {}
     a = v.get("answer", {}) or {}
     o = v.get("objective", {}) or {}
     judgments = r.get("judgments") or []
+    has_scores = "b1_relevance" in a
+    pass_cur = answer_pass(a, *pass_th) if has_scores else None
+    pass_strict = _strict_pass(a) if has_scores else None
 
     def jd(i: int, key: str) -> str:
         return str(judgments[i].get(key, "")) if i < len(judgments) else ""
@@ -845,18 +941,19 @@ def _detail_row(v: Dict[str, Any], fail_reasons: List[str]) -> List[Any]:
         v.get("collect_error") or "",
         " | ".join(v.get("gold_ids") or []),
         " | ".join(v.get("gold_titles") or []),
+        " | ".join(v.get("gold_atoms") or []),
         " | ".join(o.get("top3_ids") or []),
         " | ".join(o.get("top3_titles") or []),
-        o.get("top3_gold_hit"), o.get("recall_gold_hit"),
-        jd(0, "verdict"), jd(0, "reason"),
-        jd(1, "verdict"), jd(1, "reason"),
-        jd(2, "verdict"), jd(2, "reason"),
+        r.get("gold_hit"), o.get("top3_gold_hit"), o.get("recall_gold_hit"),
+        jd(0, "gold_match"), jd(0, "query_relevant"), jd(0, "reason"),
+        jd(1, "gold_match"), jd(1, "query_relevant"), jd(1, "reason"),
+        jd(2, "gold_match"), jd(2, "query_relevant"), jd(2, "reason"),
         r.get("any_yes"), r.get("any_relevant"),
         r.get("precision_at_3"), r.get("rr"),
         r.get("judge_error") or "",
         a.get("b1_relevance"), a.get("b2_faithfulness"),
         a.get("b3_consistency"), a.get("b4_completeness"),
-        a.get("b5_usability"), a.get("pass"),
+        a.get("b5_usability"), pass_cur, pass_strict,
         judge_u, system_u, b6,
         " | ".join(a.get("contradictions") or []),
         " | ".join(a.get("uncovered") or []),
@@ -889,7 +986,13 @@ def _mean(values: Sequence[float]) -> Optional[float]:
     return round(sum(values) / len(values), 4) if values else None
 
 
-def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
+def build_report(verdicts: List[Dict[str, Any]], out: Path,
+                 pass_th: Tuple[int, int, int] = (
+                     PASS_B1_MIN_DEFAULT, PASS_B2_MIN_DEFAULT,
+                     PASS_B3_MIN_DEFAULT)) -> Dict[str, Any]:
+    """汇总报表。pass_th=(b1,b2,b3) 最低分门槛,从原始分数重算通过率,
+    因此旧 verdicts.jsonl 无需重新调 LLM 即可改判口径。"""
+    b1_min, b2_min, b3_min = pass_th
     out.mkdir(parents=True, exist_ok=True)
     total = len(verdicts)
     service_err = [v for v in verdicts if v.get("service_error") or v.get("fatal_error")]
@@ -898,22 +1001,29 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
     answer_ok = [v for v in judged if not v.get("answer", {}).get("judge_error")
                  and "note" not in v.get("answer", {})]
 
-    # A 指标
-    a1 = _rate([v.get("retrieval", {}).get("any_yes") for v in retrieval_ok])
-    a1_loose = _rate([v.get("retrieval", {}).get("any_relevant") for v in retrieval_ok])
-    a1_obj = _rate([v.get("objective", {}).get("top3_gold_hit") for v in judged])
-    a2 = _mean([v["retrieval"]["precision_at_3"] for v in retrieval_ok
+    # A 指标(案例级: Top3 任一命中即算对)
+    a1 = _rate([v.get("retrieval", {}).get("gold_hit") for v in retrieval_ok])
+    a1_n = sum(1 for v in retrieval_ok
+               if v.get("retrieval", {}).get("gold_hit") is not None)
+    a2 = _rate([v.get("retrieval", {}).get("any_yes") for v in retrieval_ok])
+    a2_loose = _rate([v.get("retrieval", {}).get("any_relevant") for v in retrieval_ok])
+    a3 = _mean([v["retrieval"]["precision_at_3"] for v in retrieval_ok
                 if "precision_at_3" in v.get("retrieval", {})])
-    a3 = _mean([v["retrieval"]["rr"] for v in retrieval_ok
+    a4 = _mean([v["retrieval"]["rr"] for v in retrieval_ok
                 if "rr" in v.get("retrieval", {})])
-    a4 = _rate([v.get("objective", {}).get("recall_gold_hit") for v in judged])
+    a5 = _rate([v.get("objective", {}).get("recall_gold_hit") for v in judged])
+    a_obj = _rate([v.get("objective", {}).get("top3_gold_hit") for v in judged])
 
     # B 指标
     b_keys = ["b1_relevance", "b2_faithfulness", "b3_consistency",
               "b4_completeness", "b5_usability"]
     b_means = {k: _mean([v["answer"][k] for v in answer_ok if k in v.get("answer", {})])
                for k in b_keys}
-    b_pass = _rate([v["answer"].get("pass") for v in answer_ok if "pass" in v.get("answer", {})])
+    # 通过率按 pass_th 从原始分数重算(旧 verdicts 也能改口径,无需重判)
+    b_pass = _rate([answer_pass(v["answer"], b1_min, b2_min, b3_min)
+                    for v in answer_ok])
+    # 严格口径(B1≥1,B2≥1,B3=2)始终并列输出做对照
+    b_pass_strict = _rate([_strict_pass(v["answer"]) for v in answer_ok])
     b3_fatal = _rate([v["answer"]["b3_consistency"] == 0 for v in answer_ok
                       if "b3_consistency" in v.get("answer", {})])
     # B6 自评校准:judge_usability vs system usability.level
@@ -936,17 +1046,20 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
         },
         "degraded_count": sum(1 for v in judged if v.get("degraded")),
         "A_retrieval": {
-            "A1_top3命中率(judge,≥1篇yes)": a1,
-            "A1_loose(judge,含partial)": a1_loose,
-            "A1_objective_top3准确率(gold比对)": a1_obj,
-            "A2_precision@3": a2,
-            "A3_mrr@3": a3,
-            "A4_召回命中率(gold比对retrievedDocs)": a4,
+            "A1_top3准确率(LLM语义命中gold,≥1篇即对)": a1,
+            "A1_有效样本(有gold标注)": a1_n,
+            "A2_问题相关率(LLM,≥1篇yes)": a2,
+            "A2_loose(含partial)": a2_loose,
+            "A3_precision@3": a3,
+            "A4_mrr@3": a4,
+            "A5_召回命中率(字符串比对retrievedDocs)": a5,
             "召回命中但Top3丢失(重排损耗)": funnel_lost,
+            "参考_top3字符串匹配率(不经LLM)": a_obj,
             "有效样本": len(retrieval_ok),
         },
         "B_answer": {
-            "话术通过率(B1≥1且B2≥1且B3=2)": b_pass,
+            f"话术通过率(B1≥{b1_min},B2≥{b2_min},B3≥{b3_min})": b_pass,
+            "参考_严格通过率(B1≥1,B2≥1,B3=2)": b_pass_strict,
             "B3致命矛盾率": b3_fatal,
             **{f"{k}_均分(0-2)": b_means[k] for k in b_keys},
             "B6_自评一致率(judge vs system)": b6,
@@ -970,16 +1083,25 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
             reasons.append("answer_judge_error")
         if v.get("degraded"):
             reasons.append("degraded")
+        if r and r.get("gold_hit") is False:
+            reasons.append("top3未命中标准答案")
         if r and r.get("any_yes") is False:
-            reasons.append("top3无相关文档")
+            reasons.append("top3与问题不相关")
         if o.get("top3_gold_hit") is False:
-            reasons.append("top3未命中gold")
+            reasons.append("top3字符串未匹配gold")
         if o.get("recall_gold_hit") is True and o.get("top3_gold_hit") is False:
             reasons.append("重排丢失gold")
-        if a.get("pass") is False and "note" not in a:
+        if "note" not in a and not answer_pass(a, b1_min, b2_min, b3_min):
+            thr = {"b1_relevance": b1_min, "b2_faithfulness": b2_min,
+                   "b3_consistency": b3_min}
             for k in b_keys:
-                if k in a and (a[k] == 0 or (k == "b3_consistency" and a[k] < 2)):
-                    reasons.append(f"{k}={a[k]}")
+                if k not in a:
+                    continue
+                need = thr.get(k)
+                if need is not None and a[k] < need:   # 门槛维度不达标
+                    reasons.append(f"{k}={a[k]}<{need}")
+                elif need is None and a[k] == 0:        # b4/b5 非门槛,仅记 0 分
+                    reasons.append(f"{k}=0")
         if a.get("note") == "话术为空":
             reasons.append("话术为空")
         return reasons
@@ -990,7 +1112,8 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
     with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["case_id", "province", "query", "失败原因", "degraded",
-                    "top3标题", "any_yes", "gold_top3", "gold_recall",
+                    "top3标题", "gold标题", "命中gold(LLM)", "问题相关(LLM)",
+                    "gold_top3(字符串)", "gold_recall",
                     "b1", "b2", "b3", "b4", "b5", "judge_usability",
                     "system_usability", "矛盾陈述", "遗漏点", "话术(截断)",
                     "judge理由"])
@@ -1002,7 +1125,9 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
                 v.get("case_id"), v.get("province"), v.get("query"),
                 ";".join(rs), v.get("degraded"),
                 " | ".join(o.get("top3_titles") or []),
-                r.get("any_yes"), o.get("top3_gold_hit"), o.get("recall_gold_hit"),
+                " | ".join(v.get("gold_titles") or []),
+                r.get("gold_hit"), r.get("any_yes"),
+                o.get("top3_gold_hit"), o.get("recall_gold_hit"),
                 a.get("b1_relevance"), a.get("b2_faithfulness"),
                 a.get("b3_consistency"), a.get("b4_completeness"),
                 a.get("b5_usability"), a.get("judge_usability"),
@@ -1018,7 +1143,7 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
     # (纯标准库写出,无 openpyxl 的服务器也能生成)
     detail_rows = [_DETAIL_HEADER]
     for v in verdicts:
-        detail_rows.append(_detail_row(v, fail_reasons(v)))
+        detail_rows.append(_detail_row(v, fail_reasons(v), pass_th))
     xlsx_path = out / "eval_details.xlsx"
     write_xlsx(xlsx_path, [("明细", detail_rows),
                            ("汇总", _summary_rows(summary))])
@@ -1036,16 +1161,18 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path) -> Dict[str, Any]:
     print(f"  评测报告  案例总数={total}  服务错误={len(service_err)}  "
           f"降级={summary['degraded_count']}")
     print("═" * 62)
-    print("  A. 检索质量")
-    print(f"    A1  Top3命中率(judge ≥1篇yes)      : {pct(a1)}")
-    print(f"    A1' 客观Top3准确率(gold比对)       : {pct(a1_obj)}")
-    print(f"    A1~ 宽松命中(含partial)            : {pct(a1_loose)}")
-    print(f"    A2  Precision@3                    : {num(a2)}")
-    print(f"    A3  MRR@3                          : {num(a3)}")
-    print(f"    A4  召回命中率(retrievedDocs)      : {pct(a4)}")
+    print("  A. 检索质量(案例级: Top3 任一命中即算对)")
+    print(f"    A1  Top3准确率(LLM命中标准答案)    : {pct(a1)}  (有gold样本 {a1_n})")
+    print(f"    A2  问题相关率(LLM ≥1篇yes)        : {pct(a2)}")
+    print(f"    A2~ 宽松相关(含partial)            : {pct(a2_loose)}")
+    print(f"    A3  Precision@3                    : {num(a3)}")
+    print(f"    A4  MRR@3                          : {num(a4)}")
+    print(f"    A5  召回命中率(字符串比对)         : {pct(a5)}")
     print(f"    └─ 召回命中但Top3丢失(重排损耗)   : {funnel_lost} 例")
+    print(f"    参考 Top3字符串匹配率(不经LLM)     : {pct(a_obj)}")
     print("  B. 话术质量")
-    print(f"    话术通过率(B1≥1,B2≥1,B3=2)        : {pct(b_pass)}")
+    print(f"    话术通过率(B1≥{b1_min},B2≥{b2_min},B3≥{b3_min})       : {pct(b_pass)}")
+    print(f"    参考 严格通过率(B1≥1,B2≥1,B3=2)   : {pct(b_pass_strict)}")
     for k in b_keys:
         print(f"    {k:<28s}: {num(b_means[k])} / 2")
     print(f"    B3  致命矛盾率                     : {pct(b3_fatal)}")
@@ -1061,7 +1188,8 @@ def run_report(args: argparse.Namespace) -> None:
     verdicts = read_jsonl(Path(args.verdicts))
     if not verdicts:
         raise SystemExit(f"verdicts 文件为空或不存在: {args.verdicts}")
-    build_report(verdicts, Path(args.out))
+    build_report(verdicts, Path(args.out),
+                 (args.pass_b1_min, args.pass_b2_min, args.pass_b3_min))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1079,6 +1207,18 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--workers", type=int, default=2, help="并发数(默认2)")
         sp.add_argument("--insecure", action="store_true",
                         help="https 时跳过证书校验(内网自签)")
+
+    def pass_args(sp: argparse.ArgumentParser) -> None:
+        """话术通过线阈值(B1/B2/B3 各自最低分)。默认宽松:B1≥1,B2≥1,B3≥1
+        (仅 B3=0 致命矛盾一票否决)。要严格口径(零矛盾)设 --pass-b3-min 2。"""
+        sp.add_argument("--pass-b1-min", type=int, default=PASS_B1_MIN_DEFAULT,
+                        help=f"B1相关性最低分(默认{PASS_B1_MIN_DEFAULT})")
+        sp.add_argument("--pass-b2-min", type=int, default=PASS_B2_MIN_DEFAULT,
+                        help=f"B2忠实性最低分(默认{PASS_B2_MIN_DEFAULT})")
+        sp.add_argument("--pass-b3-min", type=int, default=PASS_B3_MIN_DEFAULT,
+                        choices=[0, 1, 2],
+                        help=f"B3一致性最低分(默认{PASS_B3_MIN_DEFAULT}宽松;"
+                             f"2=严格零矛盾)")
 
     p_collect = sub.add_parser("collect", help="实时调 kbagent_service 采集响应")
     p_collect.add_argument("--testset", required=True, help="测试集 .xlsx 或 .json")
@@ -1104,11 +1244,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_judge.add_argument("--testset", default=None,
                          help="可选:用测试集按 query 补齐 gold 标注")
     common(p_judge)
+    pass_args(p_judge)
     p_judge.set_defaults(func=run_judge)
 
     p_report = sub.add_parser("report", help="由 verdicts.jsonl 重算报表")
     p_report.add_argument("--verdicts", required=True)
     p_report.add_argument("--out", required=True)
+    pass_args(p_report)
     p_report.set_defaults(func=run_report)
     return parser
 
