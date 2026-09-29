@@ -7,7 +7,7 @@
     ["analyze", "Analyze", "候选规范化与质量统计", "STAGE 1"],
     ["filter", "Filter", "适用性判定与过滤原因", "STAGE 2"],
     ["build_markdown", "Build Markdown", "业务内容转换与对照", "STAGE 3"],
-    ["rerank", "Rerank 回放", "Batch → Global → Top3", "STAGE 4"],
+    ["rerank", "Rerank 回放", "Batch → 半决选 → Global → Top3", "STAGE 4"],
     ["final", "最终产物", "Top3、processed_chunks 与降级", "RESULT"],
     ["raw", "原始 Trace", "排查特殊字段时使用", "RAW JSON"],
   ];
@@ -24,6 +24,7 @@
     retrieval_rank_supplement: "模型结果不足，按程序内部 retrieval_rank 补位",
     incomplete_model_result: "模型返回结果不完整",
     batch_fallback_used: "上游批次曾发生降级或补位",
+    semifinal_fallback_used: "跨批次半决选曾发生降级或补位",
     global_model_failed: "全局模型调用未产生可用结果",
     rerank_wrong_count: "模型返回数量与期望不一致",
     rerank_invalid_json: "模型未返回严格 JSON",
@@ -34,10 +35,10 @@
   };
 
   const RERANK_MODE_HELP = {
-    title_only: "Batch和Global都只发送标题，输入量最低，但可能损失正文语义",
-    headings_and_intro: "Batch和Global发送H1-H3标题大纲，并附带简介/概述章节正文",
-    title_then_content: "Batch只发送标题，Global发送标题和精简正文",
-    title_and_content: "Batch和Global都发送正文，输入量和模型耗时可能更高",
+    title_only: "Batch、半决选和Global都只发送标题，输入量最低，但可能损失正文语义",
+    headings_and_intro: "Batch、半决选和Global发送H1-H3标题大纲，并附带简介/概述章节正文",
+    title_then_content: "Batch和半决选只发送标题，Global发送标题和精简正文",
+    title_and_content: "Batch、半决选和Global都发送正文，输入量和模型耗时可能更高",
   };
 
   const els = {
@@ -63,7 +64,7 @@
     toast: document.getElementById("toast"),
   };
 
-  const state = { response: null, view: "overview" };
+  const state = { response: null, request: null, view: "overview" };
 
   function make(tag, className, text) {
     const element = document.createElement(tag);
@@ -81,6 +82,29 @@
 
   function array(value) { return Array.isArray(value) ? value : []; }
   function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+  function resolveTraceValue(value, depth = 0) {
+    if (depth > 16) return value;
+    if (Array.isArray(value)) {
+      return value.map((item) => resolveTraceValue(item, depth + 1));
+    }
+    if (!value || typeof value !== "object") return value;
+    const keys = Object.keys(value);
+    if (keys.length === 1 && typeof value.$ref === "string") {
+      const separator = value.$ref.indexOf(":");
+      if (separator < 1) return value;
+      const kind = value.$ref.slice(0, separator);
+      const entityId = value.$ref.slice(separator + 1);
+      const entity = object(object(currentTrace().entities)[kind])[entityId];
+      return entity === undefined ? value : resolveTraceValue(entity, depth + 1);
+    }
+    if (keys.length === 1 && typeof value.$blob === "string") {
+      const blob = object(object(currentTrace().entities).blobs)[value.$blob];
+      return blob === undefined ? value : blob;
+    }
+    const resolved = {};
+    keys.forEach((key) => { resolved[key] = resolveTraceValue(value[key], depth + 1); });
+    return resolved;
+  }
   function stringify(value, space = 2) {
     try { return JSON.stringify(value, null, space); }
     catch (_) { return String(value); }
@@ -211,17 +235,38 @@
 
   function currentTrace() { return state.response ? object(state.response.trace) : {}; }
   function currentStages() { return object(currentTrace().stages); }
-  function stage(name) { return object(currentStages()[name]); }
+  function stage(name) { return object(resolveTraceValue(currentStages()[name])); }
   function stageOutput(name) { return object(stage(name).output); }
+  function currentResult() { return state.response ? object(state.response.final_result) : {}; }
+  function currentFinal() {
+    const traced = object(resolveTraceValue(currentTrace().final));
+    return Object.keys(traced).length ? traced : currentResult();
+  }
+  function currentMeta() { return object(currentFinal().processing_meta); }
+  function currentRequest() {
+    const traced = object(resolveTraceValue(currentTrace().request));
+    return Object.keys(traced).length ? traced : object(state.request);
+  }
+  function traceIsTruncated() { return currentTrace().trace_truncated === true; }
+  function stageSummary(name) { return object(object(currentTrace().stage_summary)[name]); }
+  function listCount(container, key) {
+    const value = object(container)[key];
+    return Array.isArray(value) ? value.length : null;
+  }
+  function firstCount(...values) {
+    const value = values.find((item) => Number.isFinite(item) && item >= 0);
+    return value === undefined ? null : value;
+  }
+  function displayedCount(value) { return value === null ? "—" : value; }
 
   function viewData(name) {
     if (name === "overview" || name === "raw") return currentTrace();
-    if (name === "final") return object(currentTrace().final);
+    if (name === "final") return currentFinal();
     return stage(name);
   }
 
   function queryText() {
-    const request = object(currentTrace().request);
+    const request = currentRequest();
     return request.query || "";
   }
 
@@ -252,6 +297,41 @@
     return list;
   }
 
+  function traceTruncationNotice() {
+    const reason = currentTrace().truncation_reason;
+    const reasonText = reason === "debug_response_size_limit"
+      ? "调试接口整体响应超过大小上限"
+      : reason === "trace_response_size_limit"
+        ? "Trace 内容超过大小上限"
+        : "Trace 仅返回摘要";
+    return make(
+      "div",
+      "notice warn",
+      `${reasonText}，长正文和阶段明细已省略；下方数量来自安全摘要、本次请求或最终 ProcessingMeta，真实 Processing 结果未受影响。`,
+    );
+  }
+
+  function truncatedStageView(name) {
+    const summary = stageSummary(name);
+    const definition = VIEW_DEFINITIONS.find((item) => item[0] === name);
+    const label = definition ? definition[1] : name;
+    const content = make("div");
+    content.append(statRow([
+      ["输入数量", displayedCount(firstCount(summary.input_count))],
+      ["输出数量", displayedCount(firstCount(summary.output_count))],
+      ["Warning", displayedCount(firstCount(summary.warning_count))],
+      ["耗时", Number.isFinite(summary.elapsed_ms) ? `${summary.elapsed_ms} ms` : "—"],
+    ]));
+    if (name === "filter") {
+      content.append(statRow([["过滤数量", displayedCount(firstCount(summary.filtered_count))]]));
+    }
+    if (name === "rerank") {
+      content.append(statRow([["模型调用", displayedCount(firstCount(summary.model_call_count))]]));
+    }
+    content.append(empty(`${label} 的逐条输入、输出和长正文因 Trace 大小限制不可用，请缩小候选正文后重试查看明细。`));
+    return panel(`${label} 摘要`, "当前展示的是后端保留的定长计数，不是把缺失数据当成 0。", content);
+  }
+
   function flowStory(steps) {
     const flow = make("div", "flow-story");
     steps.forEach((step, index) => {
@@ -274,35 +354,71 @@
   }
 
   function pipelineMetrics() {
-    const request = object(currentTrace().request);
+    const request = currentRequest();
     const analyze = stageOutput("analyze");
     const filter = stageOutput("filter");
     const build = stageOutput("build_markdown");
     const rerank = stageOutput("rerank");
+    const meta = currentMeta();
+    const requestSummary = object(currentTrace().request_summary);
+    const analyzeSummary = stageSummary("analyze");
+    const filterSummary = stageSummary("filter");
+    const buildSummary = stageSummary("build_markdown");
+    const rerankSummary = stageSummary("rerank");
+    const traceLabel = traceIsTruncated() ? "Trace摘要" : null;
+    const inputCount = firstCount(
+      listCount(request, "chunks"), requestSummary.chunk_count, meta.input_count,
+    );
+    const normalizedCount = firstCount(
+      listCount(analyze, "normalized_candidates"), analyzeSummary.output_count,
+      meta.normalized_count,
+    );
+    const filteredCount = firstCount(
+      listCount(filter, "kept_candidates"), filterSummary.output_count,
+      meta.filtered_count,
+    );
+    const processedCount = firstCount(
+      listCount(build, "processed_candidates"), buildSummary.output_count,
+      meta.processed_count,
+    );
+    const topCount = firstCount(
+      listCount(rerank, "top3_candidates"), rerankSummary.output_count,
+      listCount(currentResult(), "top3_candidates"), meta.top_count,
+    );
+    const removedCount = firstCount(
+      listCount(filter, "filtered_decisions"), filterSummary.filtered_count,
+    );
     return [
-      ["request", "原始候选", array(request.chunks).length, "chunks"],
-      ["analyze", "Analyze", array(analyze.normalized_candidates).length, "已规范化"],
-      ["filter", "Filter", array(filter.kept_candidates).length, `过滤 ${array(filter.filtered_decisions).length}`],
-      ["build_markdown", "Markdown", array(build.processed_candidates).length, "已构建"],
-      ["rerank", "Rerank", array(rerank.top3_candidates).length, "Top 候选"],
+      ["request", "原始候选", displayedCount(inputCount), traceLabel || "chunks"],
+      ["analyze", "Analyze", displayedCount(normalizedCount), traceLabel || "已规范化"],
+      ["filter", "Filter", displayedCount(filteredCount), traceLabel || `过滤 ${displayedCount(removedCount)}`],
+      ["build_markdown", "Markdown", displayedCount(processedCount), traceLabel || "已构建"],
+      ["rerank", "Rerank", displayedCount(topCount), traceLabel || "Top 候选"],
     ];
   }
 
   function renderSummary() {
     const response = state.response;
-    const result = object(response.final_result);
-    const request = object(response.trace && response.trace.request);
-    const calls = array(stage("rerank").model_calls);
+    const result = currentResult();
+    const request = currentRequest();
+    const callCount = firstCount(
+      listCount(stage("rerank"), "model_calls"),
+      stageSummary("rerank").model_call_count,
+    );
     const rerankMode = object(object(stageOutput("rerank")).rerank_details).input_mode
       || object(stage("rerank").details).input_mode
+      || currentRequest().rerank_input_mode
       || "—";
     const values = [
-      ["输入候选", array(request.chunks).length, false],
+      ["输入候选", displayedCount(firstCount(
+        listCount(request, "chunks"), object(currentTrace().request_summary).chunk_count,
+        currentMeta().input_count,
+      )), false],
       ["最终 Top", array(result.top3_candidates).length, false],
-      ["模型调用", calls.length, false],
+      ["模型调用", displayedCount(callCount), false],
       ["重排模式", rerankMode, true],
       ["总耗时", `${response.trace.elapsed_ms || result.elapsed_ms || 0} ms`, false],
-      ["执行结果", `${result.outcome || "—"}${result.degraded ? "（降级）" : ""}`, true],
+      ["执行结果", `${result.outcome || "—"}${result.degraded ? "（降级）" : ""}${traceIsTruncated() ? "（Trace已截断）" : ""}`, true],
     ];
     els.summary.replaceChildren();
     values.forEach(([label, value, small]) => {
@@ -351,25 +467,29 @@
       ["接收候选", `收到 ${metrics[0][2]} 条 Retrieval chunks，保留原始字段。`],
       ["确定性处理", `Analyze、Filter 和 Markdown 顺序执行，剩余 ${metrics[3][2]} 条可重排知识。`],
       ["两阶段重排", "先按批次粗排，再将入围池交给 Global 终排，模型故障时按程序规则补位。"],
-      ["适配输出", `生成 ${array(object(currentTrace().final).processed_chunks).length} 条 processed_chunks，完整正文不受 Prompt 投影影响。`],
+      ["适配输出", `生成 ${array(currentFinal().processed_chunks).length} 条 processed_chunks，完整正文不受 Prompt 投影影响。`],
     ]));
 
     const stageRows = ["analyze", "filter", "build_markdown", "rerank"].map((name, index) => {
       const current = stage(name);
       const out = object(current.output);
-      const counts = [
-        array(out.normalized_candidates).length,
-        array(out.kept_candidates).length,
-        array(out.processed_candidates).length,
-        array(out.top3_candidates).length,
+      const summary = stageSummary(name);
+      const count = metrics[index + 1][2];
+      const elapsed = firstCount(current.elapsed_ms, summary.elapsed_ms);
+      const warningCount = firstCount(listCount(out, "warnings"), summary.warning_count);
+      return [
+        index + 1,
+        VIEW_DEFINITIONS.find((item) => item[0] === name)[1],
+        elapsed === null ? "—" : `${elapsed} ms`,
+        count,
+        displayedCount(warningCount),
       ];
-      return [index + 1, VIEW_DEFINITIONS.find((item) => item[0] === name)[1], `${current.elapsed_ms || 0} ms`, counts[index], array(out.warnings).length];
     });
     container.append(panel("执行节点", "这里看的是顺序和变化，不是字段堆叠。", dataTable(
       ["顺序", "阶段", "耗时", "本阶段产物", "Warning"], stageRows,
     )));
 
-    const finalMeta = object(object(currentTrace().final).processing_meta);
+    const finalMeta = currentMeta();
     const outcome = make("div");
     outcome.append(statRow([
       ["是否降级", finalMeta.degraded ? "是" : "否"],
@@ -471,21 +591,29 @@
     const timeline = make("div", "timeline");
     comparisons.forEach((comparison, index) => {
       const item = object(comparison);
+      const sourceCandidate = object(item.source_candidate);
+      const processedCandidate = object(item.processed_candidate);
+      const sourceContent = item.source_content !== undefined
+        ? item.source_content : sourceCandidate.content;
+      const sourceAtoms = item.source_atoms !== undefined
+        ? item.source_atoms : sourceCandidate.atoms;
+      const contentMd = item.content_md !== undefined
+        ? item.content_md : processedCandidate.content_md;
       const header = make("div", "timeline-title");
-      header.append(make("strong", "", item.knowledge_name || item.knowledge_id));
-      header.append(make("small", "", `${item.knowledge_id || "—"} · ${item.chunk_id || "—"}`));
+      header.append(make("strong", "", item.knowledge_name || processedCandidate.name || item.knowledge_id));
+      header.append(make("small", "", `${item.knowledge_id || processedCandidate.knowledge_id || "—"} · ${item.chunk_id || processedCandidate.chunk_id || "—"}`));
       const summary = make("div");
       summary.append(header);
       const detail = lazyDetails(summary, () => {
         const body = make("div", "timeline-body");
         body.append(flowStory([
-          ["原始内容", `${typeof item.source_content === "string" ? item.source_content.length : stringify(item.source_content, 0).length} 字符，${array(item.source_atoms).length} 个 Atom。`],
+          ["原始内容", `${typeof sourceContent === "string" ? sourceContent.length : stringify(sourceContent, 0).length} 字符，${array(sourceAtoms).length} 个 Atom。`],
           ["确定性转换", "执行清洗、表格保护、标题建立和 Atom 排序。"],
-          ["content_md", `${String(item.content_md || "").length} 字符，保留为最终 processed_chunk 正文。`],
+          ["content_md", `${String(contentMd || "").length} 字符，保留为最终 processed_chunk 正文。`],
         ]));
         const compare = make("div", "prompt-grid");
-        compare.append(codePanel("原始 content / atoms", `${stringify(item.source_content)}\n\nAtoms:\n${stringify(item.source_atoms)}`));
-        compare.append(codePanel("构建后 content_md", item.content_md || ""));
+        compare.append(codePanel("原始 content / atoms", `${stringify(sourceContent)}\n\nAtoms:\n${stringify(sourceAtoms)}`));
+        compare.append(codePanel("构建后 content_md", contentMd || ""));
         body.append(compare);
         return body;
       }, index === 0);
@@ -517,6 +645,8 @@
   }
 
   function callForGlobal(ctx) { return ctx.calls.find((call) => object(call).stage === "global") || null; }
+
+  function callForSemifinal(ctx) { return ctx.calls.find((call) => object(call).stage === "semifinal") || null; }
 
   function evidenceInfo(ctx, evidenceId) {
     const knowledgeId = ctx.evidenceMap[evidenceId] || "";
@@ -644,6 +774,34 @@
     return body;
   }
 
+  function semifinalBody(ctx, detail, call) {
+    const body = make("div", "timeline-body");
+    const prompt = object(detail.prompt);
+    const payloadMap = payloadById(call);
+    const detailMap = promptDetailsById(detail);
+    body.append(flowStory([
+      ["汇总全部批次", `${array(detail.input_ids).length} 条批次 Top5 进入跨批次半决选。`],
+      ["Prompt 投影", projectionDescription(prompt, true)],
+      ["LLM 跨批次比较", call ? `调用耗时 ${object(call).elapsed_ms || 0} ms，要求选出 Top ${object(object(call).input_payload).top_k || array(detail.selected_ids).length}。` : "Prompt 未进入模型，按程序内部顺序降级。"],
+      ["形成 Global 池", `${array(detail.selected_ids).length} 条结果进入最终正文重排。`],
+    ]));
+    const rows = array(detail.input_ids).filter((id) => rerankEvidenceMatches(ctx, id, payloadMap.get(id))).map((id) => {
+      const info = evidenceInfo(ctx, id);
+      const sent = payloadMap.get(id) || {};
+      const projection = detailMap.get(id) || {};
+      const contentCell = make("div");
+      contentCell.append(make("span", "cell-title", sent.content_md === undefined ? "未发送正文" : `${projection.sent_content_chars || 0} 字符`));
+      if (sent.content_md) contentCell.append(contentPreview(sent.content_md, "查看半决选正文投影"));
+      return [chip(id), info.knowledgeId, sent.title || info.candidate.name || "—", contentCell];
+    });
+    body.append(panel("半决选候选与实际投影", "所有批次入围结果在这里进行一次跨批次比较；retrieval_rank 不进入模型 Prompt。", rows.length
+      ? dataTable(["Evidence", "Knowledge ID", "标题", "正文投影"], rows)
+      : empty("没有半决选候选。")));
+    body.append(panel("实际半决选 Prompt", `序列化后 ${prompt.sent_chars || 0} / ${prompt.budget_chars || 0} 字符。`, promptView(call)));
+    body.append(panel("半决选模型输出与程序后处理", "模型结果不足或异常时保留有效 ID，再按程序内部 retrieval_rank 补足候选池。", resultView(ctx, detail, call, "selected_ids 进入 Global 正文终排。")));
+    return body;
+  }
+
   function globalBody(ctx, globalDetail, call) {
     const body = make("div", "timeline-body");
     const prompt = object(globalDetail.prompt);
@@ -689,6 +847,7 @@
   function renderRerank() {
     const ctx = rerankContext();
     const batches = array(ctx.details.batches);
+    const semifinalDetail = object(ctx.details.semifinal);
     const globalDetail = object(ctx.details.global);
     const pool = array(globalDetail.pool_ids);
     const container = make("div");
@@ -696,6 +855,7 @@
     [
       ["可重排候选", ctx.details.eligible_count || ctx.processed.length, `输入模式 ${ctx.details.input_mode || "—"}`],
       ["Batch 粗排", batches.length, "默认每批 20，每批选 Top5"],
+      ["跨批次半决选", Object.keys(semifinalDetail).length ? array(semifinalDetail.selected_ids).length : "跳过", "批次入围超过 25 条时执行"],
       ["Global 候选池", pool.length, "最多 25 条"],
       ["最终 Top", array(globalDetail.selected_ids).length || array(ctx.output.top3_candidates).length, globalDetail.mode || "—"],
     ].forEach(([label, value, note], index, values) => {
@@ -705,7 +865,7 @@
       if (index < values.length - 1) lane.append(make("div", "lane-arrow", "→"));
     });
     container.append(lane);
-    container.append(make("div", "notice", "下面按真实执行顺序回放。每个 Batch 可查看分批名单、Prompt 投影、实际 Prompt、LLM 原始输出、解析与补位；Global 另外展示正文预算分配。"));
+    container.append(make("div", "notice", "下面按真实执行顺序回放。Batch 入围总数超过 25 条时，先执行跨批次半决选，再进入 Global 正文终排。"));
 
     const timeline = make("div", "timeline");
     let visibleBatchCount = 0;
@@ -736,6 +896,23 @@
       timeline.append(itemWrap);
     });
 
+    if (Object.keys(semifinalDetail).length) {
+      const call = callForSemifinal(ctx);
+      const summary = make("div");
+      const title = make("div", "timeline-title");
+      title.append(make("strong", "", "跨批次半决选"));
+      title.append(make("small", "", `${array(semifinalDetail.input_ids).length} 条输入 → ${array(semifinalDetail.selected_ids).length} 条 Global 候选`));
+      const meta = make("div", "timeline-meta");
+      meta.append(badge(semifinalDetail.complete ? "模型结果完整" : "含补位/降级", semifinalDetail.complete ? "success" : "warn"));
+      meta.append(badge(call ? `${object(call).elapsed_ms || 0} ms` : "未调用模型", "info"));
+      meta.append(badge(`${object(semifinalDetail.prompt).sent_chars || 0}/${object(semifinalDetail.prompt).budget_chars || 0} chars`, "purple"));
+      summary.append(title, meta);
+      const detailNode = lazyDetails(summary, () => semifinalBody(ctx, semifinalDetail, call), true);
+      const itemWrap = make("div", "timeline-item");
+      itemWrap.append(make("span", "timeline-dot"), detailNode);
+      timeline.append(itemWrap);
+    }
+
     if (Object.keys(globalDetail).length) {
       const call = callForGlobal(ctx);
       const summary = make("div");
@@ -752,17 +929,17 @@
       itemWrap.append(make("span", "timeline-dot"), detailNode);
       timeline.append(itemWrap);
     }
-    if (!visibleBatchCount && !Object.keys(globalDetail).length) {
+    if (!visibleBatchCount && !Object.keys(semifinalDetail).length && !Object.keys(globalDetail).length) {
       timeline.append(empty("没有匹配当前搜索条件的重排记录。"));
     }
-    container.append(panel("重排执行时间线", "Batch 顺序展开，最后进入 Global。默认展开第一批和 Global。", timeline));
+    container.append(panel("重排执行时间线", "Batch 顺序展开；候选超过阈值时经过半决选，最后进入 Global。", timeline));
     container.append(panel("Rerank warnings", "异常、非法输出、数量不足和 Prompt 超预算都会在这里汇总。", warningsView(ctx.output.warnings), "soft"));
     container.append(jsonDrawer("查看 Rerank 原始 Trace", ctx.current));
     return container;
   }
 
   function renderFinal() {
-    const final = object(currentTrace().final);
+    const final = currentFinal();
     const candidates = array(final.top3_candidates).filter(matches);
     const chunks = new Map(array(final.processed_chunks).map((chunk) => [object(chunk).chunk_id, object(chunk)]));
     const meta = object(final.processing_meta);
@@ -834,6 +1011,17 @@
       final: renderFinal,
       raw: renderRaw,
     };
+    if (traceIsTruncated() && state.view !== "raw") {
+      els.viewer.append(traceTruncationNotice());
+    }
+    if (
+      traceIsTruncated()
+      && ["analyze", "filter", "build_markdown", "rerank"].includes(state.view)
+      && !Object.keys(stage(state.view)).length
+    ) {
+      els.viewer.append(truncatedStageView(state.view));
+      return;
+    }
     els.viewer.append((renderers[state.view] || renderOverview)());
   }
 
@@ -861,6 +1049,7 @@
       try { body = await response.json(); } catch (_) { body = {}; }
       if (!response.ok) throw new Error(body.detail || body.rtnMsg || `HTTP ${response.status}`);
       state.response = body;
+      state.request = payload;
       state.view = "overview";
       els.resultLayout.hidden = false;
       els.download.disabled = false;
@@ -870,7 +1059,10 @@
       renderPipeline();
       renderNav();
       renderCurrent();
-      setStatus("success", body.final_result && body.final_result.degraded ? "已完成（存在降级）" : "已完成");
+      const statusParts = [];
+      if (body.final_result && body.final_result.degraded) statusParts.push("存在降级");
+      if (object(body.trace).trace_truncated) statusParts.push("Trace已截断");
+      setStatus("success", statusParts.length ? `已完成（${statusParts.join("，")}）` : "已完成");
     } catch (error) {
       setStatus("error", "执行失败");
       els.requestError.textContent = error.message || String(error);

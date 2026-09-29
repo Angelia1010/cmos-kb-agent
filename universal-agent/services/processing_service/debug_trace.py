@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import time
@@ -9,14 +10,14 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Sequence
 
 
-MAX_TRACE_RESPONSE_BYTES = 4_000_000
-# 全局重排 Prompt 生产预算为 30,000 字符；单字段上限略高于该值，
-# 以便正常请求可查看完整实际 Prompt，异常大输入仍会被截断。
-MAX_TRACE_FIELD_CHARS = 40_000
-MAX_TRACE_LIST_ITEMS = 100
+MAX_TRACE_RESPONSE_BYTES = 30_000_000
+# 候选正文按实体只保存一次后，允许正常长知识完整进入脱敏 Trace；
+# 仍保留极端单字段和整体响应上限，避免调试请求拖垮正式 Processing 服务。
+MAX_TRACE_FIELD_CHARS = 5_000_000
+MAX_TRACE_LIST_ITEMS = 300
 MAX_TRACE_DEPTH = 12
-MAX_SNAPSHOT_TEXT_CHARS = 350_000
-MAX_EXPORT_TEXT_CHARS = 1_500_000
+MAX_SNAPSHOT_TEXT_CHARS = 25_000_000
+TRACE_BLOB_MIN_CHARS = 256
 
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:authorization|api[_-]?key|access[_-]?token|debug[_-]?token|password|"
@@ -162,12 +163,83 @@ class ProcessingTraceCollector:
 
     def __init__(self, request_payload: Any) -> None:
         self.started = time.perf_counter()
-        self.request = _safe_snapshot(request_payload)
+        self.entities: dict[str, dict[str, Any]] = {
+            "chunks": {},
+            "candidates": {},
+            "processed_chunks": {},
+            "blobs": {},
+        }
+        self._entity_keys: dict[tuple[str, str], str] = {}
+        self._entity_reference_count = 0
         self.stages: dict[str, dict[str, Any]] = {}
         self.model_calls: list[dict[str, Any]] = []
         self.final: dict[str, Any] = {}
         self.collection_errors: list[str] = []
         self._stage_started: dict[str, float] = {}
+        request = _jsonable(request_payload)
+        if not isinstance(request, dict):
+            request = {}
+        chunks = request.pop("chunks", [])
+        self.request = _safe_snapshot(request)
+        self.request["chunks"] = self._entity_refs("chunks", chunks)
+
+    @staticmethod
+    def _entity_payload(kind: str, value: Any) -> Any:
+        payload = _jsonable(value)
+        if kind == "candidates" and isinstance(payload, dict):
+            # raw 通常完整嵌套原始 Retrieval chunk；原始值已经唯一保存在 chunks
+            # 实体表中，候选阶段快照无需再次复制。
+            payload = dict(payload)
+            payload.pop("raw", None)
+        return payload
+
+    def _entity_ref(self, kind: str, value: Any) -> dict[str, str]:
+        payload = self._entity_payload(kind, value)
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        cache_key = (kind, digest)
+        entity_id = self._entity_keys.get(cache_key)
+        if entity_id is None:
+            entity_id = f"E{len(self.entities[kind]) + 1:04d}"
+            safe_payload = _safe_snapshot(payload)
+            self.entities[kind][entity_id] = self._externalize_blobs(safe_payload)
+            self._entity_keys[cache_key] = entity_id
+        self._entity_reference_count += 1
+        return {"$ref": f"{kind}:{entity_id}"}
+
+    def _entity_refs(self, kind: str, values: Any) -> list[dict[str, str]]:
+        if not isinstance(values, (list, tuple)):
+            return []
+        return [self._entity_ref(kind, value) for value in values]
+
+    def _blob_ref(self, value: str) -> dict[str, str]:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        cache_key = ("blobs", digest)
+        blob_id = self._entity_keys.get(cache_key)
+        if blob_id is None:
+            blob_id = f"B{len(self.entities['blobs']) + 1:04d}"
+            self.entities["blobs"][blob_id] = value
+            self._entity_keys[cache_key] = blob_id
+        return {"$blob": blob_id}
+
+    def _externalize_blobs(self, value: Any) -> Any:
+        """把重复长文本提升为共享 Blob，阶段实体只保留引用。"""
+        if isinstance(value, str):
+            return self._blob_ref(value) if len(value) >= TRACE_BLOB_MIN_CHARS else value
+        if isinstance(value, list):
+            return [self._externalize_blobs(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: self._externalize_blobs(item)
+                for key, item in value.items()
+            }
+        return value
 
     def wrap_model(self, model: Any) -> Any:
         return _TracingModel(model, self)
@@ -187,21 +259,29 @@ class ProcessingTraceCollector:
         data = workspace.data
         if stage == "analyze":
             stage_input = {
-                "chunks": data.get("chunks", []),
-                "knowledge_candidates": data.get("knowledge_candidates", []),
+                "chunks": self._entity_refs("chunks", data.get("chunks", [])),
+                "knowledge_candidates": self._entity_refs(
+                    "candidates", data.get("knowledge_candidates", [])
+                ),
             }
         elif stage == "filter":
             stage_input = {
                 "processing_context": data.get("processing_context", {}),
-                "normalized_candidates": data.get("normalized_knowledge_candidates", []),
+                "normalized_candidates": self._entity_refs(
+                    "candidates", data.get("normalized_knowledge_candidates", [])
+                ),
             }
         elif stage == "build_markdown":
             stage_input = {
-                "filtered_candidates": data.get("filtered_knowledge_candidates", []),
+                "filtered_candidates": self._entity_refs(
+                    "candidates", data.get("filtered_knowledge_candidates", [])
+                ),
             }
         else:
             stage_input = {
-                "processed_candidates": data.get("processed_knowledge_candidates", []),
+                "processed_candidates": self._entity_refs(
+                    "candidates", data.get("processed_knowledge_candidates", [])
+                ),
             }
         self.stages[stage] = {"input": _safe_snapshot(stage_input)}
 
@@ -222,7 +302,9 @@ class ProcessingTraceCollector:
         data = workspace.data
         if stage == "analyze":
             output = {
-                "normalized_candidates": data.get("normalized_knowledge_candidates", []),
+                "normalized_candidates": self._entity_refs(
+                    "candidates", data.get("normalized_knowledge_candidates", [])
+                ),
                 "analysis": data.get("knowledge_candidate_analysis", {}),
                 "warnings": _warnings(data),
                 "processing_meta": data.get("processing_meta"),
@@ -230,7 +312,9 @@ class ProcessingTraceCollector:
         elif stage == "filter":
             decisions = data.get("knowledge_filter_reasons", [])
             output = {
-                "kept_candidates": data.get("filtered_knowledge_candidates", []),
+                "kept_candidates": self._entity_refs(
+                    "candidates", data.get("filtered_knowledge_candidates", [])
+                ),
                 "kept_decisions": [
                     item for item in decisions if getattr(item, "accepted", False)
                 ],
@@ -242,7 +326,9 @@ class ProcessingTraceCollector:
             }
         elif stage == "build_markdown":
             output = {
-                "processed_candidates": data.get("processed_knowledge_candidates", []),
+                "processed_candidates": self._entity_refs(
+                    "candidates", data.get("processed_knowledge_candidates", [])
+                ),
                 "content_comparison": self._markdown_comparison(data),
                 "warnings": _warnings(data),
                 "processing_meta": data.get("processing_meta"),
@@ -251,14 +337,15 @@ class ProcessingTraceCollector:
             output = {
                 "evidence_map": data.get("rerank_evidence_map", {}),
                 "rerank_details": data.get("rerank_details", {}),
-                "top3_candidates": data.get("top3_candidates", []),
+                "top3_candidates": self._entity_refs(
+                    "candidates", data.get("top3_candidates", [])
+                ),
                 "warnings": _warnings(data),
                 "processing_meta": data.get("processing_meta"),
             }
         record["output"] = _safe_snapshot(output)
 
-    @staticmethod
-    def _markdown_comparison(data: dict[str, Any]) -> list[dict[str, Any]]:
+    def _markdown_comparison(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         filtered = {
             (
                 str(getattr(item, "knowledge_id", "")),
@@ -274,9 +361,10 @@ class ProcessingTraceCollector:
                 "knowledge_id": knowledge_id,
                 "chunk_id": getattr(item, "chunk_id", ""),
                 "knowledge_name": getattr(item, "name", ""),
-                "source_content": getattr(source, "content", "") if source else "",
-                "source_atoms": getattr(source, "atoms", []) if source else [],
-                "content_md": getattr(item, "content_md", ""),
+                "source_candidate": (
+                    self._entity_ref("candidates", source) if source else None
+                ),
+                "processed_candidate": self._entity_ref("candidates", item),
             })
         return rows
 
@@ -291,7 +379,12 @@ class ProcessingTraceCollector:
         try:
             contents = [str(getattr(message, "content", "")) for message in messages]
             joined = "\n".join(contents)
-            stage = "global" if "[TASK:rerank_global]" in joined else "batch"
+            if "[STAGE:rerank_semifinal]" in joined:
+                stage = "semifinal"
+            elif "[TASK:rerank_global]" in joined:
+                stage = "global"
+            else:
+                stage = "batch"
             user_prompt = contents[-1] if contents else ""
             call = {
                 "call_index": len(self.model_calls) + 1,
@@ -325,13 +418,80 @@ class ProcessingTraceCollector:
     def finish(self, workspace: Any) -> None:
         data = workspace.data
         self.final = _safe_snapshot({
-            "top3_candidates": data.get("top3_candidates", []),
-            "processed_chunks": data.get("processed_chunks", []),
+            "top3_candidates": self._entity_refs(
+                "candidates", data.get("top3_candidates", [])
+            ),
+            "processed_chunks": self._entity_refs(
+                "processed_chunks", data.get("processed_chunks", [])
+            ),
             "processing_meta": data.get("processing_meta"),
             "warnings": _warnings(data),
             "total_elapsed_ms": workspace.tracer.elapsed_ms(),
             "events": workspace.tracer.events,
         })
+
+    @staticmethod
+    def _list_count(container: Any, key: str) -> int:
+        if not isinstance(container, dict):
+            return 0
+        value = container.get(key)
+        return len(value) if isinstance(value, list) else 0
+
+    def _stage_summary(self) -> dict[str, dict[str, Any]]:
+        """生成不含业务正文的阶段摘要，供完整 Trace 超限时继续展示。"""
+        result: dict[str, dict[str, Any]] = {}
+        mappings = {
+            "analyze": ("chunks", "normalized_candidates"),
+            "filter": ("normalized_candidates", "kept_candidates"),
+            "build_markdown": ("filtered_candidates", "processed_candidates"),
+            "rerank": ("processed_candidates", "top3_candidates"),
+        }
+        for name, (input_key, output_key) in mappings.items():
+            record = self.stages.get(name, {})
+            stage_input = record.get("input", {}) if isinstance(record, dict) else {}
+            stage_output = record.get("output", {}) if isinstance(record, dict) else {}
+            summary: dict[str, Any] = {
+                "elapsed_ms": record.get("elapsed_ms", 0) if isinstance(record, dict) else 0,
+                "has_input": isinstance(record, dict) and "input" in record,
+                "has_output": isinstance(record, dict) and "output" in record,
+                "input_count": self._list_count(stage_input, input_key),
+                "output_count": self._list_count(stage_output, output_key),
+                "warning_count": self._list_count(stage_output, "warnings"),
+            }
+            if name == "filter":
+                summary["filtered_count"] = self._list_count(
+                    stage_output, "filtered_decisions"
+                )
+            if name == "rerank":
+                summary["model_call_count"] = len(self.model_calls)
+            result[name] = summary
+        return result
+
+    def summary(self, trace_id: str, *, reason: str) -> dict[str, Any]:
+        """返回安全、定长且仍可驱动 UI 计数展示的 Trace 摘要。"""
+        request = self.request if isinstance(self.request, dict) else {}
+        final = self.final if isinstance(self.final, dict) else {}
+        return {
+            "schema_version": 2,
+            "trace_id": trace_id,
+            "elapsed_ms": round((time.perf_counter() - self.started) * 1000, 3),
+            "trace_truncated": True,
+            "truncation_reason": reason,
+            "request_summary": {
+                "chunk_count": self._list_count(request, "chunks"),
+            },
+            "stage_summary": self._stage_summary(),
+            "final_summary": {
+                "top_count": self._list_count(final, "top3_candidates"),
+                "processed_chunk_count": self._list_count(final, "processed_chunks"),
+            },
+            "collection_errors": list(self.collection_errors),
+            "deduplication": {
+                "entity_count": sum(len(items) for items in self.entities.values()),
+                "reference_count": self._entity_reference_count,
+            },
+            "limits": {"max_response_bytes": MAX_TRACE_RESPONSE_BYTES},
+        }
 
     def export(self, trace_id: str) -> dict[str, Any]:
         stages = copy.deepcopy(self.stages)
@@ -353,6 +513,10 @@ class ProcessingTraceCollector:
             rerank_details.get("global", {})
             if isinstance(rerank_details, dict) else {}
         )
+        semifinal_details = (
+            rerank_details.get("semifinal", {})
+            if isinstance(rerank_details, dict) else {}
+        )
         for call in model_calls:
             if not isinstance(call, dict):
                 continue
@@ -360,16 +524,23 @@ class ProcessingTraceCollector:
                 if batch_index < len(batch_details):
                     call["parsed_result"] = batch_details[batch_index]
                     batch_index += 1
-            elif isinstance(global_details, dict):
+            elif call.get("stage") == "semifinal" and isinstance(semifinal_details, dict):
+                call["parsed_result"] = semifinal_details
+            elif call.get("stage") == "global" and isinstance(global_details, dict):
                 call["parsed_result"] = global_details
         rerank["model_calls"] = model_calls
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "trace_id": trace_id,
             "elapsed_ms": round((time.perf_counter() - self.started) * 1000, 3),
             "request": self.request,
             "stages": stages,
             "final": copy.deepcopy(self.final),
+            "entities": self.entities,
+            "deduplication": {
+                "entity_count": sum(len(items) for items in self.entities.values()),
+                "reference_count": self._entity_reference_count,
+            },
             "collection_errors": list(self.collection_errors),
             "limits": {
                 "max_response_bytes": MAX_TRACE_RESPONSE_BYTES,
@@ -377,26 +548,7 @@ class ProcessingTraceCollector:
                 "max_list_items": MAX_TRACE_LIST_ITEMS,
             },
         }
-        sanitizer = _Sanitizer(MAX_EXPORT_TEXT_CHARS)
-        safe = sanitizer.clean(payload)
-        if isinstance(safe, dict) and sanitizer.truncated:
-            safe["trace_truncated"] = True
-        encoded = json.dumps(safe, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(encoded) <= MAX_TRACE_RESPONSE_BYTES:
-            return safe
-        return {
-            "schema_version": 1,
-            "trace_id": trace_id,
-            "elapsed_ms": safe.get("elapsed_ms", 0) if isinstance(safe, dict) else 0,
-            "trace_truncated": True,
-            "truncation_reason": "trace_response_size_limit",
-            "stage_summary": {
-                name: {
-                    "elapsed_ms": record.get("elapsed_ms", 0),
-                    "has_input": "input" in record,
-                    "has_output": "output" in record,
-                }
-                for name, record in self.stages.items()
-            },
-            "limits": {"max_response_bytes": MAX_TRACE_RESPONSE_BYTES},
-        }
+            return payload
+        return self.summary(trace_id, reason="trace_response_size_limit")

@@ -19,7 +19,11 @@ from ..shared.knowledge_processing.models import (
 )
 from ..shared.knowledge_processing.eligibility import rerank_ineligibility_reason
 from ..shared.knowledge_processing.richtext import render_richtext
-from .prompts import RERANK_BATCH_SYSTEM_PROMPT, RERANK_GLOBAL_SYSTEM_PROMPT
+from .prompts import (
+    RERANK_BATCH_SYSTEM_PROMPT,
+    RERANK_GLOBAL_SYSTEM_PROMPT,
+    RERANK_SEMIFINAL_SYSTEM_PROMPT,
+)
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
@@ -39,6 +43,24 @@ def _stable_candidates(candidates: Sequence[ProcessedKnowledge]) -> List[Process
     return [item for _, item in sorted(
         enumerate(candidates), key=lambda pair: (pair[1].retrieval_rank, pair[0])
     )]
+
+
+def _balanced_batches(
+    evidence: Sequence[Tuple[str, ProcessedKnowledge]],
+    max_batch_size: int,
+) -> List[List[Tuple[str, ProcessedKnowledge]]]:
+    """稳定连续分批，并让任意两批的候选数最多相差一条。"""
+    if not evidence:
+        return []
+    batch_count = (len(evidence) + max_batch_size - 1) // max_batch_size
+    base_size, larger_batch_count = divmod(len(evidence), batch_count)
+    batches: List[List[Tuple[str, ProcessedKnowledge]]] = []
+    start = 0
+    for batch_index in range(batch_count):
+        size = base_size + (1 if batch_index < larger_batch_count else 0)
+        batches.append(list(evidence[start:start + size]))
+        start += size
+    return batches
 
 
 @dataclass
@@ -558,8 +580,22 @@ def _allocate_content_fairly(
 
 
 def _render_user_prompt(payload: Dict[str, Any]) -> str:
+    required_count = max(0, int(payload.get("top_k") or 0))
+    output_contract = (
+        "RERANK_OUTPUT_CONTRACT_BEGIN\n"
+        f"required_count={required_count}\n"
+        f"本次 ranked_ids 必须恰好包含 {required_count} 个不同的 Evidence ID，不能多、不能少。\n"
+        "只能逐字复制下方 candidates[].evidence_id；禁止生成、修改、重新编号或返回候选集合外的ID。\n"
+        "即使部分候选相关性较低，也必须从当前 candidates 中选满 required_count 条。\n"
+        "唯一合法的输出外形是 {\"ranked_ids\":[...]}；其中 ... 不是可输出文本，必须替换为实际ID字符串。\n"
+        "OUTPUT_SCHEMA: root.type=object; root.keys=[ranked_ids]; root.additional_properties=false; "
+        f"ranked_ids.type=array<string>; ranked_ids.length={required_count}; "
+        "ranked_ids.unique=true; ranked_ids.items_source=candidates[].evidence_id。\n"
+        "输出必须以 { 开始、以 } 结束；JSON前后不得包含解释、分析、Markdown代码块或任何其他字符。\n"
+        "RERANK_OUTPUT_CONTRACT_END\n"
+    )
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
-    return f"{_PROMPT_PREFIX}{serialized}{_PROMPT_SUFFIX}"
+    return f"{output_contract}{_PROMPT_PREFIX}{serialized}{_PROMPT_SUFFIX}"
 
 
 def _projection_payload(
@@ -612,16 +648,24 @@ def _build_user_prompt(
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     """构造有硬字符预算的 Prompt；返回 None 表示最小载荷仍超预算。"""
     is_batch = stage.startswith("batch_")
+    is_semifinal = stage == "semifinal"
+    is_coarse_stage = is_batch or is_semifinal
     mode = options.rerank_input_mode
     heading_intro_mode = mode == "headings_and_intro"
     include_content = heading_intro_mode or mode == "title_and_content" or (
-        mode == "title_then_content" and not is_batch
+        mode == "title_then_content" and not is_coarse_stage
     )
     content_limit = (
         options.prompt_max_chars_per_candidate
         if is_batch else options.global_prompt_max_chars_per_candidate
     )
-    budget = options.batch_prompt_max_chars if is_batch else options.global_prompt_max_chars
+    budget = (
+        options.batch_prompt_max_chars
+        if is_batch else (
+            options.semifinal_prompt_max_chars
+            if is_semifinal else options.global_prompt_max_chars
+        )
+    )
 
     projections: List[_CandidateProjection] = []
     for evidence_id, candidate in evidence:
@@ -907,7 +951,7 @@ def _finalization_metadata(
     model_ids: Sequence[str],
     selected_ids: Sequence[str],
     model_complete: bool,
-    upstream_fallback_used: bool,
+    upstream_fallback_reasons: Sequence[str],
     eligible_count: int,
     final_top_k: int,
     stage_reasons: Sequence[str] = (),
@@ -933,8 +977,7 @@ def _finalization_metadata(
     else:
         if not model_complete:
             reasons.append("incomplete_model_result")
-        if upstream_fallback_used:
-            reasons.append("batch_fallback_used")
+        reasons.extend(upstream_fallback_reasons)
         mode = "model_with_fallback" if reasons else "model"
     return {
         "mode": mode,
@@ -1022,6 +1065,7 @@ eligible <= 3 ?
     by_evidence = dict(evidence_pairs)
     details: Dict[str, Any] = {
         "batches": [],
+        "semifinal": {},
         "global": {},
         "eligible_count": len(eligible),
         "input_mode": options.rerank_input_mode,
@@ -1032,7 +1076,7 @@ eligible <= 3 ?
             model_ids=[],
             selected_ids=[pair[0] for pair in evidence_pairs],
             model_complete=True,
-            upstream_fallback_used=False,
+            upstream_fallback_reasons=(),
             eligible_count=len(eligible),
             final_top_k=options.final_top_k,
         )
@@ -1053,8 +1097,10 @@ eligible <= 3 ?
 
     pool_ids: List[str] = []
     batch_fallback_used = False
-    for batch_index, start in enumerate(range(0, len(evidence_pairs), options.batch_size), 1):
-        batch = evidence_pairs[start:start + options.batch_size]
+    for batch_index, batch in enumerate(
+        _balanced_batches(evidence_pairs, options.batch_size),
+        1,
+    ):
         expected = min(options.batch_top_k, len(batch))
         stage = f"batch_{batch_index}"
         prompt, prompt_details = _build_user_prompt(
@@ -1122,7 +1168,94 @@ eligible <= 3 ?
             "prompt": prompt_details,
         })
 
-    pool_ids = pool_ids[:options.global_pool_size]
+    semifinal_fallback_used = False
+    semifinal_reasons: List[str] = []
+    if len(pool_ids) > options.global_pool_size:
+        semifinal_input_ids = list(pool_ids)
+        semifinal_pool = [
+            (evidence_id, by_evidence[evidence_id])
+            for evidence_id in semifinal_input_ids
+        ]
+        semifinal_expected = options.global_pool_size
+        semifinal_prompt, semifinal_prompt_details = _build_user_prompt(
+            query,
+            semifinal_pool,
+            semifinal_expected,
+            options,
+            stage="semifinal",
+            system_prompt=RERANK_SEMIFINAL_SYSTEM_PROMPT,
+        )
+        semifinal_valid: List[str] = []
+        semifinal_complete = False
+        semifinal_stage_warnings: List[ProcessingWarning] = []
+        if semifinal_prompt is None:
+            warning = ProcessingWarning(
+                code="rerank_prompt_budget_exceeded",
+                message=(
+                    "semifinal 最小必要载荷超过 "
+                    f"{options.semifinal_prompt_max_chars} 字符，已降级"
+                ),
+                field="semifinal",
+                details=semifinal_prompt_details,
+            )
+            warnings.append(warning)
+            semifinal_stage_warnings.append(warning)
+        else:
+            try:
+                raw = await _invoke_ranker(
+                    model,
+                    RERANK_SEMIFINAL_SYSTEM_PROMPT,
+                    semifinal_prompt,
+                    options.rerank_timeout_seconds,
+                )
+                semifinal_valid, parse_warnings, semifinal_complete = _parse_ranked_ids(
+                    raw,
+                    semifinal_input_ids,
+                    semifinal_expected,
+                    "semifinal",
+                )
+                warnings.extend(parse_warnings)
+                semifinal_stage_warnings.extend(parse_warnings)
+            except asyncio.TimeoutError:
+                warning = ProcessingWarning(
+                    code="rerank_timeout",
+                    message=(
+                        "semifinal 模型调用超过 "
+                        f"{options.rerank_timeout_seconds:g} 秒，已降级"
+                    ),
+                    field="semifinal",
+                )
+                warnings.append(warning)
+                semifinal_stage_warnings.append(warning)
+            except Exception as exc:  # noqa: BLE001
+                warning = ProcessingWarning(
+                    code="rerank_model_error",
+                    message=f"semifinal 模型调用失败: {exc}",
+                    field="semifinal",
+                )
+                warnings.append(warning)
+                semifinal_stage_warnings.append(warning)
+
+        semifinal_selected = _fill_by_rank(
+            semifinal_valid,
+            semifinal_pool,
+            semifinal_expected,
+        )
+        semifinal_reasons = _warning_reasons(semifinal_stage_warnings)
+        if len(semifinal_selected) > len(semifinal_valid):
+            semifinal_reasons.append("retrieval_rank_supplement")
+        semifinal_reasons = _stable_unique(semifinal_reasons)
+        semifinal_fallback_used = not semifinal_complete
+        details["semifinal"] = {
+            "input_ids": semifinal_input_ids,
+            "model_ids": semifinal_valid,
+            "selected_ids": semifinal_selected,
+            "complete": semifinal_complete,
+            "fallback_reasons": semifinal_reasons,
+            "prompt": semifinal_prompt_details,
+        }
+        pool_ids = semifinal_selected
+
     pool = [(evidence_id, by_evidence[evidence_id]) for evidence_id in pool_ids]
     expected_global = min(options.final_top_k, len(pool))
     global_prompt, global_prompt_details = _build_user_prompt(
@@ -1183,7 +1316,10 @@ eligible <= 3 ?
         model_ids=global_valid,
         selected_ids=final_ids,
         model_complete=global_complete,
-        upstream_fallback_used=batch_fallback_used,
+        upstream_fallback_reasons=[
+            *(["batch_fallback_used"] if batch_fallback_used else []),
+            *(["semifinal_fallback_used"] if semifinal_fallback_used else []),
+        ],
         eligible_count=len(eligible),
         final_top_k=options.final_top_k,
         stage_reasons=_warning_reasons(global_stage_warnings),
@@ -1202,6 +1338,7 @@ eligible <= 3 ?
             for batch_detail in details["batches"]
             for reason in batch_detail["fallback_reasons"]
         ),
+        *semifinal_reasons,
         *final_meta["fallback_reasons"],
     ])
     return RerankResult(
