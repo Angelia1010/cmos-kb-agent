@@ -6,7 +6,8 @@
 评测维度
 ────────
 A. 检索质量(对 kbagent_service 返回的 sources Top3; judge 结合标题+正文):
-   A1  Top3准确率(核心)   : judge 逐篇语义判定是否命中标准答案(gold 标题/原子),
+   A0  Top3综合命中率(核心): 任一篇 gold_match=yes 或 query_relevant=yes 即案例命中
+   A1  Top3准确率         : judge 逐篇语义判定是否命中标准答案(gold 标题/原子),
                            ≥1 篇命中 → 案例算对(不要求字符串完全一致)
    A2  问题相关率(核心)   : judge 逐篇判 yes/partial/no 与用户问题的相关性,
                            ≥1 篇 yes → 案例相关
@@ -638,6 +639,15 @@ def gold_hit(gold_ids: Sequence[str], gold_titles: Sequence[str],
     return False
 
 
+def _top3_hit(retrieval: Dict[str, Any]) -> Optional[bool]:
+    """案例级综合命中；兼容尚未保存 top3_hit 的旧 verdicts。"""
+    if "top3_hit" in retrieval:
+        return retrieval["top3_hit"]
+    if "gold_hit" in retrieval or "any_yes" in retrieval:
+        return retrieval.get("gold_hit") is True or retrieval.get("any_yes") is True
+    return None
+
+
 # ── 单案例评审 ──────────────────────────────────────────────────────────────
 
 def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
@@ -695,6 +705,10 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
                               if v == "yes"), None)
             verdict["retrieval"] = {
                 "judgments": judgments,
+                # A0 综合命中:任一篇是标准知识,或能回答用户问题
+                "top3_hit": any(
+                    j["gold_match"] == "yes" or j["query_relevant"] == "yes"
+                    for j in judgments),
                 # A1 Top3准确率: gold 任一命中即算对(无 gold 标注则不计入, 记 None)
                 "gold_hit": (any(v == "yes" for v in gold_seq)
                              if has_gold else None),
@@ -707,7 +721,8 @@ def judge_case(record: Dict[str, Any], args: argparse.Namespace) -> Dict[str, An
                 "rr": round(1.0 / first_yes, 4) if first_yes else 0.0,
             }
     else:
-        verdict["retrieval"] = {"gold_hit": (False if has_gold else None),
+        verdict["retrieval"] = {"top3_hit": False,
+                                "gold_hit": (False if has_gold else None),
                                 "any_yes": False, "any_relevant": False,
                                 "precision_at_3": 0.0, "rr": 0.0,
                                 "judgments": [], "judge_error": None,
@@ -786,7 +801,8 @@ def run_judge(args: argparse.Namespace) -> None:
             r = verdict.get("retrieval", {})
             a = verdict.get("answer", {})
             _log(f"[{counter['done']}/{len(todo)}] {verdict.get('case_id')} "
-                 f"gold命中={r.get('gold_hit')} 问题相关={r.get('any_yes')} "
+                 f"综合命中={_top3_hit(r)} gold命中={r.get('gold_hit')} "
+                 f"问题相关={r.get('any_yes')} "
                  f"pass={a.get('pass')}" + (f" ⚠judge_err: {err}" if err else ""))
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -903,7 +919,7 @@ def write_xlsx(path: Path, sheets: List[Tuple[str, List[List[Any]]]]) -> None:
 _DETAIL_HEADER = [
     "case_id", "省份", "query", "失败原因", "degraded", "服务错误", "采集错误",
     "gold_ID", "gold_标题", "gold_原子", "Top3_ID", "Top3_标题",
-    "Top3命中gold(LLM)", "Top3命中gold(字符串)", "召回命中gold",
+    "Top3综合命中", "Top3命中gold(LLM)", "Top3命中gold(字符串)", "召回命中gold",
     "D1命中gold", "D1问题相关", "D1理由",
     "D2命中gold", "D2问题相关", "D2理由",
     "D3命中gold", "D3问题相关", "D3理由",
@@ -944,7 +960,8 @@ def _detail_row(v: Dict[str, Any], fail_reasons: List[str],
         " | ".join(v.get("gold_atoms") or []),
         " | ".join(o.get("top3_ids") or []),
         " | ".join(o.get("top3_titles") or []),
-        r.get("gold_hit"), o.get("top3_gold_hit"), o.get("recall_gold_hit"),
+        _top3_hit(r), r.get("gold_hit"),
+        o.get("top3_gold_hit"), o.get("recall_gold_hit"),
         jd(0, "gold_match"), jd(0, "query_relevant"), jd(0, "reason"),
         jd(1, "gold_match"), jd(1, "query_relevant"), jd(1, "reason"),
         jd(2, "gold_match"), jd(2, "query_relevant"), jd(2, "reason"),
@@ -1002,6 +1019,7 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
                  and "note" not in v.get("answer", {})]
 
     # A 指标(案例级: Top3 任一命中即算对)
+    a0 = _rate([_top3_hit(v.get("retrieval", {})) for v in retrieval_ok])
     a1 = _rate([v.get("retrieval", {}).get("gold_hit") for v in retrieval_ok])
     a1_n = sum(1 for v in retrieval_ok
                if v.get("retrieval", {}).get("gold_hit") is not None)
@@ -1046,6 +1064,7 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
         },
         "degraded_count": sum(1 for v in judged if v.get("degraded")),
         "A_retrieval": {
+            "A0_top3综合命中率(gold_match=yes或query_relevant=yes)": a0,
             "A1_top3准确率(LLM语义命中gold,≥1篇即对)": a1,
             "A1_有效样本(有gold标注)": a1_n,
             "A2_问题相关率(LLM,≥1篇yes)": a2,
@@ -1083,9 +1102,11 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
             reasons.append("answer_judge_error")
         if v.get("degraded"):
             reasons.append("degraded")
-        if r and r.get("gold_hit") is False:
+        if _top3_hit(r) is False:
+            reasons.append("top3综合未命中")
+        if r and r.get("gold_hit") is False and _top3_hit(r) is False:
             reasons.append("top3未命中标准答案")
-        if r and r.get("any_yes") is False:
+        if r and r.get("any_yes") is False and _top3_hit(r) is False:
             reasons.append("top3与问题不相关")
         if o.get("top3_gold_hit") is False:
             reasons.append("top3字符串未匹配gold")
@@ -1112,7 +1133,8 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
     with csv_path.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
         w.writerow(["case_id", "province", "query", "失败原因", "degraded",
-                    "top3标题", "gold标题", "命中gold(LLM)", "问题相关(LLM)",
+                    "top3标题", "gold标题", "综合命中(LLM)",
+                    "命中gold(LLM)", "问题相关(LLM)",
                     "gold_top3(字符串)", "gold_recall",
                     "b1", "b2", "b3", "b4", "b5", "judge_usability",
                     "system_usability", "矛盾陈述", "遗漏点", "话术(截断)",
@@ -1126,7 +1148,7 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
                 ";".join(rs), v.get("degraded"),
                 " | ".join(o.get("top3_titles") or []),
                 " | ".join(v.get("gold_titles") or []),
-                r.get("gold_hit"), r.get("any_yes"),
+                _top3_hit(r), r.get("gold_hit"), r.get("any_yes"),
                 o.get("top3_gold_hit"), o.get("recall_gold_hit"),
                 a.get("b1_relevance"), a.get("b2_faithfulness"),
                 a.get("b3_consistency"), a.get("b4_completeness"),
@@ -1162,6 +1184,7 @@ def build_report(verdicts: List[Dict[str, Any]], out: Path,
           f"降级={summary['degraded_count']}")
     print("═" * 62)
     print("  A. 检索质量(案例级: Top3 任一命中即算对)")
+    print(f"    A0  Top3综合命中率(gold或问题相关) : {pct(a0)}")
     print(f"    A1  Top3准确率(LLM命中标准答案)    : {pct(a1)}  (有gold样本 {a1_n})")
     print(f"    A2  问题相关率(LLM ≥1篇yes)        : {pct(a2)}")
     print(f"    A2~ 宽松相关(含partial)            : {pct(a2_loose)}")

@@ -14,6 +14,7 @@
   PYTHONPATH=src python -m unittest tests.test_answer -v
 """
 import json
+import re
 import sys
 import unittest
 from unittest.mock import MagicMock
@@ -258,7 +259,7 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(rels, sorted(rels, reverse=True))
 
     def test_consistency_fail_tightens_usability(self):
-        """批量一致性校验不过 → usability 收紧为 verify_first,issues 入 reasons。"""
+        """修订复验仍不通过 → 保留生成内容,提示核实来源和失败原因。"""
         class _InconsistentModel:
             def invoke(self, messages):
                 msg = "\n".join(str(getattr(m, "content", "")) for m in messages)
@@ -274,6 +275,9 @@ class TestGenerate(unittest.TestCase):
 
         ans = _answer("套餐推荐", _InconsistentModel(), self._chunks())
         self.assertEqual(ans.usability.level, "verify_first")
+        self.assertEqual(ans.script, "您好,月费59元。")
+        self.assertEqual(ans.handling_suggestion, "可办理")
+        self.assertTrue(ans.sources)
         self.assertTrue(any("核实" in r or "一致性" in r
                             for r in ans.usability.reasons))
         self.assertTrue(any("资费数字无原文依据" in r
@@ -433,7 +437,7 @@ class TestStructuredContentAndUsability(unittest.TestCase):
         stale_sources = [s for s in ans.sources if s.stale]
         if stale_sources:
             self.assertEqual(ans.usability.level, "verify_first")
-            self.assertTrue(any("过旧" in r for r in ans.usability.reasons))
+            self.assertTrue(any("复核期限" in r for r in ans.usability.reasons))
 
     def test_consistency_fail_tightens_to_verify(self):
         """批量一致性校验不过 → 至少 verify_first。"""
@@ -546,7 +550,86 @@ def _locate_model(answerable: bool, fragments: list, relevance: int = 0):
     return _Model()
 
 
+def _indexed_locate_model(fragment_ids: list, relevance: int = 90):
+    """模拟模型从全部编号原文中选择直接回答当前问题的片段。"""
+    class _Model:
+        def invoke(self, messages):
+            prompt = messages[-1].content
+            candidates = dict((int(i), text) for i, text in
+                              re.findall(r"^\[(\d+)\] (.+)$", prompt, re.M))
+            assert all(i in candidates for i in fragment_ids)
+            return MagicMock(content=json.dumps({
+                "answerable": bool(fragment_ids), "relevance": relevance,
+                "fragment_ids": fragment_ids}, ensure_ascii=False))
+    return _Model()
+
+
 class TestLocateFragments(unittest.TestCase):
+
+    def test_age_question_selects_eligibility_over_package_contents(self):
+        """候选里包含套餐内容时，模型可按问题选择年龄门槛原文。"""
+        from kbagent.answer.locate import locate_fragments
+        from kbagent.answer.generate import _build_sources
+        content = (
+            "活动自动开通神州行欢孝包2024版-10元(含2GB国内通用流量+2GB关爱流量)，"
+            "每月额外赠送28GB上海本地流量。\n"
+            "【活动规则】\n"
+            "1、活动仅限65岁及以上客户办理(截至到当年1月1日满65周岁的用户可办理)，"
+            "当月办理立即生效，合约期12个月。\n"
+        )
+        chunk = _chunk("age1", content=content)
+        query = "新版欢孝流量安心包有年龄限制吗？"
+        matched = locate_fragments(
+            _indexed_locate_model([3, 1]),
+            query, chunk)
+        self.assertIn("仅限65岁及以上客户办理", matched.fragments[0].text)
+        self.assertIn("当年1月1日满65周岁", matched.fragments[0].text)
+        self.assertEqual(matched.fragments[0].text,
+                         content[matched.fragments[0].start:matched.fragments[0].end])
+        source = _build_sources([chunk], [matched], DEFAULT_CONFIG)[0]
+        self.assertEqual(source.key_fragment, matched.fragments[0].text)
+
+    def test_no_selected_fragment_is_not_answerable(self):
+        from kbagent.answer.locate import locate_fragments
+        chunk = _chunk(content="活动仅限65岁及以上客户办理。每月赠送28GB流量。")
+        df = locate_fragments(_indexed_locate_model([], 0), "有年龄限制吗？", chunk)
+        self.assertFalse(df.answerable)
+        self.assertFalse(df.fragments)
+
+    def test_age_rule_does_not_infer_from_unrelated_age_mention(self):
+        from kbagent.answer.locate import locate_fragments
+        chunk = _chunk(content="客服案例：一位65岁客户咨询流量使用情况。")
+        df = locate_fragments(_indexed_locate_model([], 0), "办理有年龄限制吗？", chunk)
+        self.assertFalse(df.answerable)
+
+    def test_same_document_yields_different_fragment_for_different_questions(self):
+        from kbagent.answer.locate import locate_fragments
+        content = ("办理渠道：中国移动App和营业厅。\n"
+                   "资费规则：月费10元。\n"
+                   "生效时间：当月立即生效。")
+        chunk = _chunk(content=content)
+        for query, chosen, expected in (
+            ("在哪办理？", [1], "办理渠道"),
+            ("多少钱？", [2], "月费10元"),
+            ("什么时候生效？", [3], "当月立即生效"),
+        ):
+            with self.subTest(query=query):
+                df = locate_fragments(_indexed_locate_model(chosen), query, chunk)
+                self.assertIn(expected, df.fragments[0].text)
+                self.assertEqual(df.fragments[0].text,
+                                 content[df.fragments[0].start:df.fragments[0].end])
+
+    def test_invalid_fragment_ids_are_ignored(self):
+        from kbagent.answer.locate import locate_fragments
+        from types import SimpleNamespace
+        content = "费用10元。渠道为App。"
+        class BadIds:
+            def invoke(self, messages):
+                return SimpleNamespace(content=json.dumps({
+                    "answerable": True, "relevance": 95,
+                    "fragment_ids": [0, 99, "2", True, 2, 2]}))
+        df = locate_fragments(BadIds(), "渠道是什么？", _chunk(content=content))
+        self.assertEqual([f.text for f in df.fragments], ["渠道为App。"])
 
     def test_verbatim_fragment_located_with_offsets(self):
         """逐字片段被正确定位,start/end 偏移正确且 content[start:end]==text。"""

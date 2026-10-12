@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """文档内证据片段定位(答案子智能体新增能力)。
 
-背景:检索阶段把**整篇知识文档**作为 chunk.content 传入。本模块对每篇文档,
-让大模型判断哪些片段能回答用户问题,并把片段**原文逐字**摘出(带 start/end 偏移)。
+背景:检索阶段把**整篇知识文档**作为 chunk.content 传入。本模块先把原文
+切成带编号的候选片段,让模型针对用户问题选择直接证据,再从原文回填偏移。
 
 可溯源保证:模型返回的片段文本一律经代码侧校验——必须是文档原文的连续子串;
 命中后以 content[start:end] 回填,从定义上保证逐字。非原文(改写/概括/幻觉)的
@@ -26,17 +26,29 @@ logger = logging.getLogger("kbagent.answer")
 MAX_FRAGMENTS_PER_DOC = 5
 
 _LOCATE_SYSTEM = (
-    "[TASK:locate_fragments] 你是10086坐席辅助助手。给定用户问题和一篇知识文档全文,"
-    "判断文档中哪些连续片段能回答该问题,并把这些片段从原文中逐字摘出。输出 JSON:"
+    "[TASK:locate_fragments] 你是10086坐席辅助助手。给定用户问题和一篇文档的"
+    "带编号原文候选片段,只选择能直接回答用户当前问题的片段。输出 JSON:"
     '{"answerable": bool(该文档是否能回答用户问题), '
     '"relevance": int(该文档对回答用户问题的支撑程度,0-100 整数:'
     "能直接完整回答→80-100,只覆盖部分→40-79,仅沾边→1-39,无关→0), "
-    '"fragments": [{"text": str(能回答问题的原文连续片段), "reason": str(该片段为何能回答问题,简述)}]}。'
-    "硬性要求:text 必须是文档中真实出现的连续原文,**逐字复制**,禁止改写、概括、翻译、"
-    "拼接或添加省略号;只摘与问题直接相关的片段,无关内容不要摘;"
-    "若文档无法回答该问题,answerable=false 且 fragments=[]。只输出 JSON。"
-    "字符串值内禁止出现未转义的英文双引号(引用词语请用中文引号“”),值内禁止换行。"
+    '"fragment_ids": [int](直接回答问题的候选片段编号,按支撑程度降序,最多5个)}。'
+    "先辨别用户究竟问的是哪一项:办理条件、资费、渠道、时限、功能、退订等。"
+    "同一产品的其他信息只是背景,不能因其与话术相似或篇幅较长就排在前面。"
+    "若没有直接证据,answerable=false 且 fragment_ids=[];不要选择仅同主题的片段。"
+    "只能返回提供的编号,不要复述或改写原文。只输出 JSON。"
 )
+
+
+def _source_spans(content: str) -> List[LocatedFragment]:
+    """以行、句为界形成完整覆盖全文的原文候选，保留原始偏移。"""
+    spans: List[LocatedFragment] = []
+    for match in re.finditer(r"[^。！？!?；;\n]+[。！？!?；;]?", content):
+        raw = match.group()
+        start = match.start() + len(raw) - len(raw.lstrip())
+        end = match.end() - (len(raw) - len(raw.rstrip()))
+        if end > start:
+            spans.append(LocatedFragment(content[start:end], start, end))
+    return spans
 
 
 def _parse_relevance(data: Any) -> int:
@@ -79,15 +91,31 @@ def locate_fragments(model: Any, query: str, chunk: Chunk) -> DocFragments:
     answerable 以**可验证片段**为准:模型自评 answerable 但摘不出原文片段时,
     视为不可用(answerable=False),保证暴露给坐席的片段都真实可溯源。
     """
-    data = _invoke_json(
-        model, _LOCATE_SYSTEM,
-        f"用户问题:{query}\n文档内容:\n{chunk.content}")
+    candidates = _source_spans(chunk.content)
+    numbered = "\n".join(f"[{i}] {span.text}" for i, span in enumerate(candidates, 1))
+    data = _invoke_json(model, _LOCATE_SYSTEM,
+                        f"用户问题:{query}\n原文候选片段:\n{numbered}")
 
+    raw_ids = data.get("fragment_ids") if isinstance(data, dict) else None
+    raw_ids = raw_ids if isinstance(raw_ids, list) else []
     raw_fragments = data.get("fragments") if isinstance(data, dict) else None
     raw_fragments = raw_fragments if isinstance(raw_fragments, list) else []
     llm_answerable = bool(data.get("answerable", False)) if isinstance(data, dict) else False
 
     fragments: List[LocatedFragment] = []
+    seen_ids: set[int] = set()
+    for value in raw_ids:
+        if type(value) is not int or value < 1 or value > len(candidates):
+            continue
+        if value in seen_ids:
+            continue
+        seen_ids.add(value)
+        source = candidates[value - 1]
+        fragments.append(LocatedFragment(source.text, source.start, source.end,
+                                         reason="模型按用户问题选中的原文片段"))
+        if len(fragments) >= MAX_FRAGMENTS_PER_DOC:
+            break
+    # 兼容仍返回旧 fragments/text 格式的模型。
     for item in raw_fragments:
         if len(fragments) >= MAX_FRAGMENTS_PER_DOC:
             break
@@ -102,12 +130,12 @@ def locate_fragments(model: Any, query: str, chunk: Chunk) -> DocFragments:
                            chunk.chunk_id, text[:60])
             continue
         start, end = span
+        if any(f.start == start and f.end == end for f in fragments):
+            continue
         fragments.append(LocatedFragment(
-            text=chunk.content[start:end],   # 以原文回填,从定义上保证逐字
-            start=start, end=end,
-            reason=str(item.get("reason", "")).strip(),
-        ))
-
+            text=chunk.content[start:end], start=start, end=end,
+            reason=str(item.get("reason", "")).strip()))
+    fragments = fragments[:MAX_FRAGMENTS_PER_DOC]
     answerable = bool(fragments)
     if llm_answerable and not answerable:
         logger.info("locate 模型自评可答但无可验证原文片段 → 判为不可答 chunk_id=%s",
@@ -118,7 +146,7 @@ def locate_fragments(model: Any, query: str, chunk: Chunk) -> DocFragments:
         relevance = min(relevance, 39)
     logger.info("locate 完成 chunk_id=%s answerable=%s relevance=%d 片段=%d/%d",
                 chunk.chunk_id, answerable, relevance, len(fragments),
-                len(raw_fragments))
+                len(raw_ids) + len(raw_fragments))
     return DocFragments(
         chunk_id=chunk.chunk_id, doc_id=chunk.doc_id, doc_title=chunk.doc_title,
         answerable=answerable, relevance=relevance, fragments=fragments,

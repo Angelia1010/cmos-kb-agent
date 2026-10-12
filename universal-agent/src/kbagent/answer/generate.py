@@ -5,10 +5,9 @@
 使用标准 model.invoke([SystemMessage, HumanMessage]) 调用 LLM,无需特殊接口,
 任意 BaseChatModel(如灵犀网关的 LingxiSSLChatOpenAI)可直接接入。
 
-LLM 调用次数 = 1(答案组织)+ 1(批量一致性校验);相关度与关键片段由
+LLM 调用次数 = 1(答案组织)+ 1(批量一致性校验),失败时最多额外2次(修订+复验);相关度与关键片段由
 locate_fragments 阶段顺带产出(见 .locate),此处零额外调用。
-一致性校验失败不删话术,改为收紧 usability(至少 verify_first)并列出问题,
-由坐席对照原文核实 —— 保证坐席永远有话术可看。
+一致性校验失败时最多修订一次并复验;仍不通过则保留原草稿,提示坐席核实。
 """
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -41,7 +40,9 @@ _VALID_LEVELS = (USABILITY_DIRECT, USABILITY_VERIFY, USABILITY_NOT)
 _ANSWER_SYSTEM = (
     "[TASK:answer] 你是10086坐席辅助助手。基于给定材料生成坐席答复内容,输出 JSON:"
     '{"script": str(可直接念给用户的口语化完整话术,以“您好”开头,自然流畅,'
-    "把必要的注意事项/前提条件自然融入话术,不要遗漏资费、时限等关键数字), "
+    "先直接回答当前问题,再补充2至3句相关且有依据的说明;"
+    "材料充分时通常3至4句,材料有限时按实际信息量简短回答,不为凑句数重复或补造内容;"
+    "用户询问办理方法时再给出有依据的下一步), "
     '"handling_suggestion": str(给坐席的办理建议:怎么办、需要什么材料、'
     '需与客户确认什么、有什么限制条件), '
     '"usability": {"level": "directly_usable|verify_first|not_usable", '
@@ -53,11 +54,23 @@ _ANSWER_SYSTEM = (
     "\n1. 话术与建议中的每个事实(资费数字、时限、办理条件、渠道、流程)都必须来自材料"
     "并能对应原文;禁止凭记忆改写、自行补全、引入材料之外的常识或推测。"
     "\n2. 数字、金额、时限、生效日期必须与原文**逐字一致**,禁止改动、四舍五入或换算。"
-    "\n3. 原文未明确写出的前提、例外、办理时间,不要臆断;必要时写“具体请以最新政策为准”"
-    "或“需与客户核实”,不要编造确定值。"
+    "\n3. 原文未明确写出的前提、例外、办理时间,不要臆断;在办理建议中列为待核实事项。"
+    "禁止用“以当地政策为准”等笼统免责声明包装未经核实的确定结论。"
     "\n4. 若不同片段/文档相互矛盾,不要自选其一:usability 置 verify_first,"
     "并在 reasons 中列出矛盾点。"
     "\n5. 覆盖用户问题的每个子问;材料无法覆盖的方面写入 uncovered,usability 至少 verify_first。"
+    "\n6. script先回答当前问题,再酌情补充2至3句能帮助客户理解该业务的信息。"
+    "优先说明条件的认定口径、适用范围或必要限制;材料充分时,"
+    "还可简要介绍同一业务版本的主要权益或相关办理条件,让答复更完整。"
+    "补充内容必须有原文依据且适用于当前业务版本,不因材料提到资费、时限就全部展开。"
+    "只问年龄限制等单一规则时,可补充年龄计算截止日期等相关说明,"
+    "不要延伸确认完整办理资格,不要罗列无关套餐、短信指令或互斥业务。"
+    "默认不在script中追加追问、反问或邀请式问句;"
+    "需要向客户确认的套餐档位、身份、业务状态等事项放handling_suggestion,供坐席按需核实。"
+    "影响当前操作成功、费用或安全的必要限制,有依据且适用时必须保留;复杂问题不机械限句。"
+    "详细操作步骤、坐席检查项和其余注意事项放handling_suggestion,不重复话术。"
+    "\n7. 不同省份、渠道、业务的规则不得合并为通用承诺;适用条件不明时列为待核实事项。"
+    "已知信息不要重复要求确认;缺少关键信息时在handling_suggestion列出需确认事项。"
     "\n\n只输出 JSON,不要输出 sentences/citations 等其他字段。"
     "usability 必须诚实自评:材料足以完整回答且信息明确→directly_usable;"
     "材料只覆盖部分问题、信息含糊或相互矛盾→verify_first 并在 uncovered 列出未覆盖方面;"
@@ -69,11 +82,41 @@ _ANSWER_SYSTEM = (
 # 批量话术一致性校验:整段话术 vs 全部素材,一次调用替代逐句锚定。
 # 标记仍用 [TASK:anchor_check](离线 ScriptedChatModel 按此标记分发)。
 _CONSISTENCY_SYSTEM = (
-    '[TASK:anchor_check] 判断坐席话术与知识片段是否一致:话术中每个事实性表述'
+    '[TASK:anchor_check] 同时判断坐席话术和办理建议与知识片段是否一致:两者中每个事实性表述'
     '(资费数字、办理条件、渠道、时限等)都能在片段中找到依据且不与片段矛盾。'
     '输出 JSON: {"consistent": bool, "issues": [str](话术中缺乏依据或与片段矛盾的'
-    '表述,逐条简述,每条不超过40字;完全一致时为空数组)}。只输出 JSON。'
+    '表述,注明话术或建议,逐条简述,每条不超过80字;完全一致时为空数组)}。'
+    'consistent必须为JSON布尔值。逐项检查费用、时间、渠道、条件和自动恢复等规则;'
+    '检查是否混用了不同地区、渠道或业务的规定,不能只凭关键词或数字重合判断支持。'
+    '明确列为待核实的问题不视为确定事实。只输出 JSON。'
 )
+
+
+def _check_answer(model: Any, script: str, suggestion: str,
+                  material_text: str) -> tuple[bool, List[str]]:
+    """Strictly validate the checker output; malformed output never passes."""
+    try:
+        check = _invoke_json(model, _CONSISTENCY_SYSTEM,
+                             f"坐席话术:{script}\n办理建议:{suggestion}\n{material_text}")
+    except Exception:
+        logger.exception("答案一致性校验调用失败")
+        return False, ["一致性校验调用失败，无法确认答案依据"]
+    raw = check.get("issues")
+    if type(check.get("consistent")) is not bool or not isinstance(raw, list) or any(
+            not isinstance(item, str) for item in raw):
+        return False, ["一致性校验返回格式异常，无法确认答案依据"]
+    issues = [item.strip() for item in raw if item.strip()]
+    passed = check["consistent"] is True and not issues
+    return passed, issues or ([] if passed else ["答案依据未通过校验"])
+
+
+def _updated_at(value: str) -> Optional[datetime]:
+    """Parse date, local timestamp and ISO timestamp on the same UTC clock."""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def _repair_json(raw: str) -> str:
@@ -262,19 +305,45 @@ def generate(model: Any, query: str, materials: List[Chunk],
     # ---- 批量话术一致性校验(一次调用替代逐句锚定)----
     consistent: Optional[bool] = None
     issues: List[str] = []
-    if script and materials:
-        check = _invoke_json(
-            model, _CONSISTENCY_SYSTEM,
-            f"坐席话术:{script}\n{material_text}")
-        consistent = bool(check.get("consistent", False)) if check else False
-        raw_issues = check.get("issues") if check else None
-        if isinstance(raw_issues, list):
-            issues = [str(x).strip()[:80] for x in raw_issues
-                      if str(x).strip()][:5]
+    if (script or suggestion) and materials:
+        consistent, issues = _check_answer(model, script, suggestion, material_text)
         tracer.log("answer", "consistency_check", consistent=consistent,
                    issue_count=len(issues), issues=issues)
-        logger.info("answer 一致性校验: consistent=%s issues=%s",
-                    consistent, issues)
+        if not consistent:
+            try:
+                repaired = _invoke_json(
+                    model, _ANSWER_SYSTEM,
+                    f"用户问题:{query}\n{material_text}\n"
+                    "【修订任务】以下草稿未通过校验。删除无依据或适用条件不明的确定表述，"
+                    "保留有依据的操作和必要限制；待核实事项放办理建议。"
+                    "无法回答核心问题时明确标记not_usable。返回完整的原JSON结构。\n"
+                    + json.dumps({"draft": {"script": script,
+                                             "handling_suggestion": suggestion},
+                                  "issues": issues}, ensure_ascii=False))
+                if not isinstance(repaired.get("script"), str) or not isinstance(
+                        repaired.get("handling_suggestion"), str):
+                    raise ValueError("修订答案字段缺失或类型异常")
+                new_script = repaired["script"].strip()
+                new_suggestion = repaired["handling_suggestion"].strip()
+                if not (new_script or new_suggestion):
+                    raise ValueError("修订答案为空")
+                consistent, repair_issues = _check_answer(
+                    model, new_script, new_suggestion, material_text)
+                if consistent:
+                    data, script, suggestion = repaired, new_script, new_suggestion
+                    issues = []
+                else:
+                    issues = list(dict.fromkeys(issues + repair_issues))
+            except Exception:
+                logger.exception("答案修订失败")
+                issues.append("答案修订失败，需核实原文")
+                consistent = False
+            tracer.log("answer", "consistency_repair", consistent=consistent,
+                       issue_count=len(issues), issues=issues)
+            # 修订未通过或调用失败时保留原草稿；校验结果只影响可用性提示。
+    elif script or suggestion:
+        # 无素材时不能展示模型自行补全的内容。
+        script, suggestion = "", ""
 
     # ---- 来源列表:相关度(最相关=100)+ 关键片段 + 全文 + 过旧提示 ----
     # sources = 全部精选素材:LLM 输出解析失败时坐席仍有原文可核对。
@@ -317,7 +386,7 @@ def _build_sources(materials: List[Chunk],
     保证"最相关 = 100%"不变式恒成立。
     """
     matched_by_id = {d.chunk_id: d for d in (matched or [])}
-    stale_before = datetime.now() - timedelta(days=cfg.stale_days)
+    stale_before = datetime.now(timezone.utc) - timedelta(days=cfg.stale_days)
 
     raws: List[float] = []
     for c in materials:
@@ -337,10 +406,8 @@ def _build_sources(materials: List[Chunk],
         df = matched_by_id.get(c.chunk_id)
         key_fragment = df.fragments[0].text if df and df.fragments else ""
         relevance = int(round(raws[i] / peak * 100)) if peak > 0 else 0
-        try:
-            stale = datetime.strptime(c.updated_at, "%Y-%m-%d") < stale_before
-        except ValueError:
-            stale = True
+        updated = _updated_at(c.updated_at)
+        stale = updated is not None and updated < stale_before
         rows.append(SourceRef(chunk_id=c.chunk_id, doc_id=c.doc_id,
                               doc_title=c.doc_title, relevance=relevance,
                               key_fragment=key_fragment, content=c.content,
@@ -357,7 +424,7 @@ def _assess_usability(data: Dict[str, Any], sources: List[SourceRef],
     """可用性判定:以 LLM 自评为基线,用确定性规则收紧(只降不升)。
 
     规则层覆盖 LLM 自评不可信/缺失的场景:
-      素材为空、JSON 解析失败、内容为空      → not_usable
+      素材为空、JSON 解析失败、内容为空 → not_usable
       一致性校验不过、知识过旧、存在未覆盖    → verify_first
     """
     raw = data.get("usability") if isinstance(data.get("usability"), dict) else {}
@@ -388,7 +455,11 @@ def _assess_usability(data: Dict[str, Any], sources: List[SourceRef],
     stale_n = sum(1 for s in sources if s.stale)
     if stale_n:
         u.tighten(USABILITY_VERIFY,
-                  f"{stale_n} 条引用知识已过旧,请核实最新政策")
+                  f"{stale_n} 条引用知识超过复核期限,请核实当前是否仍适用")
+    unknown_dates = sum(_updated_at(s.updated_at) is None for s in sources)
+    if unknown_dates:
+        u.tighten(USABILITY_VERIFY,
+                  f"{unknown_dates} 条引用知识更新时间缺失或无法识别,请核实有效性")
     if u.uncovered:
         u.tighten(USABILITY_VERIFY, "问题存在知识库未覆盖的方面,见未覆盖列表")
     return u

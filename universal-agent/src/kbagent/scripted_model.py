@@ -247,36 +247,33 @@ class ScriptedChatModel(BaseChatModel):
 
     # ---- 文档内证据片段定位脚本 ----
     def _scripted_locate(self, text: str) -> str:
-        """离线模拟 [TASK:locate_fragments]:按句切分文档,挑与问题字符重叠的句子。
-
-        返回的 text 必为文档原文连续子串,使 locate_fragments 的逐字校验通过。
-        """
-        m = re.search(r"用户问题[:：]\s*(.*?)\s*文档内容[:：]\s*(.*)$", text, re.S)
+        """离线模拟按问题选择编号片段；仅供演示，不代表生产语义模型质量。"""
+        m = re.search(r"用户问题[:：]\s*(.*?)\s*原文候选片段[:：]\s*(.*)$", text, re.S)
         if not m:
-            return json.dumps({"answerable": False, "relevance": 0, "fragments": []},
+            return json.dumps({"answerable": False, "relevance": 0, "fragment_ids": []},
                               ensure_ascii=False)
         query, content = m.group(1), m.group(2)
         qchars = {c for c in query if not c.isspace()}
         if not qchars or not content.strip():
-            return json.dumps({"answerable": False, "relevance": 0, "fragments": []},
+            return json.dumps({"answerable": False, "relevance": 0, "fragment_ids": []},
                               ensure_ascii=False)
-        sentences = [s.strip() for s in
-                     re.split(r"(?<=[。;!?；！?\n])", content) if s.strip()]
+        candidates = [(int(i), s) for i, s in
+                      re.findall(r"^\[(\d+)\] (.+)$", content, re.M)]
         threshold = max(2, int(len(qchars) * 0.3))
-        fragments, best = [], 0.0
-        for s in sentences:
+        ranked = []
+        for i, s in candidates:
             schars = {c for c in s if not c.isspace()}
             hit = len(qchars & schars)
             if hit >= threshold:
-                fragments.append({"text": s, "reason": "离线脚本:与问题字符重叠"})
-                best = max(best, hit / len(qchars))
-            if len(fragments) >= 3:
-                break
+                ranked.append((hit, i))
+        ranked.sort(key=lambda pair: (-pair[0], pair[1]))
+        fragment_ids = [i for _, i in ranked[:3]]
+        best = ranked[0][0] / len(qchars) if ranked else 0.0
         # 相关度:命中覆盖率映射到 40-95(有片段);无片段给 0
-        relevance = int(round(40 + best * 55)) if fragments else 0
-        return json.dumps({"answerable": bool(fragments),
+        relevance = int(round(40 + best * 55)) if fragment_ids else 0
+        return json.dumps({"answerable": bool(fragment_ids),
                            "relevance": min(95, relevance),
-                           "fragments": fragments},
+                           "fragment_ids": fragment_ids},
                           ensure_ascii=False)
 
     # ---- Top3 回答充分性校验脚本 ----

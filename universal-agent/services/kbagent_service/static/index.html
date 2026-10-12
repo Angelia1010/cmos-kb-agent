@@ -372,7 +372,7 @@
     <div class="card" id="statsCard">
       <div class="stats">
         <div class="stat"><b id="statDocs">-</b><span>引用文档</span></div>
-        <div class="stat"><b id="statTopRel" class="accent">-</b><span>最高相关度</span></div>
+        <div class="stat"><b id="statTopRel" class="accent">-</b><span>最高相对相关分（非正确率）</span></div>
         <div class="stat"><b id="statElapsed">-</b><span>端到端耗时</span></div>
       </div>
     </div>
@@ -391,8 +391,8 @@
     <div class="card" id="sourcesCard">
       <h2>引用文档 <span class="hint" id="sourceCount"></span></h2>
       <div class="legend">
-        <span>文档按 <b>相关度降序</b> 排列(最相关 = 100%),每篇将 <b>⭐ 最能回答问题的关键片段</b> 置顶,点击「查看整篇文档」可展开全文对照。</span>
-        <mark>黄色</mark><span>= 被话术直接引用</span>
+        <span>文档按 <b>相对相关分降序</b> 排列(最高为100分，不代表正确率),每篇将 <b>⭐ 问题相关原文片段</b> 置顶,点击「查看整篇文档」可展开全文对照。文本匹配仅表示文字重合，不代表事实已获支持。</span>
+        <mark>黄色</mark><span>= 与话术或建议文本匹配</span>
         <mark class="q">蓝色</mark><span>= 命中用户问题关键词</span>
       </div>
       <div id="sourceList"></div>
@@ -957,7 +957,7 @@ function relBadge(rel) {
   rel = rel || 0;
   if (rel <= 0) return "";
   var cls = rel >= 80 ? "rel-high" : (rel >= 40 ? "rel-mid" : "rel-low");
-  return '<span class="rel-badge ' + cls + '">相关度 ' + rel + '%</span>';
+  return '<span class="rel-badge ' + cls + '">相对相关分 ' + rel + '</span>';
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1590,7 +1590,7 @@ function render(data) {
   // ── 结果概览统计(重要信息放最前) ──
   document.getElementById("statDocs").textContent = docGroups.length;
   document.getElementById("statTopRel").textContent =
-    topRel > 0 ? topRel + "%" : "-";
+    topRel > 0 ? topRel + " 分" : "-";
   document.getElementById("statElapsed").textContent =
     (obj.elapsedMs != null ? (obj.elapsedMs / 1000).toFixed(1) + " s" : "-");
 
@@ -1615,7 +1615,7 @@ function render(data) {
   // ── 引用文档(按相关度降序 + 关键片段 + 全文折叠) ──
   document.getElementById("sourceCount").textContent = analyzed.length
     ? "(共 " + analyzed.length + " 个片段 · " + docGroups.length +
-      " 个文档 · 最相关 " + topRel + "%)"
+      " 个文档 · 最高相对相关分 " + topRel + ")"
     : "";
   var listEl = document.getElementById("sourceList");
   if (!docGroups.length) {
@@ -1628,8 +1628,8 @@ function render(data) {
             '<span class="chunk-no">片段 ' + (ci + 1) + '</span>' +
             relBadge(c.relevance) +
             (c.used
-              ? '<span class="badge used">✓ 已支撑话术</span>'
-              : '<span class="badge unused">未直接引用</span>') +
+              ? '<span class="badge used">文本匹配</span>'
+              : '<span class="badge unused">无文本匹配</span>') +
           '</div>';
 
         // content 是整篇文档:关键片段置顶,全文折叠在下方并可展开对照
@@ -1642,8 +1642,8 @@ function render(data) {
               '<div class="kf-label">' + (c.kf.fallback
                 ? '📄 全文开头摘要(未在全文中定位到直接回答的片段)'
                 : (c.kf.backend
-                  ? '⭐ 最能回答用户问题的关键片段(模型从原文逐字定位)'
-                  : '⭐ 全文中最能回答用户问题的片段')) + '</div>' +
+                  ? '⭐ 与用户问题相关的原文片段(已逐字定位)'
+                  : '⭐ 与用户问题相关的原文片段')) + '</div>' +
               '<div class="kf-text">' + renderTwoColor(
                 kfText,
                 clipRanges(c.ranges, c.kf.start, c.kf.end),
@@ -1681,10 +1681,10 @@ function render(data) {
           relBadge(g.bestRel) +
           (g.usedCount
             ? '<span class="badge used">' + g.usedCount + ' / ' +
-              g.chunks.length + ' 个片段支撑话术</span>'
-            : '<span class="badge unused">未直接引用</span>') +
+              g.chunks.length + ' 个片段与话术或建议文本匹配</span>'
+            : '<span class="badge unused">无文本匹配</span>') +
           '<span class="tag">更新于 ' + esc(g.updatedAt || "未知") + '</span>' +
-          (g.stale ? '<span class="tag stale">⚠ 知识可能过旧,请核实</span>' : "") +
+          (g.stale ? '<span class="tag stale">⚠ 超过复核期限,请核实是否仍适用</span>' : "") +
         '</div>' +
         '<div class="doc-body">' + chunksHtml + '</div>' +
       '</div>';
